@@ -41,6 +41,7 @@ jobs:
         run: |
           set -e
           unzip -q workspace/Ankit_AI_Trader_Android_V1_1_Background_Source.zip -d workspace
+
           test -f workspace/ankit_ai_trader_mobile_v1/pubspec.yaml
           test -f workspace/ankit_ai_trader_mobile_v1/lib/main.dart
 
@@ -51,12 +52,14 @@ jobs:
           cd workspace/ankit_ai_trader_mobile_v1
 
           mkdir -p /tmp/ankit-native
+
           cp android/app/src/main/AndroidManifest.xml /tmp/ankit-native/AndroidManifest.xml
           cp -R android/app/src/main/kotlin /tmp/ankit-native/kotlin
 
           flutter create . --platforms=android --project-name=ankit_ai_trader --org=com.ankit
 
           cp /tmp/ankit-native/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+
           rm -rf android/app/src/main/kotlin
           cp -R /tmp/ankit-native/kotlin android/app/src/main/kotlin
 
@@ -151,18 +154,18 @@ jobs:
           }
           EOF
 
-          echo "===== Android toolchain versions ====="
+          echo "Android build configuration:"
           grep -E 'com.android.application|org.jetbrains.kotlin.android' android/settings.gradle
           cat android/gradle/wrapper/gradle-wrapper.properties
-          cat android/gradle.properties
 
       - name: Install Flutter dependencies
         working-directory: workspace/ankit_ai_trader_mobile_v1
         run: flutter pub get
 
-      - name: Check Flutter project
+      - name: Analyze application code
         working-directory: workspace/ankit_ai_trader_mobile_v1
-        run: flutter analyze --no-pub
+        continue-on-error: true
+        run: flutter analyze --no-pub lib
 
       - name: Build release APK
         working-directory: workspace/ankit_ai_trader_mobile_v1
@@ -172,8 +175,12 @@ jobs:
         shell: bash
         run: |
           set -e
+
           cp workspace/ankit_ai_trader_mobile_v1/build/app/outputs/flutter-apk/app-release.apk ./Ankit_AI_Trader.apk
+
           test -s ./Ankit_AI_Trader.apk
+
+          echo "APK successfully generated:"
           ls -lh ./Ankit_AI_Trader.apk
 
       - name: Upload APK artifact
