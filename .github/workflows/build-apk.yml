@@ -110,23 +110,30 @@ jobs:
           main_dart.write_text(dart_text, encoding="utf-8")
           PY
 
-          # 2. Keep the deterministic widget test shipped with the V1.2 source.
-          # Fall back to a basic smoke test only if no test file exists.
+          # 2. Replace Flutter's generated MyApp test with a deterministic V1.2 test.
+          # Inject a successful probe so tests never depend on the public internet.
           mkdir -p test
-          if [ ! -f test/widget_test.dart ]; then
-            cat > test/widget_test.dart <<'EOF'
+          cat > test/widget_test.dart <<'EOF'
+          import 'package:flutter/material.dart';
           import 'package:flutter_test/flutter_test.dart';
           import 'package:ankit_ai_trader/main.dart';
 
           void main() {
-            testWidgets('AnkitTraderApp renders paper trading dashboard', (WidgetTester tester) async {
-              await tester.pumpWidget(const AnkitTraderApp());
+            testWidgets('dashboard shows paper account and connected state', (tester) async {
+              await tester.pumpWidget(
+                MaterialApp(
+                  home: DashboardPage(internetChecker: () async => true),
+                ),
+              );
+              await tester.pump(const Duration(milliseconds: 20));
               expect(find.text('ANKIT AI TRADER'), findsOneWidget);
               expect(find.text('PAPER TRADING MODE'), findsOneWidget);
+              expect(find.text('\\$100.00'), findsOneWidget);
+              expect(find.text('INTERNET CONNECTED'), findsOneWidget);
+              await tester.pumpWidget(const SizedBox.shrink());
             });
           }
           EOF
-          fi
 
           # The updated source archive already contains the Android 14+ service and network monitor.
 
