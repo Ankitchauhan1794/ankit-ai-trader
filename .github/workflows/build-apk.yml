@@ -32,7 +32,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p workspace
-          unzip -q Ankit_AI_Trader_Android_V1_1_Background_Source.zip -d workspace
+          unzip -q Ankit_AI_Trader_GitHub_Cloud_Build_Kit.zip -d workspace
           test -d workspace/ankit_ai_trader_mobile_v1
 
       - name: Generate Android wrapper files
