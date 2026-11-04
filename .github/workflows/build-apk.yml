@@ -1,0 +1,126 @@
+
+name: Build Ankit AI Trader APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Extract application source
+        shell: bash
+        run: |
+          mkdir -p workspace
+          unzip -q Ankit_AI_Trader_Android_V1_1_Background_Source.zip -d workspace
+          test -d workspace/ankit_ai_trader_mobile_v1
+
+      - name: Generate Android wrapper files
+        shell: bash
+        run: |
+          cd workspace/ankit_ai_trader_mobile_v1
+          mkdir -p /tmp/ankit-native
+          cp android/app/src/main/AndroidManifest.xml /tmp/ankit-native/AndroidManifest.xml
+          mkdir -p /tmp/ankit-native/kotlin
+          cp -R android/app/src/main/kotlin/com /tmp/ankit-native/kotlin/
+          flutter create . --platforms=android --project-name=ankit_ai_trader --org=com.ankit
+          cp /tmp/ankit-native/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+          mkdir -p android/app/src/main/kotlin
+          cp -R /tmp/ankit-native/kotlin/com android/app/src/main/kotlin/
+
+      - name: Repair manifest and configure release build
+        shell: bash
+        run: |
+          cd workspace/ankit_ai_trader_mobile_v1
+          python3 - <<'PY'
+          from pathlib import Path
+
+          manifest = Path("android/app/src/main/AndroidManifest.xml")
+          text = manifest.read_text(encoding="utf-8")
+          text = text.replace(r'>\n        <meta-data', '>\n        <meta-data')
+          manifest.write_text(text, encoding="utf-8")
+
+          gradle = Path("android/app/build.gradle")
+          gradle.write_text("""plugins {
+              id "com.android.application"
+              id "org.jetbrains.kotlin.android"
+              id "dev.flutter.flutter-gradle-plugin"
+          }
+
+          android {
+              namespace "com.ankit.aitrader"
+              compileSdk 35
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+
+              defaultConfig {
+                  applicationId "com.ankit.aitrader"
+                  minSdk 23
+                  targetSdk 35
+                  versionCode 2
+                  versionName "1.1.0"
+              }
+
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.debug
+                      minifyEnabled false
+                      shrinkResources false
+                  }
+              }
+          }
+
+          flutter {
+              source "../.."
+          }
+          """, encoding="utf-8")
+          PY
+
+      - name: Install dependencies
+        working-directory: workspace/ankit_ai_trader_mobile_v1
+        run: flutter pub get
+
+      - name: Build APK
+        working-directory: workspace/ankit_ai_trader_mobile_v1
+        run: flutter build apk --release
+
+      - name: Rename APK
+        shell: bash
+        run: |
+          cp workspace/ankit_ai_trader_mobile_v1/build/app/outputs/flutter-apk/app-release.apk ./Ankit_AI_Trader.apk
+          test -s ./Ankit_AI_Trader.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ankit_AI_Trader_APK
+          path: Ankit_AI_Trader.apk
+          if-no-files-found: error
+          retention-days: 14
