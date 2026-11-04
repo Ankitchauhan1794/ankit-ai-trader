@@ -9,58 +9,73 @@ permissions:
 
 jobs:
   build:
+    name: Build Android APK
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
     steps:
-      - name: Check out repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Java 17
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Flutter
+      - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
-      - name: Extract application source
+      - name: Extract cloud build kit
         shell: bash
         run: |
+          set -e
           mkdir -p workspace
           unzip -q Ankit_AI_Trader_GitHub_Cloud_Build_Kit.zip -d workspace
-          test -d workspace/ankit_ai_trader_mobile_v1
 
-      - name: Generate Android wrapper files
+      - name: Extract Android source project
         shell: bash
         run: |
+          set -e
+          unzip -q workspace/Ankit_AI_Trader_Android_V1_1_Background_Source.zip -d workspace
+          test -f workspace/ankit_ai_trader_mobile_v1/pubspec.yaml
+          test -f workspace/ankit_ai_trader_mobile_v1/lib/main.dart
+
+      - name: Generate Flutter Android project files
+        shell: bash
+        run: |
+          set -e
           cd workspace/ankit_ai_trader_mobile_v1
+
           mkdir -p /tmp/ankit-native
           cp android/app/src/main/AndroidManifest.xml /tmp/ankit-native/AndroidManifest.xml
-          mkdir -p /tmp/ankit-native/kotlin
-          cp -R android/app/src/main/kotlin/com /tmp/ankit-native/kotlin/
-          flutter create . --platforms=android --project-name=ankit_ai_trader --org=com.ankit
-          cp /tmp/ankit-native/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
-          mkdir -p android/app/src/main/kotlin
-          cp -R /tmp/ankit-native/kotlin/com android/app/src/main/kotlin/
+          cp -R android/app/src/main/kotlin /tmp/ankit-native/kotlin
 
-      - name: Repair manifest and configure release build
+          flutter create . --platforms=android --project-name=ankit_ai_trader --org=com.ankit
+
+          cp /tmp/ankit-native/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+          rm -rf android/app/src/main/kotlin
+          cp -R /tmp/ankit-native/kotlin android/app/src/main/kotlin
+
+      - name: Configure Android build
         shell: bash
         run: |
+          set -e
           cd workspace/ankit_ai_trader_mobile_v1
+
           python3 - <<'PY'
           from pathlib import Path
 
           manifest = Path("android/app/src/main/AndroidManifest.xml")
-          text = manifest.read_text(encoding="utf-8")
-          text = text.replace(r'>\n        <meta-data', '>\n        <meta-data')
-          manifest.write_text(text, encoding="utf-8")
+          content = manifest.read_text(encoding="utf-8")
+          content = content.replace(r'>\n        <meta-data', '>\n        <meta-data')
+          manifest.write_text(content, encoding="utf-8")
 
           gradle = Path("android/app/build.gradle")
+
           gradle.write_text("""plugins {
               id "com.android.application"
               id "org.jetbrains.kotlin.android"
@@ -103,19 +118,21 @@ jobs:
           """, encoding="utf-8")
           PY
 
-      - name: Install dependencies
+      - name: Install Flutter dependencies
         working-directory: workspace/ankit_ai_trader_mobile_v1
         run: flutter pub get
 
-      - name: Build APK
+      - name: Build release APK
         working-directory: workspace/ankit_ai_trader_mobile_v1
         run: flutter build apk --release
 
-      - name: Rename APK
+      - name: Prepare APK
         shell: bash
         run: |
+          set -e
           cp workspace/ankit_ai_trader_mobile_v1/build/app/outputs/flutter-apk/app-release.apk ./Ankit_AI_Trader.apk
           test -s ./Ankit_AI_Trader.apk
+          ls -lh ./Ankit_AI_Trader.apk
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
