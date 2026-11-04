@@ -2,6 +2,8 @@ name: Build Ankit AI Trader APK
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [ main, master ]
   push:
     branches: [ main, master ]
 
@@ -119,79 +121,7 @@ jobs:
           }
           EOF
 
-          # 3. Upgrade TradingForegroundService.kt for Android 14+ (API 34+) specialUse service type
-          cat > android/app/src/main/kotlin/com/ankit/aitrader/TradingForegroundService.kt <<'EOF'
-          package com.ankit.aitrader
-
-          import android.app.Notification
-          import android.app.NotificationChannel
-          import android.app.NotificationManager
-          import android.app.Service
-          import android.content.Intent
-          import android.content.pm.ServiceInfo
-          import android.os.Build
-          import android.os.IBinder
-
-          class TradingForegroundService : Service() {
-              companion object {
-                  private const val CHANNEL_ID = "ankit_trader_service"
-                  private const val NOTIFICATION_ID = 1101
-              }
-
-              override fun onCreate() {
-                  super.onCreate()
-                  createNotificationChannel()
-                  val notification = buildNotification()
-                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                      startForeground(
-                          NOTIFICATION_ID,
-                          notification,
-                          ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-                      )
-                  } else {
-                      startForeground(NOTIFICATION_ID, notification)
-                  }
-              }
-
-              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-                  return START_STICKY
-              }
-
-              override fun onBind(intent: Intent?): IBinder? = null
-
-              override fun onDestroy() {
-                  super.onDestroy()
-              }
-
-              private fun createNotificationChannel() {
-                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                      val channel = NotificationChannel(
-                          CHANNEL_ID,
-                          "Trading service",
-                          NotificationManager.IMPORTANCE_LOW
-                      )
-                      channel.description = "Shows when the Ankit AI Trader background service is active."
-                      val manager = getSystemService(NotificationManager::class.java)
-                      manager.createNotificationChannel(channel)
-                  }
-              }
-
-              private fun buildNotification(): Notification {
-                  val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                      Notification.Builder(this, CHANNEL_ID)
-                  } else {
-                      @Suppress("DEPRECATION")
-                      Notification.Builder(this)
-                  }
-                  return builder
-                      .setSmallIcon(android.R.drawable.ic_menu_myplaces)
-                      .setContentTitle("Ankit AI Trader service active")
-                      .setContentText("Background service prototype is running. No real trades are being placed.")
-                      .setOngoing(true)
-                      .build()
-              }
-          }
-          EOF
+          # The updated source archive already contains the Android 14+ service and network monitor.
 
           # 4. Write compatible Gradle 8.10.2 + AGP 8.7.3 + Kotlin 2.1.0 files
           cat > android/settings.gradle <<'EOF'
@@ -282,8 +212,8 @@ jobs:
                   applicationId = "com.ankit.aitrader"
                   minSdk = 23
                   targetSdk = 35
-                  versionCode = 2
-                  versionName = "1.1.0"
+                  versionCode = 3
+                  versionName = "1.2.0"
               }
 
               buildTypes {
