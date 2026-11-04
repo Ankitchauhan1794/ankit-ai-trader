@@ -96,10 +96,17 @@ jobs:
           include(":app")
           EOF
 
+          cat > android/build.gradle <<'EOF'
+          plugins {
+              id "com.android.application" version "8.6.1" apply false
+              id "org.jetbrains.kotlin.android" version "2.1.0" apply false
+          }
+          EOF
+
           cat > android/gradle/wrapper/gradle-wrapper.properties <<'EOF'
           distributionBase=GRADLE_USER_HOME
           distributionPath=wrapper/dists
-          distributionUrl=https\://services.gradle.org/distributions/gradle-8.7-bin.zip
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.14.3-bin.zip
           zipStoreBase=GRADLE_USER_HOME
           zipStorePath=wrapper/dists
           EOF
@@ -107,7 +114,6 @@ jobs:
           cat > android/gradle.properties <<'EOF'
           org.gradle.jvmargs=-Xmx4G -XX:MaxMetaspaceSize=1G
           android.useAndroidX=true
-          android.newDsl=false
           EOF
 
           rm -f android/app/build.gradle.kts
@@ -154,9 +160,11 @@ jobs:
           }
           EOF
 
-          echo "Android build configuration:"
-          grep -E 'com.android.application|org.jetbrains.kotlin.android' android/settings.gradle
-          cat android/gradle/wrapper/gradle-wrapper.properties
+          echo "===== Gradle wrapper version ====="
+          grep distributionUrl android/gradle/wrapper/gradle-wrapper.properties
+
+          echo "===== Android Gradle Plugin version ====="
+          grep 'com.android.application' android/settings.gradle
 
       - name: Install Flutter dependencies
         working-directory: workspace/ankit_ai_trader_mobile_v1
@@ -180,7 +188,7 @@ jobs:
 
           test -s ./Ankit_AI_Trader.apk
 
-          echo "APK successfully generated:"
+          echo "APK generated successfully:"
           ls -lh ./Ankit_AI_Trader.apk
 
       - name: Upload APK artifact
