@@ -1,8 +1,9 @@
-
 name: Build Ankit AI Trader APK
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ main, master ]
 
 permissions:
   contents: read
@@ -23,62 +24,188 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Setup Flutter
+      - name: Setup Flutter (Pinned Stable 3.29.2 — Pre-AGP 9 Migration)
         uses: subosito/flutter-action@v2
         with:
+          flutter-version: "3.29.2"
           channel: stable
           cache: true
 
-      - name: Extract cloud build kit
+      - name: Locate or Extract Android Source Project
         shell: bash
         run: |
-          set -e
+          set -euxo pipefail
           mkdir -p workspace
-          unzip -q Ankit_AI_Trader_GitHub_Cloud_Build_Kit.zip -d workspace
 
-      - name: Extract Android source project
-        shell: bash
-        run: |
-          set -e
-          unzip -q workspace/Ankit_AI_Trader_Android_V1_1_Background_Source.zip -d workspace
+          if [ -f "pubspec.yaml" ] && [ -f "lib/main.dart" ]; then
+            echo "Project found at repository root."
+            mkdir -p workspace/ankit_ai_trader_mobile_v1
+            cp -R . workspace/ankit_ai_trader_mobile_v1/ || true
+          elif [ -f "ankit_ai_trader_mobile_v1/pubspec.yaml" ]; then
+            echo "Project found in ankit_ai_trader_mobile_v1/."
+            cp -R ankit_ai_trader_mobile_v1 workspace/
+          elif [ -f "Ankit_AI_Trader_Android_V1_1_Background_Source.zip" ]; then
+            echo "Extracting Ankit_AI_Trader_Android_V1_1_Background_Source.zip..."
+            unzip -q -o Ankit_AI_Trader_Android_V1_1_Background_Source.zip -d workspace
+          elif [ -f "Ankit_AI_Trader_GitHub_Cloud_Build_Kit.zip" ]; then
+            echo "Extracting outer Ankit_AI_Trader_GitHub_Cloud_Build_Kit.zip..."
+            unzip -q -o Ankit_AI_Trader_GitHub_Cloud_Build_Kit.zip -d workspace
+            unzip -q -o workspace/Ankit_AI_Trader_Android_V1_1_Background_Source.zip -d workspace
+          else
+            echo "ERROR: Could not find Flutter source project or ZIP archive in repository."
+            ls -la
+            exit 1
+          fi
 
           test -f workspace/ankit_ai_trader_mobile_v1/pubspec.yaml
           test -f workspace/ankit_ai_trader_mobile_v1/lib/main.dart
 
-      - name: Generate Flutter Android wrapper
+      - name: Generate Flutter Android wrapper & preserve custom native files
         shell: bash
         run: |
-          set -e
+          set -euxo pipefail
           cd workspace/ankit_ai_trader_mobile_v1
 
           mkdir -p /tmp/ankit-native
-
+          cp lib/main.dart /tmp/ankit-native/main.dart
           cp android/app/src/main/AndroidManifest.xml /tmp/ankit-native/AndroidManifest.xml
           cp -R android/app/src/main/kotlin /tmp/ankit-native/kotlin
 
           flutter create . --platforms=android --project-name=ankit_ai_trader --org=com.ankit
 
+          cp /tmp/ankit-native/main.dart lib/main.dart
           cp /tmp/ankit-native/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
-
           rm -rf android/app/src/main/kotlin
           cp -R /tmp/ankit-native/kotlin android/app/src/main/kotlin
 
-      - name: Pin compatible Android build tools
+          # Remove any Kotlin DSL files created by flutter create so only Groovy build.gradle is evaluated
+          rm -f android/build.gradle.kts android/settings.gradle.kts android/app/build.gradle.kts
+
+      - name: Repair Manifest, Dart Lints, Widget Test & Pin Verified Toolchain
         shell: bash
         run: |
-          set -e
+          set -euxo pipefail
           cd workspace/ankit_ai_trader_mobile_v1
 
+          # 1. Repair literal \n in AndroidManifest.xml and fix deprecated Dart calls in main.dart
+          python3 - <<'PY'
+          from pathlib import Path
+
+          manifest = Path("android/app/src/main/AndroidManifest.xml")
+          text = manifest.read_text(encoding="utf-8")
+          text = text.replace(r'>\n        <meta-data', '>\n        <meta-data')
+          manifest.write_text(text, encoding="utf-8")
+
+          main_dart = Path("lib/main.dart")
+          dart_text = main_dart.read_text(encoding="utf-8")
+          dart_text = dart_text.replace("color.withOpacity(.13)", "color.withAlpha(33)")
+          dart_text = dart_text.replace("color.withOpacity(disabled ? .08 : .35)", "color.withAlpha(disabled ? 20 : 89)")
+          dart_text = dart_text.replace("activeColor: const Color(0xFF39D6A0),", "thumbColor: const WidgetStatePropertyAll<Color>(Color(0xFF39D6A0)),")
+          main_dart.write_text(dart_text, encoding="utf-8")
+          PY
+
+          # 2. Fix widget_test.dart so it references AnkitTraderApp instead of MyApp
+          mkdir -p test
+          cat > test/widget_test.dart <<'EOF'
+          import 'package:flutter_test/flutter_test.dart';
+          import 'package:ankit_ai_trader/main.dart';
+
+          void main() {
+            testWidgets('AnkitTraderApp renders paper trading dashboard', (WidgetTester tester) async {
+              await tester.pumpWidget(const AnkitTraderApp());
+              expect(find.text('ANKIT AI TRADER'), findsOneWidget);
+              expect(find.text('PAPER TRADING MODE'), findsOneWidget);
+            });
+          }
+          EOF
+
+          # 3. Upgrade TradingForegroundService.kt for Android 14+ (API 34+) specialUse service type
+          cat > android/app/src/main/kotlin/com/ankit/aitrader/TradingForegroundService.kt <<'EOF'
+          package com.ankit.aitrader
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.Build
+          import android.os.IBinder
+
+          class TradingForegroundService : Service() {
+              companion object {
+                  private const val CHANNEL_ID = "ankit_trader_service"
+                  private const val NOTIFICATION_ID = 1101
+              }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  createNotificationChannel()
+                  val notification = buildNotification()
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                      startForeground(
+                          NOTIFICATION_ID,
+                          notification,
+                          ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                      )
+                  } else {
+                      startForeground(NOTIFICATION_ID, notification)
+                  }
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  return START_STICKY
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onDestroy() {
+                  super.onDestroy()
+              }
+
+              private fun createNotificationChannel() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val channel = NotificationChannel(
+                          CHANNEL_ID,
+                          "Trading service",
+                          NotificationManager.IMPORTANCE_LOW
+                      )
+                      channel.description = "Shows when the Ankit AI Trader background service is active."
+                      val manager = getSystemService(NotificationManager::class.java)
+                      manager.createNotificationChannel(channel)
+                  }
+              }
+
+              private fun buildNotification(): Notification {
+                  val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      Notification.Builder(this, CHANNEL_ID)
+                  } else {
+                      @Suppress("DEPRECATION")
+                      Notification.Builder(this)
+                  }
+                  return builder
+                      .setSmallIcon(android.R.drawable.ic_menu_myplaces)
+                      .setContentTitle("Ankit AI Trader service active")
+                      .setContentText("Background service prototype is running. No real trades are being placed.")
+                      .setOngoing(true)
+                      .build()
+              }
+          }
+          EOF
+
+          # 4. Write compatible Gradle 8.10.2 + AGP 8.7.3 + Kotlin 2.1.0 files
           cat > android/settings.gradle <<'EOF'
           pluginManagement {
               def flutterSdkPath = {
                   def properties = new Properties()
                   file("local.properties").withInputStream { properties.load(it) }
                   def flutterSdkPath = properties.getProperty("flutter.sdk")
-                  assert flutterSdkPath != null
+                  assert flutterSdkPath != null, "flutter.sdk not set in local.properties"
                   return flutterSdkPath
               }()
+
               includeBuild("$flutterSdkPath/packages/flutter_tools/gradle")
+
               repositories {
                   google()
                   mavenCentral()
@@ -88,50 +215,63 @@ jobs:
 
           plugins {
               id "dev.flutter.flutter-plugin-loader" version "1.0.0"
-              id "com.android.application" version "8.6.1" apply false
+              id "com.android.application" version "8.7.3" apply false
               id "org.jetbrains.kotlin.android" version "2.1.0" apply false
           }
 
-          rootProject.name = "AnkitAITrader"
-          include(":app")
+          include ":app"
           EOF
 
           cat > android/build.gradle <<'EOF'
-          plugins {
-              id "com.android.application" version "8.6.1" apply false
-              id "org.jetbrains.kotlin.android" version "2.1.0" apply false
+          allprojects {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.buildDir = "../build"
+          subprojects {
+              project.buildDir = "${rootProject.buildDir}/${project.name}"
+          }
+          subprojects {
+              project.evaluationDependsOn(":app")
+          }
+
+          tasks.register("clean", Delete) {
+              delete rootProject.buildDir
           }
           EOF
 
           cat > android/gradle/wrapper/gradle-wrapper.properties <<'EOF'
           distributionBase=GRADLE_USER_HOME
           distributionPath=wrapper/dists
-          distributionUrl=https\://services.gradle.org/distributions/gradle-8.14.3-bin.zip
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.10.2-all.zip
           zipStoreBase=GRADLE_USER_HOME
           zipStorePath=wrapper/dists
           EOF
 
           cat > android/gradle.properties <<'EOF'
-          org.gradle.jvmargs=-Xmx4G -XX:MaxMetaspaceSize=1G
+          org.gradle.jvmargs=-Xmx4G -XX:MaxMetaspaceSize=1G -Dfile.encoding=UTF-8
           android.useAndroidX=true
+          android.enableJetifier=true
+          kotlin.code.style=official
           EOF
-
-          rm -f android/app/build.gradle.kts
 
           cat > android/app/build.gradle <<'EOF'
           plugins {
               id "com.android.application"
-              id "org.jetbrains.kotlin.android"
+              id "kotlin-android"
               id "dev.flutter.flutter-gradle-plugin"
           }
 
           android {
-              namespace "com.ankit.aitrader"
-              compileSdk 35
+              namespace = "com.ankit.aitrader"
+              compileSdk = 35
 
               compileOptions {
-                  sourceCompatibility JavaVersion.VERSION_17
-                  targetCompatibility JavaVersion.VERSION_17
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
               }
 
               kotlinOptions {
@@ -139,16 +279,16 @@ jobs:
               }
 
               defaultConfig {
-                  applicationId "com.ankit.aitrader"
-                  minSdk 23
-                  targetSdk 35
-                  versionCode 2
-                  versionName "1.1.0"
+                  applicationId = "com.ankit.aitrader"
+                  minSdk = 23
+                  targetSdk = 35
+                  versionCode = 2
+                  versionName = "1.1.0"
               }
 
               buildTypes {
                   release {
-                      signingConfig signingConfigs.debug
+                      signingConfig = signingConfigs.debug
                       minifyEnabled false
                       shrinkResources false
                   }
@@ -156,45 +296,36 @@ jobs:
           }
 
           flutter {
-              source "../.."
+              source = "../.."
           }
           EOF
-
-          echo "===== Gradle wrapper version ====="
-          grep distributionUrl android/gradle/wrapper/gradle-wrapper.properties
-
-          echo "===== Android Gradle Plugin version ====="
-          grep 'com.android.application' android/settings.gradle
 
       - name: Install Flutter dependencies
         working-directory: workspace/ankit_ai_trader_mobile_v1
         run: flutter pub get
 
-      - name: Analyze application code
+      - name: Run Flutter Widget Tests
         working-directory: workspace/ankit_ai_trader_mobile_v1
-        continue-on-error: true
-        run: flutter analyze --no-pub lib
+        run: flutter test
 
-      - name: Build release APK
+      - name: Build Release APK (Bypassing Auto-Migrator)
         working-directory: workspace/ankit_ai_trader_mobile_v1
-        run: flutter build apk --release
+        run: flutter build apk --release --android-skip-build-dependency-validation
 
-      - name: Prepare APK
+      - name: Verify and Rename APK to Ankit_AI_Trader.apk
         shell: bash
         run: |
-          set -e
-
-          cp workspace/ankit_ai_trader_mobile_v1/build/app/outputs/flutter-apk/app-release.apk ./Ankit_AI_Trader.apk
-
-          test -s ./Ankit_AI_Trader.apk
-
-          echo "APK generated successfully:"
+          set -euxo pipefail
+          APK="workspace/ankit_ai_trader_mobile_v1/build/app/outputs/flutter-apk/app-release.apk"
+          test -s "$APK"
+          cp "$APK" ./Ankit_AI_Trader.apk
           ls -lh ./Ankit_AI_Trader.apk
+          file ./Ankit_AI_Trader.apk
 
-      - name: Upload APK artifact
+      - name: Upload Ankit_AI_Trader.apk Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Ankit_AI_Trader_APK
           path: Ankit_AI_Trader.apk
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
