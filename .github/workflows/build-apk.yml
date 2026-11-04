@@ -5,7 +5,7 @@ on:
   pull_request:
     branches: [ main, master ]
   push:
-    branches: [ main, master ]
+    branches: [ main, master, feature/auto-reconnect-v1-2 ]
 
 permissions:
   contents: read
@@ -46,6 +46,10 @@ jobs:
           elif [ -f "ankit_ai_trader_mobile_v1/pubspec.yaml" ]; then
             echo "Project found in ankit_ai_trader_mobile_v1/."
             cp -R ankit_ai_trader_mobile_v1 workspace/
+          elif [ -f "Ankit_AI_Trader_V1_2_Source.zip.b64" ]; then
+            echo "Decoding corrected V1.2 source archive..."
+            base64 -d Ankit_AI_Trader_V1_2_Source.zip.b64 > /tmp/Ankit_AI_Trader_V1_2_Source.zip
+            unzip -q -o /tmp/Ankit_AI_Trader_V1_2_Source.zip -d workspace
           elif [ -f "Ankit_AI_Trader_Android_V1_1_Background_Source.zip" ]; then
             echo "Extracting Ankit_AI_Trader_Android_V1_1_Background_Source.zip..."
             unzip -q -o Ankit_AI_Trader_Android_V1_1_Background_Source.zip -d workspace
@@ -106,9 +110,11 @@ jobs:
           main_dart.write_text(dart_text, encoding="utf-8")
           PY
 
-          # 2. Fix widget_test.dart so it references AnkitTraderApp instead of MyApp
+          # 2. Keep the deterministic widget test shipped with the V1.2 source.
+          # Fall back to a basic smoke test only if no test file exists.
           mkdir -p test
-          cat > test/widget_test.dart <<'EOF'
+          if [ ! -f test/widget_test.dart ]; then
+            cat > test/widget_test.dart <<'EOF'
           import 'package:flutter_test/flutter_test.dart';
           import 'package:ankit_ai_trader/main.dart';
 
@@ -120,6 +126,7 @@ jobs:
             });
           }
           EOF
+          fi
 
           # The updated source archive already contains the Android 14+ service and network monitor.
 
