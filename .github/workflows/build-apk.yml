@@ -44,7 +44,7 @@ jobs:
           test -f workspace/ankit_ai_trader_mobile_v1/pubspec.yaml
           test -f workspace/ankit_ai_trader_mobile_v1/lib/main.dart
 
-      - name: Generate Flutter Android project files
+      - name: Generate Flutter Android wrapper
         shell: bash
         run: |
           set -e
@@ -60,25 +60,57 @@ jobs:
           rm -rf android/app/src/main/kotlin
           cp -R /tmp/ankit-native/kotlin android/app/src/main/kotlin
 
-      - name: Configure Android build
+      - name: Pin compatible Android build tools
         shell: bash
         run: |
           set -e
           cd workspace/ankit_ai_trader_mobile_v1
 
-          echo "android.newDsl=false" >> android/gradle.properties
+          cat > android/settings.gradle <<'EOF'
+          pluginManagement {
+              def flutterSdkPath = {
+                  def properties = new Properties()
+                  file("local.properties").withInputStream { properties.load(it) }
+                  def flutterSdkPath = properties.getProperty("flutter.sdk")
+                  assert flutterSdkPath != null
+                  return flutterSdkPath
+              }()
+              includeBuild("$flutterSdkPath/packages/flutter_tools/gradle")
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
 
-          python3 - <<'PY'
-          from pathlib import Path
+          plugins {
+              id "dev.flutter.flutter-plugin-loader" version "1.0.0"
+              id "com.android.application" version "8.6.1" apply false
+              id "org.jetbrains.kotlin.android" version "2.1.0" apply false
+          }
 
-          manifest = Path("android/app/src/main/AndroidManifest.xml")
-          content = manifest.read_text(encoding="utf-8")
-          content = content.replace(r'>\n        <meta-data', '>\n        <meta-data')
-          manifest.write_text(content, encoding="utf-8")
+          rootProject.name = "AnkitAITrader"
+          include(":app")
+          EOF
 
-          gradle = Path("android/app/build.gradle")
+          cat > android/gradle/wrapper/gradle-wrapper.properties <<'EOF'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.7-bin.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          EOF
 
-          gradle.write_text("""plugins {
+          cat > android/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx4G -XX:MaxMetaspaceSize=1G
+          android.useAndroidX=true
+          android.newDsl=false
+          EOF
+
+          rm -f android/app/build.gradle.kts
+
+          cat > android/app/build.gradle <<'EOF'
+          plugins {
               id "com.android.application"
               id "org.jetbrains.kotlin.android"
               id "dev.flutter.flutter-gradle-plugin"
@@ -117,12 +149,20 @@ jobs:
           flutter {
               source "../.."
           }
-          """, encoding="utf-8")
-          PY
+          EOF
+
+          echo "===== Android toolchain versions ====="
+          grep -E 'com.android.application|org.jetbrains.kotlin.android' android/settings.gradle
+          cat android/gradle/wrapper/gradle-wrapper.properties
+          cat android/gradle.properties
 
       - name: Install Flutter dependencies
         working-directory: workspace/ankit_ai_trader_mobile_v1
         run: flutter pub get
+
+      - name: Check Flutter project
+        working-directory: workspace/ankit_ai_trader_mobile_v1
+        run: flutter analyze --no-pub
 
       - name: Build release APK
         working-directory: workspace/ankit_ai_trader_mobile_v1
