@@ -108,6 +108,21 @@ jobs:
           dart_text = dart_text.replace("color.withOpacity(disabled ? .08 : .35)", "color.withAlpha(disabled ? 20 : 89)")
           dart_text = dart_text.replace("activeColor: const Color(0xFF39D6A0),", "thumbColor: const WidgetStatePropertyAll<Color>(Color(0xFF39D6A0)),")
           main_dart.write_text(dart_text, encoding="utf-8")
+
+          # Remove duplicate Kotlin import lines carried by the source archive.
+          kotlin_root = Path("android/app/src/main/kotlin")
+          for kt_file in kotlin_root.rglob("*.kt"):
+              lines = kt_file.read_text(encoding="utf-8").splitlines()
+              seen_imports = set()
+              cleaned = []
+              for line in lines:
+                  stripped = line.strip()
+                  if stripped.startswith("import "):
+                      if stripped in seen_imports:
+                          continue
+                      seen_imports.add(stripped)
+                  cleaned.append(line)
+              kt_file.write_text("\\n".join(cleaned) + "\\n", encoding="utf-8")
           PY
 
           # 2. Replace Flutter's generated MyApp test with a deterministic V1.2 test.
