@@ -128,7 +128,7 @@ jobs:
               await tester.pump(const Duration(milliseconds: 20));
               expect(find.text('ANKIT AI TRADER'), findsOneWidget);
               expect(find.text('PAPER TRADING MODE'), findsOneWidget);
-              expect(find.text('\\$100.00'), findsOneWidget);
+              expect(find.text('\$100.00'), findsOneWidget);
               expect(find.text('INTERNET CONNECTED'), findsOneWidget);
               await tester.pumpWidget(const SizedBox.shrink());
             });
