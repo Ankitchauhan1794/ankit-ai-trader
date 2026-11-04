@@ -5,7 +5,7 @@ on:
   pull_request:
     branches: [ main, master ]
   push:
-    branches: [ main, master ]
+    branches: [ main, master, "feature/**" ]
 
 permissions:
   contents: read
@@ -46,6 +46,11 @@ jobs:
           elif [ -f "ankit_ai_trader_mobile_v1/pubspec.yaml" ]; then
             echo "Project found in ankit_ai_trader_mobile_v1/."
             cp -R ankit_ai_trader_mobile_v1 workspace/
+          elif compgen -G "Ankit_AI_Trader_Phase1_Source.part*.b64" > /dev/null; then
+            echo "Reassembling and extracting corrected Phase 1 source..."
+            cat Ankit_AI_Trader_Phase1_Source.part*.b64 > /tmp/Ankit_AI_Trader_Phase1_Source.tar.xz.b64
+            base64 -d /tmp/Ankit_AI_Trader_Phase1_Source.tar.xz.b64 > /tmp/Ankit_AI_Trader_Phase1_Source.tar.xz
+            tar -xJf /tmp/Ankit_AI_Trader_Phase1_Source.tar.xz -C workspace
           elif [ -f "Ankit_AI_Trader_V1_2_Source.zip.b64" ]; then
             echo "Decoding corrected V1.2 source archive..."
             base64 -d Ankit_AI_Trader_V1_2_Source.zip.b64 > /tmp/Ankit_AI_Trader_V1_2_Source.zip
@@ -125,30 +130,7 @@ jobs:
               kt_file.write_text("\n".join(cleaned) + "\n", encoding="utf-8")
           PY
 
-          # 2. Replace Flutter's generated MyApp test with a deterministic V1.2 test.
-          # Inject a successful probe so tests never depend on the public internet.
-          mkdir -p test
-          cat > test/widget_test.dart <<'EOF'
-          import 'package:flutter/material.dart';
-          import 'package:flutter_test/flutter_test.dart';
-          import 'package:ankit_ai_trader/main.dart';
-
-          void main() {
-            testWidgets('dashboard shows paper account and connected state', (tester) async {
-              await tester.pumpWidget(
-                MaterialApp(
-                  home: DashboardPage(internetChecker: () async => true),
-                ),
-              );
-              await tester.pump(const Duration(milliseconds: 20));
-              expect(find.text('ANKIT AI TRADER'), findsOneWidget);
-              expect(find.text('PAPER TRADING MODE'), findsOneWidget);
-              expect(find.text('\$100.00'), findsOneWidget);
-              expect(find.text('INTERNET CONNECTED'), findsOneWidget);
-              await tester.pumpWidget(const SizedBox.shrink());
-            });
-          }
-          EOF
+          # Preserve the complete Phase 1 widget and trading-engine test suite from the source archive.
 
           # The updated source archive already contains the Android 14+ service and network monitor.
 
@@ -263,7 +245,11 @@ jobs:
         working-directory: workspace/ankit_ai_trader_mobile_v1
         run: flutter pub get
 
-      - name: Run Flutter Widget Tests
+      - name: Analyze Dart Source
+        working-directory: workspace/ankit_ai_trader_mobile_v1
+        run: flutter analyze
+
+      - name: Run Phase 1 Unit, Persistence & Widget Tests
         working-directory: workspace/ankit_ai_trader_mobile_v1
         run: flutter test
 
