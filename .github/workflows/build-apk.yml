@@ -66,6 +66,8 @@ jobs:
           set -e
           cd workspace/ankit_ai_trader_mobile_v1
 
+          echo "android.newDsl=false" >> android/gradle.properties
+
           python3 - <<'PY'
           from pathlib import Path
 
