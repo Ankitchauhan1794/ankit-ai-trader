@@ -48,15 +48,20 @@ jobs:
             echo "Project found in ankit_ai_trader_mobile_v1/."
             echo "BUILD_VARIANT=SOURCE_TREE" >> "$GITHUB_ENV"
             cp -R ankit_ai_trader_mobile_v1 workspace/
+          elif [ -f "Ankit_AI_Trader_Phase1_Recovered_Source.tar.xz" ]; then
+            echo "Extracting independently revalidated Phase 1 source archive..."
+            xz -t Ankit_AI_Trader_Phase1_Recovered_Source.tar.xz
+            tar -xJf Ankit_AI_Trader_Phase1_Recovered_Source.tar.xz -C workspace
+            echo "BUILD_VARIANT=PHASE1" >> "$GITHUB_ENV"
           elif compgen -G "Ankit_AI_Trader_Phase1_Source.part*.b64" > /dev/null; then
-            echo "Reassembling and validating corrected Phase 1 source..."
+            echo "Reassembling legacy Phase 1 source archive..."
             cat Ankit_AI_Trader_Phase1_Source.part*.b64 > /tmp/Ankit_AI_Trader_Phase1_Source.tar.xz.b64
             if base64 -d /tmp/Ankit_AI_Trader_Phase1_Source.tar.xz.b64 > /tmp/Ankit_AI_Trader_Phase1_Source.tar.xz \
               && xz -t /tmp/Ankit_AI_Trader_Phase1_Source.tar.xz \
               && tar -xJf /tmp/Ankit_AI_Trader_Phase1_Source.tar.xz -C workspace; then
               echo "BUILD_VARIANT=PHASE1" >> "$GITHUB_ENV"
             else
-              echo "::warning::Phase 1 source archive is corrupt. Building the verified V1.2 fallback only; this APK does NOT contain Phase 1 paper trading."
+              echo "::warning::Legacy Phase 1 archive is corrupt. Building V1.2 fallback only; it does NOT contain Phase 1 paper trading."
               rm -rf workspace/*
               test -f "Ankit_AI_Trader_V1_2_Source.zip.b64"
               base64 -d Ankit_AI_Trader_V1_2_Source.zip.b64 > /tmp/Ankit_AI_Trader_V1_2_Source.zip
@@ -93,13 +98,20 @@ jobs:
           cd workspace/ankit_ai_trader_mobile_v1
 
           mkdir -p /tmp/ankit-native
-          cp lib/main.dart /tmp/ankit-native/main.dart
+          cp -R lib /tmp/ankit-native/lib
+          cp -R test /tmp/ankit-native/test
+          cp pubspec.yaml /tmp/ankit-native/pubspec.yaml
+          cp analysis_options.yaml /tmp/ankit-native/analysis_options.yaml
           cp android/app/src/main/AndroidManifest.xml /tmp/ankit-native/AndroidManifest.xml
           cp -R android/app/src/main/kotlin /tmp/ankit-native/kotlin
 
           flutter create . --platforms=android --project-name=ankit_ai_trader --org=com.ankit
 
-          cp /tmp/ankit-native/main.dart lib/main.dart
+          rm -rf lib test
+          cp -R /tmp/ankit-native/lib lib
+          cp -R /tmp/ankit-native/test test
+          cp /tmp/ankit-native/pubspec.yaml pubspec.yaml
+          cp /tmp/ankit-native/analysis_options.yaml analysis_options.yaml
           cp /tmp/ankit-native/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
           rm -rf android/app/src/main/kotlin
           cp -R /tmp/ankit-native/kotlin android/app/src/main/kotlin
