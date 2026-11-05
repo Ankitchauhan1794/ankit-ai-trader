@@ -260,6 +260,10 @@ jobs:
         working-directory: workspace/ankit_ai_trader_mobile_v1
         run: flutter pub get
 
+      - name: Apply Safe Dart Fixes
+        working-directory: workspace/ankit_ai_trader_mobile_v1
+        run: dart fix --apply
+
       - name: Analyze Dart Source
         working-directory: workspace/ankit_ai_trader_mobile_v1
         run: flutter analyze
