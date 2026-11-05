@@ -15,7 +15,7 @@ void main() {
 
 /// The single authoritative headless Dart entrypoint started by `TradingForegroundService.kt`.
 /// Acknowledges initialization to the native service only after `PersistenceDatabase`
-/// is verified ready. All paper trading execution happens exclusively here.
+/// is verified ready. All paper trading execution and trade alert notifications happen exclusively here.
 @pragma('vm:entry-point')
 Future<void> backgroundServiceMain() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -23,6 +23,7 @@ Future<void> backgroundServiceMain() async {
   final marketService = CoinDcxMarketService();
   final persistence = PersistenceDatabase();
 
+  Timer? retryTimer;
   late final AuthoritativeTradingEngine engine;
   engine = AuthoritativeTradingEngine(
     marketService: marketService,
@@ -34,6 +35,23 @@ Future<void> backgroundServiceMain() async {
           'text': text,
         });
       } catch (_) {}
+    },
+    onTradeAlert: (alert) async {
+      try {
+        await channel.invokeMethod('postTradeAlertNotification', {
+          'alertId': alert.alertId,
+          'title': alert.title,
+          'body': alert.body,
+        });
+      } catch (_) {}
+    },
+    onScheduleRetry: (delayMs, reason) async {
+      retryTimer?.cancel();
+      retryTimer = Timer(Duration(milliseconds: delayMs), () {
+        unawaited(
+          engine.executeAuthoritativeCycle(allowTradingExecution: true),
+        );
+      });
     },
   );
 
@@ -150,8 +168,16 @@ class _DashboardPageState extends State<DashboardPage> {
     final dailyPnl = broker.currentUtcDayTotalPnl(nowMs, prices);
     final drawdown = broker.currentDrawdownUsdt(prices);
 
-    final btcPrice = prices['BTCUSDT'] ?? 0.0;
-    final ethPrice = prices['ETHUSDT'] ?? 0.0;
+    final closedPrices = _coordinator.closedCandlePrices;
+    final liveTickers = _coordinator.liveTickerPrices;
+    final btcPrice = (closedPrices['BTCUSDT'] ?? 0.0) > 0
+        ? closedPrices['BTCUSDT']!
+        : (prices['BTCUSDT'] ?? 0.0);
+    final ethPrice = (closedPrices['ETHUSDT'] ?? 0.0) > 0
+        ? closedPrices['ETHUSDT']!
+        : (prices['ETHUSDT'] ?? 0.0);
+    final btcLiveTicker = liveTickers['BTCUSDT'] ?? 0.0;
+    final ethLiveTicker = liveTickers['ETHUSDT'] ?? 0.0;
     final btcEval = _coordinator.latestEvaluations['BTCUSDT'];
     final ethEval = _coordinator.latestEvaluations['ETHUSDT'];
 
@@ -197,6 +223,8 @@ class _DashboardPageState extends State<DashboardPage> {
             const SizedBox(height: 12),
             _buildBannerCard(),
             const SizedBox(height: 12),
+            _buildTradeAlertsToggleCard(),
+            const SizedBox(height: 12),
             _buildAccountMetricsCard(
               equity: equity,
               cash: cash,
@@ -207,8 +235,10 @@ class _DashboardPageState extends State<DashboardPage> {
             ),
             const SizedBox(height: 12),
             _buildLiveMarketCard(
-              btcPrice: btcPrice,
-              ethPrice: ethPrice,
+              btcClosedPrice: btcPrice,
+              ethClosedPrice: ethPrice,
+              btcLivePrice: btcLiveTicker,
+              ethLivePrice: ethLiveTicker,
               btcEval: btcEval,
               ethEval: ethEval,
             ),
@@ -222,6 +252,86 @@ class _DashboardPageState extends State<DashboardPage> {
             _buildBacktestCard(),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildTradeAlertsToggleCard() {
+    final enabled = _coordinator.tradeAlertsEnabled;
+    final permGranted = _coordinator.notificationPermissionGranted;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        color: const Color(0xFF161F30),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.white12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Trade alert notifications',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 13,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      enabled
+                          ? 'ON — High-importance PAPER TRADE alerts for entries, exits & safety locks'
+                          : 'OFF — Trade alerts muted (persistent service notification stays active)',
+                      style: const TextStyle(color: Colors.white70, fontSize: 11),
+                    ),
+                  ],
+                ),
+              ),
+              Switch(
+                key: const Key('trade_alerts_toggle_switch'),
+                value: enabled,
+                thumbColor: const WidgetStatePropertyAll<Color>(
+                  Color(0xFF39D6A0),
+                ),
+                onChanged: (val) => _coordinator.setTradeAlertsEnabled(val),
+              ),
+            ],
+          ),
+          if (!permGranted) ...[
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: Colors.redAccent.withAlpha(33),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: Colors.redAccent),
+              ),
+              child: Row(
+                children: [
+                  const Expanded(
+                    child: Text(
+                      'Notification permission is blocked on Android 13+. Trade alerts cannot be shown until enabled in settings.',
+                      style: TextStyle(color: Colors.white, fontSize: 11),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton(
+                    onPressed: () => _coordinator.openNotificationSettings(),
+                    child: const Text('NOTIFICATION SETTINGS'),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ],
       ),
     );
   }
@@ -284,6 +394,15 @@ class _DashboardPageState extends State<DashboardPage> {
     final lastUpdate = _coordinator.lastMarketDataUpdateUtc != null
         ? _coordinator.lastMarketDataUpdateUtc!.toIso8601String()
         : 'Never';
+    final nowMs = DateTime.now().toUtc().millisecondsSinceEpoch;
+    final timer = _coordinator.activeTimerSummary;
+    final isRunning = _coordinator.engineState == BotEngineState.running;
+    final activeText = isRunning
+        ? 'Active for ${ActiveTimerSummary.formatHhMmSs(timer.currentSessionElapsedMs(nowMs))}'
+        : 'Last session ${ActiveTimerSummary.formatHhMmSs(timer.lastSessionDurationMs)}';
+    final totalActiveText =
+        'Total active ${ActiveTimerSummary.formatDaysHhMm(timer.effectiveTotalActiveMs(nowMs))}';
+
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
@@ -306,6 +425,22 @@ class _DashboardPageState extends State<DashboardPage> {
           Text(
             'Last Market Data Update (UTC): $lastUpdate',
             style: const TextStyle(color: Colors.white70, fontSize: 11),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            _coordinator.formatHeartbeatStatus(nowOverrideMs: nowMs),
+            key: const Key('heartbeat_status_text'),
+            style: const TextStyle(color: Colors.white70, fontSize: 11),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            '$activeText | $totalActiveText',
+            key: const Key('active_timer_summary_text'),
+            style: const TextStyle(
+              color: Color(0xFF39D6A0),
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+            ),
           ),
         ],
       ),
@@ -384,8 +519,10 @@ class _DashboardPageState extends State<DashboardPage> {
   }
 
   Widget _buildLiveMarketCard({
-    required double btcPrice,
-    required double ethPrice,
+    required double btcClosedPrice,
+    required double ethClosedPrice,
+    required double btcLivePrice,
+    required double ethLivePrice,
     required StrategyEvaluationResult? btcEval,
     required StrategyEvaluationResult? ethEval,
   }) {
@@ -408,24 +545,44 @@ class _DashboardPageState extends State<DashboardPage> {
             ),
           ),
           const SizedBox(height: 8),
-          _pairRow('BTC/USDT', btcPrice, btcEval),
+          _pairRow(
+            symbol: 'BTCUSDT',
+            label: 'BTC/USDT',
+            closedPrice: btcClosedPrice,
+            livePrice: btcLivePrice,
+            eval: btcEval,
+          ),
           const Divider(color: Colors.white12),
-          _pairRow('ETH/USDT', ethPrice, ethEval),
+          _pairRow(
+            symbol: 'ETHUSDT',
+            label: 'ETH/USDT',
+            closedPrice: ethClosedPrice,
+            livePrice: ethLivePrice,
+            eval: ethEval,
+          ),
         ],
       ),
     );
   }
 
-  Widget _pairRow(
-    String label,
-    double price,
-    StrategyEvaluationResult? eval,
-  ) {
-    final priceText = price > 0 ? '\$${price.toStringAsFixed(2)}' : '--';
+  Widget _pairRow({
+    required String symbol,
+    required String label,
+    required double closedPrice,
+    required double livePrice,
+    required StrategyEvaluationResult? eval,
+  }) {
+    final closedText =
+        closedPrice > 0 ? '\$${closedPrice.toStringAsFixed(2)}' : '--';
+    final liveText =
+        livePrice > 0 ? '\$${livePrice.toStringAsFixed(2)}' : '--';
     final sigText = eval?.description ?? 'AWAITING MARKET POLL';
+    final htfTrend =
+        eval == null ? '--' : (eval.higherTimeframeBullish ? 'BULLISH' : 'BEARISH');
     final indText = eval?.ema20_15m != null
-        ? '15m EMA20: ${eval!.ema20_15m!.toStringAsFixed(1)} | EMA50: ${eval.ema50_15m!.toStringAsFixed(1)} | RSI14: ${eval.rsi14_15m!.toStringAsFixed(1)} | ATR14: ${eval.atr14_15m!.toStringAsFixed(2)}'
+        ? '15m EMA20: ${eval!.ema20_15m!.toStringAsFixed(1)} | EMA50: ${eval.ema50_15m!.toStringAsFixed(1)} | RSI14: ${eval.rsi14_15m!.toStringAsFixed(1)} | ATR14: ${eval.atr14_15m!.toStringAsFixed(2)} | 1h: $htfTrend'
         : 'Indicators warming up';
+    final whyNoTrade = _coordinator.whyNoTradeForSymbol(symbol);
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -439,11 +596,11 @@ class _DashboardPageState extends State<DashboardPage> {
                   fontWeight: FontWeight.bold, color: Colors.white),
             ),
             Text(
-              priceText,
+              'Live: $liveText | Closed 15m: $closedText',
               style: const TextStyle(
                 fontWeight: FontWeight.bold,
                 color: Color(0xFF39D6A0),
-                fontSize: 15,
+                fontSize: 13,
               ),
             ),
           ],
@@ -453,6 +610,11 @@ class _DashboardPageState extends State<DashboardPage> {
             style: const TextStyle(color: Colors.amberAccent, fontSize: 11)),
         Text(indText,
             style: const TextStyle(color: Colors.white60, fontSize: 11)),
+        const SizedBox(height: 2),
+        Text(
+          whyNoTrade,
+          style: const TextStyle(color: Colors.lightBlueAccent, fontSize: 11),
+        ),
       ],
     );
   }

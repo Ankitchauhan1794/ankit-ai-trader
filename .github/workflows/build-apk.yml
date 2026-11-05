@@ -234,6 +234,10 @@ jobs:
         working-directory: workspace/ankit_ai_trader_mobile_v1
         run: flutter pub get
 
+      - name: Format Dart Source
+        working-directory: workspace/ankit_ai_trader_mobile_v1
+        run: dart format .
+
       - name: Analyze Dart Source
         working-directory: workspace/ankit_ai_trader_mobile_v1
         run: flutter analyze

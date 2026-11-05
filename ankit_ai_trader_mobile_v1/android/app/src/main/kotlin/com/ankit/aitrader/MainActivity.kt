@@ -1,10 +1,14 @@
 package com.ankit.aitrader
 
+import android.Manifest
+import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -19,6 +23,10 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val SERVICE_CHANNEL = "com.ankit.aitrader/service"
         private const val NETWORK_EVENTS = "com.ankit.aitrader/network_events"
+        private const val REQ_POST_NOTIFICATIONS = 2401
+        // Step 1(e): Raise cold-start timeout from 5s (25 * 200ms) to 15s (75 * 200ms)
+        private const val START_TIMEOUT_ATTEMPTS = 75
+        private const val START_POLL_INTERVAL_MS = 200L
     }
 
     private var connectivityManager: ConnectivityManager? = null
@@ -41,7 +49,7 @@ class MainActivity : FlutterActivity() {
         ).setMethodCallHandler { call, result ->
             when (call.method) {
                 "startService" -> {
-                    val title = call.argument<String>("title") ?: "Ankit AI Trader service active"
+                    val title = call.argument<String>("title") ?: "Ankit AI Trader — PAPER BOT ACTIVE"
                     val text = call.argument<String>("text")
                         ?: "Authoritative background paper engine running."
                     val intent = Intent(this, TradingForegroundService::class.java).apply {
@@ -56,7 +64,7 @@ class MainActivity : FlutterActivity() {
                         } else {
                             startService(intent)
                         }
-                        awaitServiceAndDartInitialization(result, attemptsRemaining = 25)
+                        awaitServiceAndDartInitialization(result, attemptsRemaining = START_TIMEOUT_ATTEMPTS)
                     } catch (e: Exception) {
                         TradingForegroundService.lastStartupError = e.message ?: "Start exception"
                         result.error("SERVICE_START_FAILED", e.message, null)
@@ -87,8 +95,13 @@ class MainActivity : FlutterActivity() {
                         }
                     }
                 }
+                "notifyNetworkChanged" -> {
+                    val connected = call.argument<Boolean>("connected") ?: true
+                    TradingForegroundService.notifyNetworkTransition(connected)
+                    result.success(true)
+                }
                 "updateNotification" -> {
-                    val title = call.argument<String>("title") ?: "Ankit AI Trader"
+                    val title = call.argument<String>("title") ?: "Ankit AI Trader — PAPER BOT ACTIVE"
                     val text = call.argument<String>("text") ?: "Paper mode active"
                     val intent = Intent(this, TradingForegroundService::class.java).apply {
                         action = TradingForegroundService.ACTION_UPDATE
@@ -122,12 +135,52 @@ class MainActivity : FlutterActivity() {
                         mapOf(
                             "serviceRunning" to TradingForegroundService.isRunning,
                             "dartEngineInitialized" to TradingForegroundService.isDartEngineInitialized,
-                            "lastError" to (TradingForegroundService.lastStartupError ?: "")
+                            "lastError" to (TradingForegroundService.lastStartupError ?: ""),
+                            "lastHeartbeatTickError" to (TradingForegroundService.lastHeartbeatTickError ?: ""),
+                            "lastNativeHeartbeatEpochMs" to TradingForegroundService.lastNativeHeartbeatEpochMs
                         )
                     )
                 }
                 "checkNetworkConnected" -> {
                     result.success(isInternetAvailable())
+                }
+                "checkNotificationPermission" -> {
+                    result.success(isNotificationPermissionGranted())
+                }
+                "requestNotificationPermission" -> {
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+                                PackageManager.PERMISSION_GRANTED
+                            ) {
+                                requestPermissions(
+                                    arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                                    REQ_POST_NOTIFICATIONS
+                                )
+                            }
+                        }
+                        result.success(isNotificationPermissionGranted())
+                    } catch (_: Exception) {
+                        result.success(false)
+                    }
+                }
+                "openNotificationSettings" -> {
+                    try {
+                        val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                                putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+                            }
+                        } else {
+                            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                                data = Uri.fromParts("package", packageName, null)
+                            }
+                        }
+                        intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                        startActivity(intent)
+                        result.success(true)
+                    } catch (_: Exception) {
+                        result.success(false)
+                    }
                 }
                 "openBatterySettings" -> {
                     try {
@@ -162,6 +215,20 @@ class MainActivity : FlutterActivity() {
         })
     }
 
+    private fun isNotificationPermissionGranted(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val granted = checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+                PackageManager.PERMISSION_GRANTED
+            if (!granted) return false
+        }
+        val manager = getSystemService(NotificationManager::class.java) ?: return false
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            manager.areNotificationsEnabled()
+        } else {
+            true
+        }
+    }
+
     private fun awaitServiceAndDartInitialization(
         result: MethodChannel.Result,
         attemptsRemaining: Int
@@ -183,14 +250,14 @@ class MainActivity : FlutterActivity() {
         if (attemptsRemaining <= 0) {
             result.error(
                 "SERVICE_INIT_TIMEOUT",
-                "Timed out waiting for TradingForegroundService and background Dart engine acknowledgement.",
+                "starting…",
                 null
             )
             return
         }
         mainHandler.postDelayed(
             { awaitServiceAndDartInitialization(result, attemptsRemaining - 1) },
-            200L
+            START_POLL_INTERVAL_MS
         )
     }
 
@@ -207,7 +274,6 @@ class MainActivity : FlutterActivity() {
         val cm = connectivityManager ?: return
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                TradingForegroundService.notifyNetworkTransition(true)
                 runOnUiThread {
                     eventSink?.success(true)
                 }
@@ -215,7 +281,9 @@ class MainActivity : FlutterActivity() {
 
             override fun onLost(network: Network) {
                 val nowAvailable = isInternetAvailable()
-                TradingForegroundService.notifyNetworkTransition(nowAvailable)
+                if (!nowAvailable) {
+                    TradingForegroundService.notifyNetworkTransition(false)
+                }
                 runOnUiThread {
                     eventSink?.success(nowAvailable)
                 }
@@ -228,7 +296,9 @@ class MainActivity : FlutterActivity() {
                 val validated =
                     networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
                         networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-                TradingForegroundService.notifyNetworkTransition(validated)
+                if (!validated) {
+                    TradingForegroundService.notifyNetworkTransition(false)
+                }
                 runOnUiThread {
                     eventSink?.success(validated)
                 }

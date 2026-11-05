@@ -12,6 +12,7 @@ import 'package:ankit_ai_trader/services/paper_broker.dart';
 import 'package:ankit_ai_trader/services/persistence_db.dart';
 import 'package:ankit_ai_trader/services/risk_manager.dart';
 import 'package:ankit_ai_trader/services/strategy_engine.dart';
+import 'package:ankit_ai_trader/services/trade_alert_formatter.dart';
 import 'package:ankit_ai_trader/services/trading_coordinator.dart';
 
 class FakeEngineCommandBridge implements EngineCommandBridge {
@@ -774,7 +775,8 @@ void main() {
       await persistence.close();
     });
 
-    test('Test 17: Internet loss pauses authoritative engine and automatic reconnection requires manual START', () async {
+    test('Test 17: Internet loss pauses authoritative engine and automatic reconnection requires manual START (via real MethodChannelEngineBridge)', () async {
+      TestWidgetsFlutterBinding.ensureInitialized();
       final db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
       final persistence = PersistenceDatabase();
       await persistence.openWithCustomDatabase(db);
@@ -806,6 +808,9 @@ void main() {
             200,
           );
         }
+        if (request.url.toString().contains('/exchange/ticker')) {
+          return http.Response(jsonEncode([]), 200);
+        }
         final is1h = request.url.queryParameters['interval'] == '1h';
         final step = is1h ? 3600000 : 900000;
         final baseOpen = ((nowMs ~/ step) - 65) * step;
@@ -828,20 +833,50 @@ void main() {
         marketService: mktService,
         persistence: persistence,
       );
-      final bridge = FakeEngineCommandBridge(engine: authEngine);
 
+      // Wire the real MethodChannelEngineBridge ('com.ankit.aitrader/service')
+      const serviceChannel = MethodChannel('com.ankit.aitrader/service');
+      final recordedMethodCalls = <String>[];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(serviceChannel, (MethodCall call) async {
+        recordedMethodCalls.add(call.method);
+        switch (call.method) {
+          case 'startService':
+            return true;
+          case 'isServiceRunning':
+            return true;
+          case 'dispatchCommand':
+            final cmd = (call.arguments as Map?)?['command']?.toString() ?? '';
+            return await authEngine.handleCommand(cmd, nowOverrideMs: nowMs);
+          case 'notifyNetworkChanged':
+            final connected =
+                (call.arguments as Map?)?['connected'] as bool? ?? true;
+            await authEngine.handleNetworkTransition(
+              connected,
+              nowOverrideMs: nowMs,
+            );
+            return true;
+          default:
+            return true;
+        }
+      });
+
+      final realBridge = MethodChannelEngineBridge();
       final coordinator = TradingCoordinator(
         marketService: mktService,
         persistence: persistence,
-        commandBridge: bridge,
+        commandBridge: realBridge,
         customInternetProbe: () async => true,
       );
       await coordinator.initialize(enablePlatformChannels: false);
       await coordinator.manualStartBot();
       expect(coordinator.engineState, BotEngineState.running);
+      expect(recordedMethodCalls, contains('startService'));
+      expect(recordedMethodCalls, contains('dispatchCommand'));
 
-      // Internet lost
+      // Internet lost -> routed through real MethodChannelEngineBridge.notifyNetworkChanged(false)
       await coordinator.handleConnectivityTransition(false);
+      expect(recordedMethodCalls, contains('notifyNetworkChanged'));
       expect(coordinator.engineState, BotEngineState.pausedNetworkLoss);
 
       // Internet recovered -> must remain paused until manual START
@@ -851,6 +886,8 @@ void main() {
         BotEngineState.pausedAfterRecoveryManualStartRequired,
       );
 
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(serviceChannel, null);
       await persistence.close();
     });
 
@@ -920,9 +957,14 @@ void main() {
         startOpenMs: baseTime,
         count: 240,
         closeBuilder: (i) {
-          if (i < 60) return 120.0 - i * 0.15;
-          if (i < 130) return 111.0 + (i - 60) * 0.12;
-          return 119.4 + (i - 130) * 0.25;
+          if (i < 40) return 100.0 + (i.isEven ? 0.2 : -0.2);
+          if (i < 55) return 99.5 - (i - 40) * 0.05 + (i.isEven ? 0.15 : -0.15);
+          if (i < 75) {
+            final step = i - 55;
+            return 99.0 + step * 0.12 + (i.isEven ? 0.18 : -0.14);
+          }
+          if (i < 110) return 101.5 + (i - 75) * 0.35;
+          return 113.0 + (i - 110) * 0.05;
         },
       );
 
@@ -932,31 +974,1014 @@ void main() {
         candles1h: candles1h,
       );
 
-      expect(report.endingEquityUsdt.isFinite, isTrue);
+      expect(report.totalTrades, greaterThan(0));
+      expect(report.winningTrades, greaterThan(0));
+      expect(report.netPnlUsdt, greaterThan(0.0));
+      expect(report.profitFactor, greaterThan(1.0));
+      expect(report.endingEquityUsdt, closeTo(100.0 + report.netPnlUsdt, 1e-6));
       expect(report.maxDrawdownUsdt >= 0.0, isTrue);
       expect(report.winRatePercent >= 0.0 && report.winRatePercent <= 100.0, isTrue);
     });
 
-    test('Test 21: Technical indicators (EMA 20/50, RSI 14, ATR 14) mathematical verification', () {
-      final prices = List<double>.generate(60, (i) => 100.0 + i * 2.0);
+    test('Test 21: Technical indicators (EMA 20/50, RSI 14, ATR 14) mathematical verification including post-seed recursion', () {
+      // 1. EMA seed + post-seed recursion with non-linear jump after seed
+      final prices = List<double>.generate(60, (i) {
+        if (i < 20) return 100.0 + i * 2.0; // indices 0..19 -> SMA20 seed = 119.0
+        if (i == 20) return 150.0; // non-linear jump to test EMA recursion
+        if (i == 21) return 160.0;
+        return 100.0 + i * 2.0;
+      });
       final ema20 = IndicatorEngine.calculateEmaSeries(prices, 20);
-      final ema50 = IndicatorEngine.calculateEmaSeries(prices, 50);
-      expect(ema20[19], closeTo(119.0, 1e-6));
-      expect(ema50[49], closeTo(149.0, 1e-6));
+      expect(ema20[18], isNull);
+      expect(ema20[19], closeTo(119.0, 1e-6)); // seed
+      // Recursion step 1: (150.0 - 119.0) * (2/21) + 119.0 = 121.95238095238095
+      expect(ema20[20], closeTo(121.95238095, 1e-6));
+      // Recursion step 2: (160.0 - 121.95238095238095) * (2/21) + 121.95238095238095 = 125.57596372
+      expect(ema20[21], closeTo(125.57596372, 1e-6));
 
-      final flat = List<double>.filled(20, 100.0);
-      final rsiFlat = IndicatorEngine.calculateRsiSeries(flat, 14);
-      expect(rsiFlat.last, closeTo(50.0, 1e-6));
+      final linear50 = List<double>.generate(55, (i) => 100.0 + i * 2.0);
+      linear50[50] = 250.0; // jump right after EMA50 seed (149.0)
+      final ema50 = IndicatorEngine.calculateEmaSeries(linear50, 50);
+      expect(ema50[49], closeTo(149.0, 1e-6)); // seed
+      // Recursion: (250.0 - 149.0) * (2/51) + 149.0 = 152.9607843137255
+      expect(ema50[50], closeTo(152.96078431, 1e-6));
 
-      final candles = buildContiguousCandles(
+      // 2. RSI 14 Wilder seed + post-seed recursion
+      // Indices 0..14 alternate 100, 101 -> 7 gains of +1, 7 losses of -1 -> seed RSI[14] = 50.0
+      final rsiPrices = <double>[
+        for (int i = 0; i <= 14; i++) i.isEven ? 100.0 : 101.0,
+        103.0, // index 15: change +3.0 -> avgGain=(0.5*13+3)/14=9.5/14, avgLoss=(0.5*13)/14=6.5/14 -> RSI = 59.375
+        101.0, // index 16: change -2.0 -> avgGain=123.5/196, avgLoss=112.5/196 -> RSI = 52.33050847
+      ];
+      final rsiSeries = IndicatorEngine.calculateRsiSeries(rsiPrices, 14);
+      expect(rsiSeries[13], isNull);
+      expect(rsiSeries[14], closeTo(50.0, 1e-6)); // seed
+      expect(rsiSeries[15], closeTo(59.375, 1e-6)); // Wilder recursion step 1
+      expect(rsiSeries[16], closeTo(52.33050847, 1e-6)); // Wilder recursion step 2
+
+      // 3. ATR 14 seed + Wilder post-seed recursion
+      final baseCandles = buildContiguousCandles(
         symbol: 'BTCUSDT',
         interval: '15m',
         startOpenMs: 1700000000000,
-        count: 20,
-        closeBuilder: (_) => 100.0,
+        count: 14,
+        closeBuilder: (_) => 100.0, // high=101.5, low=98.5 -> TR=3.0
       );
-      final atr14 = IndicatorEngine.calculateAtrSeries(candles, 14);
-      expect(atr14.last, closeTo(3.0, 1e-6));
+      const candle14 = Candle(
+        symbol: 'BTCUSDT',
+        interval: '15m',
+        openTimeMs: 1700000000000 + 14 * 900000,
+        closeTimeMs: 1700000000000 + 15 * 900000,
+        open: 100.0,
+        high: 105.0,
+        low: 98.0,
+        close: 104.0,
+        volume: 25.0,
+      ); // TR = 7.0 -> ATR[14] = (3.0 * 13 + 7.0) / 14 = 46/14 = 3.28571429
+      const candle15 = Candle(
+        symbol: 'BTCUSDT',
+        interval: '15m',
+        openTimeMs: 1700000000000 + 15 * 900000,
+        closeTimeMs: 1700000000000 + 16 * 900000,
+        open: 104.0,
+        high: 106.0,
+        low: 101.0,
+        close: 105.0,
+        volume: 25.0,
+      ); // TR = 5.0 -> ATR[15] = ((46/14)*13 + 5.0) / 14 = 668/196 = 3.40816327
+
+      final atr14 = IndicatorEngine.calculateAtrSeries(
+        [...baseCandles, candle14, candle15],
+        14,
+      );
+      expect(atr14[12], isNull);
+      expect(atr14[13], closeTo(3.0, 1e-6)); // seed
+      expect(atr14[14], closeTo(46.0 / 14.0, 1e-6)); // recursion step 1
+      expect(atr14[15], closeTo(668.0 / 196.0, 1e-6)); // recursion step 2
+    });
+
+    test('Test 22: Trade alert text formatting for ENTRY, EXIT, and SAFETY LOCK includes PAPER TRADE label and required metrics', () {
+      const buyOrder = SimulatedOrder(
+        id: 'ORD-BUY-1001',
+        symbol: 'BTCUSDT',
+        side: 'BUY',
+        requestedPrice: 50000.0,
+        executedPrice: 50025.0,
+        quantity: 0.001,
+        notionalUsdt: 50.025,
+        feeUsdt: 0.05,
+        signalCandleCloseMs: 1700000000000,
+        executedAtMs: 1700000900000,
+        reason: 'SIGNAL_NEXT_OPEN_ENTRY',
+      );
+      const position = PaperPosition(
+        id: 'POS-1001',
+        symbol: 'BTCUSDT',
+        entryPrice: 50025.0,
+        quantity: 0.001,
+        stopLoss: 49125.0,
+        takeProfit: 51825.0,
+        entryFeeUsdt: 0.05,
+        signalCandleCloseMs: 1700000000000,
+        openedAtMs: 1700000900000,
+      );
+
+      final entryAlert = TradeAlertFormatter.formatEntryAlert(
+        buyOrder: buyOrder,
+        position: position,
+      );
+      expect(entryAlert.alertId, 'ENTRY:ORD-BUY-1001');
+      expect(entryAlert.title, contains('PAPER TRADE ENTRY'));
+      expect(entryAlert.body, contains('[PAPER TRADE]'));
+      expect(entryAlert.body, contains('BUY BTCUSDT'));
+      expect(entryAlert.body, contains('Entry: \$50025.00'));
+      expect(entryAlert.body, contains('Qty: 0.001000'));
+      expect(entryAlert.body, contains('SL: \$49125.00'));
+      expect(entryAlert.body, contains('TP: \$51825.00'));
+      expect(entryAlert.body, contains('Risked: \$1.00'));
+
+      const sellOrder = SimulatedOrder(
+        id: 'ORD-SELL-1002',
+        symbol: 'BTCUSDT',
+        side: 'SELL',
+        requestedPrice: 51825.0,
+        executedPrice: 51799.09,
+        quantity: 0.001,
+        notionalUsdt: 51.799,
+        feeUsdt: 0.0518,
+        signalCandleCloseMs: 1700000000000,
+        executedAtMs: 1700001800000,
+        reason: 'TAKE_PROFIT',
+      );
+      const closedTrade = ClosedPaperTrade(
+        id: 'TRD-1002',
+        symbol: 'BTCUSDT',
+        entryPrice: 50025.0,
+        exitPrice: 51799.09,
+        quantity: 0.001,
+        stopLoss: 49125.0,
+        takeProfit: 51825.0,
+        totalFeesUsdt: 0.1018,
+        realizedPnlUsdt: 1.67,
+        openedAtMs: 1700000900000,
+        closedAtMs: 1700001800000,
+        exitReason: 'TAKE_PROFIT',
+      );
+
+      final exitAlert = TradeAlertFormatter.formatExitAlert(
+        sellOrder: sellOrder,
+        closedTrade: closedTrade,
+        newAccountEquityUsdt: 101.67,
+      );
+      expect(exitAlert.alertId, 'EXIT:ORD-SELL-1002');
+      expect(exitAlert.title, contains('PAPER TRADE EXIT'));
+      expect(exitAlert.body, contains('[PAPER TRADE]'));
+      expect(exitAlert.body, contains('EXIT BTCUSDT @ \$51799.09'));
+      expect(exitAlert.body, contains('Reason: TAKE_PROFIT'));
+      expect(exitAlert.body, contains('Net P&L: +\$1.67'));
+      expect(exitAlert.body, contains('Equity: \$101.67'));
+
+      final lockAlert = TradeAlertFormatter.formatSafetyLockAlert(
+        lockTypeKey: 'DAILY_LOSS_LIMIT:2026-11-05',
+        lockTitle: 'DAILY LOSS LIMIT (\$2.00) REACHED',
+        reasonDetail: 'New entries locked.',
+        currentEquityUsdt: 97.95,
+      );
+      expect(lockAlert.title, contains('PAPER TRADE SAFETY LOCK'));
+      expect(lockAlert.body, contains('[PAPER TRADE]'));
+      expect(lockAlert.body, contains('Equity: \$97.95'));
+    });
+
+    test('Test 23: Trade alert notifications ON/OFF toggle defaults to ON and persists in SQLite engine_kv_state across restarts', () async {
+      final db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
+      final persistence = PersistenceDatabase();
+      await persistence.openWithCustomDatabase(db);
+
+      // Default is ON (true)
+      expect(await persistence.getTradeAlertsEnabled(), isTrue);
+
+      // Turn OFF and verify persistence
+      await persistence.setTradeAlertsEnabled(false);
+      expect(await persistence.getTradeAlertsEnabled(), isFalse);
+
+      final snapOff = await persistence.restoreFullSnapshot(PaperBroker());
+      expect(snapOff.tradeAlertsEnabled, isFalse);
+
+      // Turn ON and verify persistence
+      await persistence.setTradeAlertsEnabled(true);
+      expect(await persistence.getTradeAlertsEnabled(), isTrue);
+
+      await persistence.close();
+    });
+
+    test('Test 24: Authoritative engine sends NO trade alert when toggle is OFF while keeping foreground service notification active', () async {
+      final db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
+      final persistence = PersistenceDatabase();
+      await persistence.openWithCustomDatabase(db);
+
+      final sentAlerts = <TradeAlertPayload>[];
+      final serviceNotifications = <String>[];
+
+      final engine = AuthoritativeTradingEngine(
+        marketService: CoinDcxMarketService(),
+        persistence: persistence,
+        onNotificationUpdate: (title, text) async {
+          serviceNotifications.add('$title|$text');
+        },
+        onTradeAlert: (alert) async {
+          sentAlerts.add(alert);
+        },
+      );
+
+      // Set toggle to OFF in SQLite
+      await persistence.setTradeAlertsEnabled(false);
+
+      const sampleAlert = TradeAlertPayload(
+        alertId: 'ENTRY:ORD-BUY-5001',
+        title: 'PAPER TRADE ENTRY — BTCUSDT (BUY)',
+        body: '[PAPER TRADE] BUY BTCUSDT',
+      );
+      final dispatchedWhenOff =
+          await engine.dispatchAlertIfEnabledAndNew(sampleAlert);
+      expect(dispatchedWhenOff, isFalse);
+      expect(sentAlerts, isEmpty);
+
+      // Pause command still updates the ongoing foreground service notification
+      await engine.handleCommand('PAUSE', nowOverrideMs: 1700000000000);
+      expect(serviceNotifications.isNotEmpty, isTrue);
+
+      await persistence.close();
+    });
+
+    test('Test 25: Duplicate alert guard prevents sending a second alert for the same order ID across restarts', () async {
+      final db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
+      final persistence = PersistenceDatabase();
+      await persistence.openWithCustomDatabase(db);
+
+      final sentAlerts = <TradeAlertPayload>[];
+      final engine1 = AuthoritativeTradingEngine(
+        marketService: CoinDcxMarketService(),
+        persistence: persistence,
+        onTradeAlert: (alert) async {
+          sentAlerts.add(alert);
+        },
+      );
+
+      const alert = TradeAlertPayload(
+        alertId: 'ENTRY:ORD-BUY-9001',
+        title: 'PAPER TRADE ENTRY — BTCUSDT (BUY)',
+        body: '[PAPER TRADE] BUY BTCUSDT',
+      );
+
+      // First dispatch succeeds
+      final firstSend = await engine1.dispatchAlertIfEnabledAndNew(alert);
+      expect(firstSend, isTrue);
+      expect(sentAlerts.length, 1);
+      expect(await persistence.getLastNotifiedOrderId(), 'ENTRY:ORD-BUY-9001');
+
+      // Simulated service recreation / second engine instance attempting the same order ID
+      final engine2 = AuthoritativeTradingEngine(
+        marketService: CoinDcxMarketService(),
+        persistence: persistence,
+        onTradeAlert: (a) async {
+          sentAlerts.add(a);
+        },
+      );
+      final duplicateSend = await engine2.dispatchAlertIfEnabledAndNew(alert);
+      expect(duplicateSend, isFalse);
+      expect(sentAlerts.length, 1);
+
+      await persistence.close();
+    });
+
+    test('Test 26: CoinDCX /exchange/ticker parser extracts valid BTCUSDT and ETHUSDT last_price and ignores malformed entries', () async {
+      final rawTickerResponse = [
+        {
+          'market': 'BTCUSDT',
+          'change_24_hour': '2.45',
+          'high': '68950.00',
+          'low': '66200.00',
+          'volume': '1420.55',
+          'last_price': '68425.75',
+          'bid': '68425.00',
+          'ask': '68426.50',
+          'timestamp': 1700054000000,
+        },
+        {
+          'market': 'B-ETH_USDT',
+          'change_24_hour': '1.12',
+          'high': '3520.00',
+          'low': '3410.00',
+          'volume': '8540.10',
+          'last_price': 3489.25,
+          'bid': '3489.00',
+          'ask': '3489.50',
+          'timestamp': 1700054000000,
+        },
+        {
+          'market': 'SOLUSDT',
+          'last_price': '185.40',
+        },
+        {
+          'market': 'BTCINR',
+          'last_price': '5800000.00',
+        },
+        {
+          'market': 'ETHUSDT',
+          'last_price': '-10.0', // invalid negative price ignored
+        },
+      ];
+
+      final parsed = CoinDcxMarketService.parseLiveTickerPrices(
+        rawList: rawTickerResponse,
+      );
+      expect(parsed['BTCUSDT'], closeTo(68425.75, 1e-6));
+      expect(parsed['ETHUSDT'], closeTo(3489.25, 1e-6));
+      expect(parsed.containsKey('SOLUSDT'), isFalse);
+
+      final mockClient = MockClient((request) async {
+        expect(request.url.toString(), CoinDcxMarketService.tickerUrl);
+        return http.Response(jsonEncode(rawTickerResponse), 200);
+      });
+      final service = CoinDcxMarketService(client: mockClient);
+      final fetched = await service.fetchLiveTickerPrices();
+      expect(fetched['BTCUSDT'], closeTo(68425.75, 1e-6));
+      expect(fetched['ETHUSDT'], closeTo(3489.25, 1e-6));
+    });
+
+    test('Test 27: Ongoing notification includes live BTC/ETH ticker prices and equity while strategy & SL/TP use only closed candles', () async {
+      final db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
+      final persistence = PersistenceDatabase();
+      await persistence.openWithCustomDatabase(db);
+
+      final nowMs = DateTime.now().toUtc().millisecondsSinceEpoch;
+      final mockClient = MockClient((request) async {
+        final url = request.url.toString();
+        if (url.contains('markets_details')) {
+          return http.Response(
+            jsonEncode([
+              {
+                'symbol': 'BTCUSDT',
+                'pair': 'B-BTC_USDT',
+                'status': 'active',
+                'base_currency_short_name': 'USDT',
+                'target_currency_short_name': 'BTC',
+                'min_notional': 1.0,
+                'min_quantity': 0.0001,
+              },
+              {
+                'symbol': 'ETHUSDT',
+                'pair': 'B-ETH_USDT',
+                'status': 'active',
+                'base_currency_short_name': 'USDT',
+                'target_currency_short_name': 'ETH',
+                'min_notional': 1.0,
+                'min_quantity': 0.001,
+              },
+            ]),
+            200,
+          );
+        }
+        if (url.contains('/exchange/ticker')) {
+          return http.Response(
+            jsonEncode([
+              {
+                'market': 'BTCUSDT',
+                'last_price': '67890.50',
+                'timestamp': nowMs,
+              },
+              {
+                'market': 'ETHUSDT',
+                'last_price': '3456.75',
+                'timestamp': nowMs,
+              },
+            ]),
+            200,
+          );
+        }
+        final is1h = request.url.queryParameters['interval'] == '1h';
+        final step = is1h ? 3600000 : 900000;
+        final baseOpen = ((nowMs ~/ step) - 65) * step;
+        final list = List.generate(65, (i) {
+          final t = baseOpen + (i * step);
+          return {
+            'time': t,
+            'open': 50000 + i * 10,
+            'high': 50050 + i * 10,
+            'low': 49950 + i * 10,
+            'close': 50020 + i * 10,
+            'volume': 12.5,
+          };
+        });
+        return http.Response(jsonEncode(list), 200);
+      });
+
+      final serviceNotifications = <String>[];
+      final mktService = CoinDcxMarketService(client: mockClient);
+      final authEngine = AuthoritativeTradingEngine(
+        marketService: mktService,
+        persistence: persistence,
+        onNotificationUpdate: (title, text) async {
+          serviceNotifications.add('$title|$text');
+        },
+      );
+
+      final started = await authEngine.handleCommand('START', nowOverrideMs: nowMs);
+      expect(started, isTrue);
+      expect(serviceNotifications.isNotEmpty, isTrue);
+
+      final lastNotif = serviceNotifications.last;
+      expect(lastNotif, contains('Eq: \$100.00'));
+      expect(lastNotif, contains('BTC: \$67890.50'));
+      expect(lastNotif, contains('ETH: \$3456.75'));
+
+      final snap = await persistence.restoreFullSnapshot(PaperBroker());
+      expect(snap.latestPrices['BTCUSDT'], closeTo(67890.50, 1e-6));
+      expect(snap.latestPrices['ETHUSDT'], closeTo(3456.75, 1e-6));
+
+      await persistence.close();
+    });
+
+    test('Test 28: Indicator values (EMA20/50, RSI14, ATR14, 1h trend) are kept when NO NEW CLOSED 15M CANDLES and only null when truly warming up', () async {
+      final broker = PaperBroker();
+      const baseMs = 1700000000000;
+      final candles15m = buildContiguousCandles(
+        symbol: 'BTCUSDT',
+        interval: '15m',
+        startOpenMs: baseMs,
+        count: 60,
+        closeBuilder: (i) => 100.0 + i * 0.5,
+      );
+      final candles1h = buildContiguousCandles(
+        symbol: 'BTCUSDT',
+        interval: '1h',
+        startOpenMs: baseMs - (60 * 3600000),
+        count: 75,
+        closeBuilder: (i) => 90.0 + i * 0.5,
+      );
+
+      // First call warms up
+      final first = broker.processClosedCandleStream(
+        symbol: 'BTCUSDT',
+        closed15m: candles15m,
+        closed1h: candles1h,
+        latestPrices: {},
+      );
+      expect(first.evaluations.first.ema20_15m, isNotNull);
+      expect(first.evaluations.first.ema50_15m, isNotNull);
+      expect(first.evaluations.first.rsi14_15m, isNotNull);
+      expect(first.evaluations.first.atr14_15m, isNotNull);
+
+      // Second call with no new closed candles keeps all indicator values non-null
+      final second = broker.processClosedCandleStream(
+        symbol: 'BTCUSDT',
+        closed15m: candles15m,
+        closed1h: candles1h,
+        latestPrices: {},
+      );
+      final evalNoNew = second.evaluations.first;
+      expect(evalNoNew.description, 'NO NEW CLOSED 15M CANDLES');
+      expect(evalNoNew.ema20_15m, closeTo(first.evaluations.first.ema20_15m!, 1e-6));
+      expect(evalNoNew.ema50_15m, closeTo(first.evaluations.first.ema50_15m!, 1e-6));
+      expect(evalNoNew.rsi14_15m, closeTo(first.evaluations.first.rsi14_15m!, 1e-6));
+      expect(evalNoNew.atr14_15m, closeTo(first.evaluations.first.atr14_15m!, 1e-6));
+      expect(evalNoNew.higherTimeframeBullish, isTrue);
+
+      // Truly too few candles (<52) returns null indicators and warming up / insufficient history
+      final short15m = candles15m.sublist(0, 20);
+      final shortEval = broker.strategyEngine.evaluateClosedCandles(
+        closed15m: short15m,
+        closed1h: candles1h.sublist(0, 20),
+        hasOpenPosition: false,
+      );
+      expect(shortEval.ema20_15m, isNull);
+    });
+
+    test('Test 29: Active timer persists runningSinceMs in engine_kv_state and accumulates totalActiveMs across pause/resume', () async {
+      final db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
+      final persistence = PersistenceDatabase();
+      await persistence.openWithCustomDatabase(db);
+      final broker = PaperBroker();
+
+      const tStart = 1700000000000;
+      await persistence.saveFullState(
+        broker: broker,
+        botState: BotEngineState.running,
+        latestPrices: const {'BTCUSDT': 68000.0},
+        nowOverrideMs: tStart,
+      );
+
+      final snapRunning = await persistence.restoreFullSnapshot(broker);
+      expect(snapRunning.runningSinceMs, tStart);
+      expect(snapRunning.totalActiveMs, 0);
+
+      // Pause after 2 hours (7,200,000 ms)
+      const tPause = tStart + 7200000;
+      await persistence.saveFullState(
+        broker: broker,
+        botState: BotEngineState.pausedAfterRecoveryManualStartRequired,
+        latestPrices: const {'BTCUSDT': 68100.0},
+        nowOverrideMs: tPause,
+      );
+
+      final snapPaused = await persistence.restoreFullSnapshot(broker);
+      expect(snapPaused.runningSinceMs, isNull);
+      expect(snapPaused.lastSessionDurationMs, 7200000);
+      expect(snapPaused.totalActiveMs, 7200000);
+      expect(
+        ActiveTimerSummary.formatHhMmSs(snapPaused.lastSessionDurationMs),
+        '02:00:00',
+      );
+
+      // Resume at tResume and run for 35 minutes (2,100,000 ms), then stop
+      const tResume = tPause + 600000;
+      await persistence.saveFullState(
+        broker: broker,
+        botState: BotEngineState.running,
+        latestPrices: const {'BTCUSDT': 68200.0},
+        nowOverrideMs: tResume,
+      );
+
+      const tStop = tResume + 2100000;
+      await persistence.saveFullState(
+        broker: broker,
+        botState: BotEngineState.stopped,
+        latestPrices: const {'BTCUSDT': 68300.0},
+        nowOverrideMs: tStop,
+      );
+
+      final snapStopped = await persistence.restoreFullSnapshot(broker);
+      expect(snapStopped.runningSinceMs, isNull);
+      expect(snapStopped.lastSessionDurationMs, 2100000);
+      expect(snapStopped.totalActiveMs, 9300000); // 2h 35m total
+      expect(
+        ActiveTimerSummary.formatDaysHhMm(snapStopped.totalActiveMs),
+        '0d 02:35',
+      );
+
+      await persistence.close();
+    });
+
+    test('Test 30: Why-no-trade helper reports each first failed condition accurately (stale, locked/paused, 1h not bullish, RSI outside 50-65, no EMA cross, risk rejected, below minimum order)', () {
+      const baseEval = StrategyEvaluationResult(
+        signalType: StrategySignalType.none,
+        description: 'SCANNING 15M (1H BULLISH, RSI 56.0)',
+        evaluatedCandleCloseMs: 1700000900000,
+        ema20_15m: 105.0,
+        ema50_15m: 103.0,
+        rsi14_15m: 56.0,
+        atr14_15m: 1.5,
+        ema20_1h: 104.0,
+        ema50_1h: 101.0,
+        higherTimeframeBullish: true,
+      );
+
+      // 1. Stale data
+      expect(
+        StrategyEngine.deriveWhyNoTradeReason(
+          botState: BotEngineState.pausedStaleData,
+          marketDataStatus: MarketDataStatus.stale,
+          eval: baseEval,
+        ),
+        'Why no trade: Stale data',
+      );
+
+      // 2. Locked / paused
+      expect(
+        StrategyEngine.deriveWhyNoTradeReason(
+          botState: BotEngineState.lockedDailyLossLimit,
+          marketDataStatus: MarketDataStatus.connected,
+          eval: baseEval,
+        ),
+        contains('Why no trade: Locked/paused'),
+      );
+
+      // 3. 1h not bullish
+      const bearish1hEval = StrategyEvaluationResult(
+        signalType: StrategySignalType.waitingHigherTimeframe,
+        description: '15M CROSSOVER BLOCKED: 1H TREND NOT BULLISH',
+        evaluatedCandleCloseMs: 1700000900000,
+        ema20_15m: 105.0,
+        ema50_15m: 103.0,
+        rsi14_15m: 56.0,
+        atr14_15m: 1.5,
+        ema20_1h: 99.0,
+        ema50_1h: 101.0,
+        higherTimeframeBullish: false,
+      );
+      expect(
+        StrategyEngine.deriveWhyNoTradeReason(
+          botState: BotEngineState.running,
+          marketDataStatus: MarketDataStatus.connected,
+          eval: bearish1hEval,
+        ),
+        'Why no trade: 1h not bullish',
+      );
+
+      // 4. RSI outside 50-65
+      const rsiOutEval = StrategyEvaluationResult(
+        signalType: StrategySignalType.none,
+        description: 'SCANNING 15M (1H BULLISH, RSI 71.2)',
+        evaluatedCandleCloseMs: 1700000900000,
+        ema20_15m: 105.0,
+        ema50_15m: 103.0,
+        rsi14_15m: 71.2,
+        atr14_15m: 1.5,
+        ema20_1h: 104.0,
+        ema50_1h: 101.0,
+        higherTimeframeBullish: true,
+      );
+      expect(
+        StrategyEngine.deriveWhyNoTradeReason(
+          botState: BotEngineState.running,
+          marketDataStatus: MarketDataStatus.connected,
+          eval: rsiOutEval,
+        ),
+        'Why no trade: RSI outside 50-65 (71.2)',
+      );
+
+      // 5. No EMA cross
+      expect(
+        StrategyEngine.deriveWhyNoTradeReason(
+          botState: BotEngineState.running,
+          marketDataStatus: MarketDataStatus.connected,
+          eval: baseEval,
+        ),
+        'Why no trade: No EMA cross',
+      );
+
+      // 6. Below minimum order
+      expect(
+        StrategyEngine.deriveWhyNoTradeReason(
+          botState: BotEngineState.running,
+          marketDataStatus: MarketDataStatus.connected,
+          eval: baseEval,
+          lastSizingRejectionReason: 'QUANTITY BELOW EXCHANGE MINIMUM',
+        ),
+        'Why no trade: Below minimum order',
+      );
+
+      // 7. Risk rejected
+      const riskBlockedEval = StrategyEvaluationResult(
+        signalType: StrategySignalType.blockedByRisk,
+        description: 'TRADE RISK EXCEEDS 1% LIMIT',
+        evaluatedCandleCloseMs: 1700000900000,
+        ema20_15m: 105.0,
+        ema50_15m: 103.0,
+        rsi14_15m: 56.0,
+        atr14_15m: 1.5,
+        ema20_1h: 104.0,
+        ema50_1h: 101.0,
+        higherTimeframeBullish: true,
+      );
+      expect(
+        StrategyEngine.deriveWhyNoTradeReason(
+          botState: BotEngineState.running,
+          marketDataStatus: MarketDataStatus.connected,
+          eval: riskBlockedEval,
+        ),
+        'Why no trade: Risk rejected',
+      );
+    });
+
+    test('Test 31: Bounded auto-recovery retries with 30s -> 60s -> 120s backoff for up to 10 minutes and only pauses after 10m window expires', () async {
+      final db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
+      final persistence = PersistenceDatabase();
+      await persistence.openWithCustomDatabase(db);
+
+      const t0 = 1700050000000;
+      await persistence.saveFullState(
+        broker: PaperBroker(),
+        botState: BotEngineState.running,
+        latestPrices: const {'BTCUSDT': 68000.0, 'ETHUSDT': 3400.0},
+        nowOverrideMs: t0,
+      );
+
+      final recordedDelays = <int>[];
+      final scheduledRetries = <int>[];
+      final mockClient = MockClient((request) async {
+        final url = request.url.toString();
+        if (url.contains('markets_details')) {
+          return http.Response(
+            jsonEncode([
+              {
+                'symbol': 'BTCUSDT',
+                'pair': 'B-BTC_USDT',
+                'status': 'active',
+                'base_currency_short_name': 'USDT',
+                'target_currency_short_name': 'BTC',
+                'min_notional': 1.0,
+                'min_quantity': 0.0001,
+              },
+              {
+                'symbol': 'ETHUSDT',
+                'pair': 'B-ETH_USDT',
+                'status': 'active',
+                'base_currency_short_name': 'USDT',
+                'target_currency_short_name': 'ETH',
+                'min_notional': 1.0,
+                'min_quantity': 0.001,
+              },
+            ]),
+            200,
+          );
+        }
+        // Simulate transient HTTP 503 failure on candle fetches
+        return http.Response('Service Unavailable', 503);
+      });
+
+      final engine = AuthoritativeTradingEngine(
+        marketService: CoinDcxMarketService(client: mockClient),
+        persistence: persistence,
+        delayProvider: (delayMs) async {
+          recordedDelays.add(delayMs);
+        },
+        onScheduleRetry: (delayMs, reason) async {
+          scheduledRetries.add(delayMs);
+        },
+      );
+
+      // 1st failed cycle at t0: in-cycle retry schedule [30s, 60s, 120s] + cycle-level retry #1 (30s)
+      final ok1 = await engine.executeAuthoritativeCycle(
+        allowTradingExecution: true,
+        nowOverrideMs: t0,
+      );
+      expect(ok1, isFalse);
+      expect(recordedDelays.sublist(0, 3), [30000, 60000, 120000]);
+      expect(scheduledRetries.first, 30000);
+
+      // Engine must remain RUNNING during the 10-minute bounded window
+      final snapAfter1 = await persistence.restoreFullSnapshot(PaperBroker());
+      expect(snapAfter1.botState, BotEngineState.running);
+      expect(snapAfter1.recoveryAttemptCount, 1);
+      expect(snapAfter1.recoveryLogs, isNotEmpty);
+
+      // 2nd failed cycle at t0 + 35s: cycle-level backoff steps to 60s, still RUNNING
+      await engine.executeAuthoritativeCycle(
+        allowTradingExecution: true,
+        nowOverrideMs: t0 + 35000,
+      );
+      final snapAfter2 = await persistence.restoreFullSnapshot(PaperBroker());
+      expect(snapAfter2.botState, BotEngineState.running);
+      expect(snapAfter2.recoveryAttemptCount, 2);
+      expect(scheduledRetries[1], 60000);
+
+      // 3rd failed cycle at t0 + 100s: cycle-level backoff steps to 120s, still RUNNING
+      await engine.executeAuthoritativeCycle(
+        allowTradingExecution: true,
+        nowOverrideMs: t0 + 100000,
+      );
+      final snapAfter3 = await persistence.restoreFullSnapshot(PaperBroker());
+      expect(snapAfter3.botState, BotEngineState.running);
+      expect(snapAfter3.recoveryAttemptCount, 3);
+      expect(scheduledRetries[2], 120000);
+
+      // After 10 minutes (t0 + 601,000 ms), bounded recovery expires and transitions to PAUSED
+      await engine.executeAuthoritativeCycle(
+        allowTradingExecution: true,
+        nowOverrideMs: t0 + 601000,
+      );
+      final snapExpired = await persistence.restoreFullSnapshot(PaperBroker());
+      expect(
+        snapExpired.botState,
+        BotEngineState.pausedAfterRecoveryManualStartRequired,
+      );
+      expect(
+        snapExpired.statusBannerMessage,
+        contains('PAUSED AFTER 10M AUTO-RECOVERY'),
+      );
+
+      await persistence.close();
+    });
+
+    test('Test 32: Reconnect on reopen keeps RUNNING and shows RECONNECTED banner when heartbeat is under 5m old, and pauses only when service is dead AND heartbeat >= 5m old', () async {
+      final db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
+      final persistence = PersistenceDatabase();
+      await persistence.openWithCustomDatabase(db);
+
+      const baseNowMs = 1700050300000;
+      // Case A: Heartbeat is 45 seconds old (< 5 minutes)
+      const recentHbMs = baseNowMs - 45000;
+      await persistence.saveFullState(
+        broker: PaperBroker(),
+        botState: BotEngineState.running,
+        latestPrices: const {'BTCUSDT': 68100.0, 'ETHUSDT': 3410.0},
+        lastHeartbeatMs: recentHbMs,
+        nowOverrideMs: recentHbMs,
+      );
+
+      final coordinatorReconnect = TradingCoordinator(
+        persistence: persistence,
+        commandBridge: FakeEngineCommandBridge(
+          serviceStartsSuccessfully: true,
+          dartEngineInitializesSuccessfully: true,
+        ),
+        customInternetProbe: () async => true,
+        nowMsProvider: () => baseNowMs,
+      );
+      await coordinatorReconnect.initialize(enablePlatformChannels: false);
+
+      expect(coordinatorReconnect.engineState, BotEngineState.running);
+      expect(
+        coordinatorReconnect.statusBannerMessage,
+        startsWith('RECONNECTED — heartbeat '),
+      );
+      expect(
+        coordinatorReconnect.formatHeartbeatStatus(nowOverrideMs: baseNowMs),
+        contains('(45s ago)'),
+      );
+
+      // Case B: Service is dead AND heartbeat is 6 minutes old (>= 5 minutes) -> downgrade to paused
+      const staleHbMs = baseNowMs - (6 * 60 * 1000);
+      await persistence.saveFullState(
+        broker: PaperBroker(),
+        botState: BotEngineState.running,
+        latestPrices: const {'BTCUSDT': 68100.0, 'ETHUSDT': 3410.0},
+        lastHeartbeatMs: staleHbMs,
+        nowOverrideMs: staleHbMs,
+      );
+
+      final coordinatorDead = TradingCoordinator(
+        persistence: persistence,
+        commandBridge: FakeEngineCommandBridge(
+          serviceStartsSuccessfully: false,
+          dartEngineInitializesSuccessfully: false,
+        ),
+        customInternetProbe: () async => true,
+        nowMsProvider: () => baseNowMs,
+      );
+      await coordinatorDead.initialize(enablePlatformChannels: false);
+
+      expect(
+        coordinatorDead.engineState,
+        BotEngineState.pausedAfterRecoveryManualStartRequired,
+      );
+
+      await persistence.close();
+    });
+
+    test('Test 33: Per-symbol isolation ensures a BTC failure does not skip ETH and keeps the engine RUNNING when ETH succeeds', () async {
+      final db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
+      final persistence = PersistenceDatabase();
+      await persistence.openWithCustomDatabase(db);
+
+      const nowMs = 1700054000000;
+      final mockClient = MockClient((request) async {
+        final url = request.url.toString();
+        if (url.contains('markets_details')) {
+          return http.Response(
+            jsonEncode([
+              {
+                'symbol': 'BTCUSDT',
+                'pair': 'B-BTC_USDT',
+                'status': 'active',
+                'base_currency_short_name': 'USDT',
+                'target_currency_short_name': 'BTC',
+                'min_notional': 1.0,
+                'min_quantity': 0.0001,
+              },
+              {
+                'symbol': 'ETHUSDT',
+                'pair': 'B-ETH_USDT',
+                'status': 'active',
+                'base_currency_short_name': 'USDT',
+                'target_currency_short_name': 'ETH',
+                'min_notional': 1.0,
+                'min_quantity': 0.001,
+              },
+            ]),
+            200,
+          );
+        }
+        if (url.contains('/exchange/ticker')) {
+          return http.Response(jsonEncode([]), 200);
+        }
+        final pair = request.url.queryParameters['pair'] ?? '';
+        // Simulate BTCUSDT throwing HTTP 500 while ETHUSDT succeeds with valid closed candles
+        if (pair.contains('BTC')) {
+          return http.Response('BTC Upstream Error', 500);
+        }
+        final is1h = request.url.queryParameters['interval'] == '1h';
+        final step = is1h ? 3600000 : 900000;
+        final baseOpen = ((nowMs ~/ step) - 65) * step;
+        final list = List.generate(65, (i) {
+          final t = baseOpen + (i * step);
+          return {
+            'time': t,
+            'open': 3400 + i * 2,
+            'high': 3410 + i * 2,
+            'low': 3390 + i * 2,
+            'close': 3405 + i * 2,
+            'volume': 20.0,
+          };
+        });
+        return http.Response(jsonEncode(list), 200);
+      });
+
+      final engine = AuthoritativeTradingEngine(
+        marketService: CoinDcxMarketService(client: mockClient),
+        persistence: persistence,
+      );
+
+      final ok = await engine.handleCommand('START', nowOverrideMs: nowMs);
+      expect(ok, isTrue);
+
+      final snap = await persistence.restoreFullSnapshot(PaperBroker());
+      expect(snap.botState, BotEngineState.running);
+      expect(snap.latestEvaluations.containsKey('ETHUSDT'), isTrue);
+      expect(snap.latestPrices['ETHUSDT'], greaterThan(3400.0));
+      expect(snap.statusBannerMessage, contains('PARTIAL FEED'));
+
+      await persistence.close();
+    });
+
+    test('Test 34: Explicit STOP stops the bot and is never auto-restarted by subsequent background ticks', () async {
+      final db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
+      final persistence = PersistenceDatabase();
+      await persistence.openWithCustomDatabase(db);
+
+      const nowMs = 1700054000000;
+      final mockClient = MockClient((request) async {
+        final url = request.url.toString();
+        if (url.contains('markets_details')) {
+          return http.Response(
+            jsonEncode([
+              {
+                'symbol': 'BTCUSDT',
+                'pair': 'B-BTC_USDT',
+                'status': 'active',
+                'base_currency_short_name': 'USDT',
+                'target_currency_short_name': 'BTC',
+                'min_notional': 1.0,
+                'min_quantity': 0.0001,
+              },
+              {
+                'symbol': 'ETHUSDT',
+                'pair': 'B-ETH_USDT',
+                'status': 'active',
+                'base_currency_short_name': 'USDT',
+                'target_currency_short_name': 'ETH',
+                'min_notional': 1.0,
+                'min_quantity': 0.001,
+              },
+            ]),
+            200,
+          );
+        }
+        if (url.contains('/exchange/ticker')) {
+          return http.Response(jsonEncode([]), 200);
+        }
+        final is1h = request.url.queryParameters['interval'] == '1h';
+        final step = is1h ? 3600000 : 900000;
+        final baseOpen = ((nowMs ~/ step) - 65) * step;
+        final list = List.generate(65, (i) {
+          final t = baseOpen + (i * step);
+          return {
+            'time': t,
+            'open': 50000 + i * 10,
+            'high': 50050 + i * 10,
+            'low': 49950 + i * 10,
+            'close': 50020 + i * 10,
+            'volume': 12.5,
+          };
+        });
+        return http.Response(jsonEncode(list), 200);
+      });
+
+      final engine = AuthoritativeTradingEngine(
+        marketService: CoinDcxMarketService(client: mockClient),
+        persistence: persistence,
+      );
+
+      // Start the bot
+      final started = await engine.handleCommand('START', nowOverrideMs: nowMs);
+      expect(started, isTrue);
+      expect(
+        (await persistence.restoreFullSnapshot(PaperBroker())).botState,
+        BotEngineState.running,
+      );
+
+      // User presses STOP
+      final stopped =
+          await engine.handleCommand('STOP', nowOverrideMs: nowMs + 10000);
+      expect(stopped, isTrue);
+      expect(
+        (await persistence.restoreFullSnapshot(PaperBroker())).botState,
+        BotEngineState.stopped,
+      );
+
+      // Subsequent background ticks must return false and NEVER transition back to running
+      final tickAfterStop = await engine.executeAuthoritativeCycle(
+        allowTradingExecution: true,
+        nowOverrideMs: nowMs + 70000,
+      );
+      expect(tickAfterStop, isFalse);
+      expect(
+        (await persistence.restoreFullSnapshot(PaperBroker())).botState,
+        BotEngineState.stopped,
+      );
+
+      await persistence.close();
     });
   });
 }
