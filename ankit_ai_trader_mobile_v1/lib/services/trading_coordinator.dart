@@ -15,7 +15,7 @@ class MethodChannelEngineBridge implements EngineCommandBridge {
   @override
   Future<bool> ensureServiceStartedAndReady() async {
     final ok = await _serviceChannel.invokeMethod<bool>('startService', {
-      'title': 'Ankit AI Trader (Paper Mode)',
+      'title': 'Ankit AI Trader — PAPER BOT ACTIVE',
       'text': 'Initializing authoritative background paper engine...',
     });
     return ok ?? false;
@@ -51,6 +51,8 @@ class MethodChannelEngineBridge implements EngineCommandBridge {
 /// 1. Sends `START`, `PAUSE`, `STOP`, `RESET`, and `REFRESH_QUOTES` commands to the
 ///    single authoritative background engine via `EngineCommandBridge`.
 /// 2. Reads committed state snapshots from `PersistenceDatabase` to render the UI.
+/// 3. Persists the "Trade alert notifications" ON/OFF toggle in SQLite `engine_kv_state`
+///    without ever stopping the bot or hiding the persistent foreground service notification.
 class TradingCoordinator extends ChangeNotifier {
   static const MethodChannel _serviceChannel =
       MethodChannel('com.ankit.aitrader/service');
@@ -65,6 +67,8 @@ class TradingCoordinator extends ChangeNotifier {
 
   bool foregroundServiceActive = false;
   bool internetConnected = true;
+  bool tradeAlertsEnabled = true;
+  bool notificationPermissionGranted = true;
   MarketDataStatus marketDataStatus = MarketDataStatus.disconnected;
   BotEngineState engineState = BotEngineState.stopped;
 
@@ -108,6 +112,7 @@ class TradingCoordinator extends ChangeNotifier {
   Future<void> refreshStateFromDatabase({bool isInitialLoad = false}) async {
     try {
       final snap = await persistence.restoreFullSnapshot(broker);
+      tradeAlertsEnabled = snap.tradeAlertsEnabled;
       marketDataStatus = snap.marketDataStatus;
       latestPrices.addAll(snap.latestPrices);
       latestEvaluations
@@ -151,6 +156,33 @@ class TradingCoordinator extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Updates the "Trade alert notifications" ON/OFF toggle in SQLite (`engine_kv_state`).
+  /// Takes effect immediately in the authoritative background engine without restarting
+  /// or stopping the bot, and never hides or disables the persistent foreground notification.
+  Future<void> setTradeAlertsEnabled(bool enabled) async {
+    tradeAlertsEnabled = enabled;
+    await persistence.setTradeAlertsEnabled(enabled);
+    notifyListeners();
+  }
+
+  Future<void> checkNotificationPermissionStatus() async {
+    try {
+      final granted = await _serviceChannel
+              .invokeMethod<bool>('checkNotificationPermission') ??
+          true;
+      notificationPermissionGranted = granted;
+    } catch (_) {
+      notificationPermissionGranted = true;
+    }
+    notifyListeners();
+  }
+
+  Future<void> openNotificationSettings() async {
+    try {
+      await _serviceChannel.invokeMethod('openNotificationSettings');
+    } catch (_) {}
+  }
+
   Future<bool> _checkServiceReadySafe() async {
     try {
       final ready = await commandBridge.isServiceAndEngineReady();
@@ -167,6 +199,7 @@ class TradingCoordinator extends ChangeNotifier {
     // Passive SQLite reader timer (only reads state; NEVER executes trades)
     _uiStateRefreshTimer = Timer.periodic(const Duration(seconds: 5), (_) {
       unawaited(refreshStateFromDatabase());
+      unawaited(checkNotificationPermissionStatus());
     });
   }
 
@@ -177,6 +210,10 @@ class TradingCoordinator extends ChangeNotifier {
           await _serviceChannel.invokeMethod<bool>('checkNetworkConnected') ??
               true;
       internetConnected = net;
+      final notifPerm = await _serviceChannel
+              .invokeMethod<bool>('requestNotificationPermission') ??
+          true;
+      notificationPermissionGranted = notifPerm;
     } catch (_) {
       foregroundServiceActive = false;
     }

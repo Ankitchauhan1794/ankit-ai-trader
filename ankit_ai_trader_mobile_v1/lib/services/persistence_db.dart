@@ -12,6 +12,8 @@ class PersistedEngineSnapshot {
   final int? lastMarketDataUpdateMs;
   final Map<String, double> latestPrices;
   final Map<String, StrategyEvaluationResult> latestEvaluations;
+  final bool tradeAlertsEnabled;
+  final Set<String> notifiedAlertIds;
 
   const PersistedEngineSnapshot({
     required this.botState,
@@ -20,6 +22,8 @@ class PersistedEngineSnapshot {
     this.lastMarketDataUpdateMs,
     required this.latestPrices,
     required this.latestEvaluations,
+    this.tradeAlertsEnabled = true,
+    this.notifiedAlertIds = const {},
   });
 }
 
@@ -129,6 +133,103 @@ class PersistenceDatabase {
     if (oldVersion < 2) {
       await _onCreate(db, newVersion);
     }
+  }
+
+  /// Reads whether Trade Alert notifications are enabled from `engine_kv_state`.
+  /// Defaults to `true` (ON) when not yet set.
+  Future<bool> getTradeAlertsEnabled() async {
+    final db = await database;
+    final rows = await db.query(
+      'engine_kv_state',
+      where: 'key = ?',
+      whereArgs: ['tradeAlertsEnabled'],
+    );
+    if (rows.isEmpty) return true;
+    final decoded = jsonDecode(rows.first['value'] as String);
+    if (decoded is bool) return decoded;
+    return true;
+  }
+
+  /// Persists the "Trade alert notifications" ON/OFF toggle in `engine_kv_state`
+  /// so it survives app restarts and process death and takes effect immediately.
+  Future<void> setTradeAlertsEnabled(bool enabled) async {
+    final db = await database;
+    await db.insert(
+      'engine_kv_state',
+      {'key': 'tradeAlertsEnabled', 'value': jsonEncode(enabled)},
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  /// Reads the set of already-notified alert IDs (order IDs / lock event keys)
+  /// from `engine_kv_state` so service restarts cannot send duplicate alerts.
+  Future<Set<String>> getNotifiedAlertIds() async {
+    final db = await database;
+    final rows = await db.query(
+      'engine_kv_state',
+      where: 'key = ?',
+      whereArgs: ['notifiedAlertIds'],
+    );
+    if (rows.isEmpty) return <String>{};
+    final decoded = jsonDecode(rows.first['value'] as String);
+    if (decoded is List) {
+      return decoded.map((e) => e.toString()).toSet();
+    }
+    return <String>{};
+  }
+
+  /// Marks an alert ID (such as `ENTRY:ORD-BUY-...`, `EXIT:ORD-SELL-...`, or `LOCK:...`)
+  /// as sent in `engine_kv_state`. Returns `true` if newly recorded, or `false` if it was
+  /// already notified previously.
+  Future<bool> markAlertIdNotified(String alertId) async {
+    final db = await database;
+    return db.transaction<bool>((txn) async {
+      final rows = await txn.query(
+        'engine_kv_state',
+        where: 'key = ?',
+        whereArgs: ['notifiedAlertIds'],
+      );
+      final existing = <String>{};
+      if (rows.isNotEmpty) {
+        final decoded = jsonDecode(rows.first['value'] as String);
+        if (decoded is List) {
+          existing.addAll(decoded.map((e) => e.toString()));
+        }
+      }
+      if (existing.contains(alertId)) {
+        return false;
+      }
+      existing.add(alertId);
+      await txn.insert(
+        'engine_kv_state',
+        {
+          'key': 'notifiedAlertIds',
+          'value': jsonEncode(existing.toList()),
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      await txn.insert(
+        'engine_kv_state',
+        {
+          'key': 'lastNotifiedOrderId',
+          'value': jsonEncode(alertId),
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      return true;
+    });
+  }
+
+  Future<String?> getLastNotifiedOrderId() async {
+    final db = await database;
+    final rows = await db.query(
+      'engine_kv_state',
+      where: 'key = ?',
+      whereArgs: ['lastNotifiedOrderId'],
+    );
+    if (rows.isEmpty) return null;
+    final decoded = jsonDecode(rows.first['value'] as String);
+    return decoded?.toString();
   }
 
   /// Acquires a persistent SQLite execution lease so that only the single authoritative
@@ -300,6 +401,8 @@ class PersistenceDatabase {
         statusBannerMessage: 'ENGINE STOPPED — PRESS START TO RUN PAPER BOT',
         latestPrices: {'BTCUSDT': 0.0, 'ETHUSDT': 0.0},
         latestEvaluations: {},
+        tradeAlertsEnabled: true,
+        notifiedAlertIds: {},
       );
     }
 
@@ -435,6 +538,14 @@ class PersistenceDatabase {
       });
     }
 
+    final alertsEnabled = (kv['tradeAlertsEnabled'] as bool?) ?? true;
+    final notifiedIds = <String>{};
+    if (kv['notifiedAlertIds'] is List) {
+      for (final item in (kv['notifiedAlertIds'] as List)) {
+        notifiedIds.add(item.toString());
+      }
+    }
+
     return PersistedEngineSnapshot(
       botState: botState,
       marketDataStatus: mktStatus,
@@ -442,6 +553,8 @@ class PersistenceDatabase {
       lastMarketDataUpdateMs: lastUpdateMs,
       latestPrices: restoredPrices,
       latestEvaluations: restoredEvals,
+      tradeAlertsEnabled: alertsEnabled,
+      notifiedAlertIds: notifiedIds,
     );
   }
 
@@ -452,6 +565,7 @@ class PersistenceDatabase {
 
   Future<void> clearAllTables() async {
     final db = await database;
+    final alertsEnabled = await getTradeAlertsEnabled();
     await db.delete('engine_kv_state');
     await db.delete('open_positions');
     await db.delete('closed_trades');
@@ -459,6 +573,7 @@ class PersistenceDatabase {
     await db.delete('equity_snapshots');
     await db.delete('execution_locks');
     await db.delete('processed_signal_keys');
+    await setTradeAlertsEnabled(alertsEnabled);
   }
 
   Future<void> close() async {

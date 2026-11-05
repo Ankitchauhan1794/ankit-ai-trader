@@ -15,7 +15,7 @@ void main() {
 
 /// The single authoritative headless Dart entrypoint started by `TradingForegroundService.kt`.
 /// Acknowledges initialization to the native service only after `PersistenceDatabase`
-/// is verified ready. All paper trading execution happens exclusively here.
+/// is verified ready. All paper trading execution and trade alert notifications happen exclusively here.
 @pragma('vm:entry-point')
 Future<void> backgroundServiceMain() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -32,6 +32,15 @@ Future<void> backgroundServiceMain() async {
         await channel.invokeMethod('updateServiceNotification', {
           'title': title,
           'text': text,
+        });
+      } catch (_) {}
+    },
+    onTradeAlert: (alert) async {
+      try {
+        await channel.invokeMethod('postTradeAlertNotification', {
+          'alertId': alert.alertId,
+          'title': alert.title,
+          'body': alert.body,
         });
       } catch (_) {}
     },
@@ -197,6 +206,8 @@ class _DashboardPageState extends State<DashboardPage> {
             const SizedBox(height: 12),
             _buildBannerCard(),
             const SizedBox(height: 12),
+            _buildTradeAlertsToggleCard(),
+            const SizedBox(height: 12),
             _buildAccountMetricsCard(
               equity: equity,
               cash: cash,
@@ -222,6 +233,86 @@ class _DashboardPageState extends State<DashboardPage> {
             _buildBacktestCard(),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildTradeAlertsToggleCard() {
+    final enabled = _coordinator.tradeAlertsEnabled;
+    final permGranted = _coordinator.notificationPermissionGranted;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        color: const Color(0xFF161F30),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.white12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Trade alert notifications',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 13,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      enabled
+                          ? 'ON — High-importance PAPER TRADE alerts for entries, exits & safety locks'
+                          : 'OFF — Trade alerts muted (persistent service notification stays active)',
+                      style: const TextStyle(color: Colors.white70, fontSize: 11),
+                    ),
+                  ],
+                ),
+              ),
+              Switch(
+                key: const Key('trade_alerts_toggle_switch'),
+                value: enabled,
+                thumbColor: const WidgetStatePropertyAll<Color>(
+                  Color(0xFF39D6A0),
+                ),
+                onChanged: (val) => _coordinator.setTradeAlertsEnabled(val),
+              ),
+            ],
+          ),
+          if (!permGranted) ...[
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: Colors.redAccent.withAlpha(33),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: Colors.redAccent),
+              ),
+              child: Row(
+                children: [
+                  const Expanded(
+                    child: Text(
+                      'Notification permission is blocked on Android 13+. Trade alerts cannot be shown until enabled in settings.',
+                      style: TextStyle(color: Colors.white, fontSize: 11),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton(
+                    onPressed: () => _coordinator.openNotificationSettings(),
+                    child: const Text('NOTIFICATION SETTINGS'),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ],
       ),
     );
   }

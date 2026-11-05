@@ -12,6 +12,7 @@ import 'package:ankit_ai_trader/services/paper_broker.dart';
 import 'package:ankit_ai_trader/services/persistence_db.dart';
 import 'package:ankit_ai_trader/services/risk_manager.dart';
 import 'package:ankit_ai_trader/services/strategy_engine.dart';
+import 'package:ankit_ai_trader/services/trade_alert_formatter.dart';
 import 'package:ankit_ai_trader/services/trading_coordinator.dart';
 
 class FakeEngineCommandBridge implements EngineCommandBridge {
@@ -957,6 +958,348 @@ void main() {
       );
       final atr14 = IndicatorEngine.calculateAtrSeries(candles, 14);
       expect(atr14.last, closeTo(3.0, 1e-6));
+    });
+
+    test('Test 22: Trade alert text formatting for ENTRY, EXIT, and SAFETY LOCK includes PAPER TRADE label and required metrics', () {
+      const buyOrder = SimulatedOrder(
+        id: 'ORD-BUY-1001',
+        symbol: 'BTCUSDT',
+        side: 'BUY',
+        requestedPrice: 50000.0,
+        executedPrice: 50025.0,
+        quantity: 0.001,
+        notionalUsdt: 50.025,
+        feeUsdt: 0.05,
+        signalCandleCloseMs: 1700000000000,
+        executedAtMs: 1700000900000,
+        reason: 'SIGNAL_NEXT_OPEN_ENTRY',
+      );
+      const position = PaperPosition(
+        id: 'POS-1001',
+        symbol: 'BTCUSDT',
+        entryPrice: 50025.0,
+        quantity: 0.001,
+        stopLoss: 49125.0,
+        takeProfit: 51825.0,
+        entryFeeUsdt: 0.05,
+        signalCandleCloseMs: 1700000000000,
+        openedAtMs: 1700000900000,
+      );
+
+      final entryAlert = TradeAlertFormatter.formatEntryAlert(
+        buyOrder: buyOrder,
+        position: position,
+      );
+      expect(entryAlert.alertId, 'ENTRY:ORD-BUY-1001');
+      expect(entryAlert.title, contains('PAPER TRADE ENTRY'));
+      expect(entryAlert.body, contains('[PAPER TRADE]'));
+      expect(entryAlert.body, contains('BUY BTCUSDT'));
+      expect(entryAlert.body, contains('Entry: \$50025.00'));
+      expect(entryAlert.body, contains('Qty: 0.001000'));
+      expect(entryAlert.body, contains('SL: \$49125.00'));
+      expect(entryAlert.body, contains('TP: \$51825.00'));
+      expect(entryAlert.body, contains('Risked: \$1.00'));
+
+      const sellOrder = SimulatedOrder(
+        id: 'ORD-SELL-1002',
+        symbol: 'BTCUSDT',
+        side: 'SELL',
+        requestedPrice: 51825.0,
+        executedPrice: 51799.09,
+        quantity: 0.001,
+        notionalUsdt: 51.799,
+        feeUsdt: 0.0518,
+        signalCandleCloseMs: 1700000000000,
+        executedAtMs: 1700001800000,
+        reason: 'TAKE_PROFIT',
+      );
+      const closedTrade = ClosedPaperTrade(
+        id: 'TRD-1002',
+        symbol: 'BTCUSDT',
+        entryPrice: 50025.0,
+        exitPrice: 51799.09,
+        quantity: 0.001,
+        stopLoss: 49125.0,
+        takeProfit: 51825.0,
+        totalFeesUsdt: 0.1018,
+        realizedPnlUsdt: 1.67,
+        openedAtMs: 1700000900000,
+        closedAtMs: 1700001800000,
+        exitReason: 'TAKE_PROFIT',
+      );
+
+      final exitAlert = TradeAlertFormatter.formatExitAlert(
+        sellOrder: sellOrder,
+        closedTrade: closedTrade,
+        newAccountEquityUsdt: 101.67,
+      );
+      expect(exitAlert.alertId, 'EXIT:ORD-SELL-1002');
+      expect(exitAlert.title, contains('PAPER TRADE EXIT'));
+      expect(exitAlert.body, contains('[PAPER TRADE]'));
+      expect(exitAlert.body, contains('EXIT BTCUSDT @ \$51799.09'));
+      expect(exitAlert.body, contains('Reason: TAKE_PROFIT'));
+      expect(exitAlert.body, contains('Net P&L: +\$1.67'));
+      expect(exitAlert.body, contains('Equity: \$101.67'));
+
+      final lockAlert = TradeAlertFormatter.formatSafetyLockAlert(
+        lockTypeKey: 'DAILY_LOSS_LIMIT:2026-11-05',
+        lockTitle: 'DAILY LOSS LIMIT (\$2.00) REACHED',
+        reasonDetail: 'New entries locked.',
+        currentEquityUsdt: 97.95,
+      );
+      expect(lockAlert.title, contains('PAPER TRADE SAFETY LOCK'));
+      expect(lockAlert.body, contains('[PAPER TRADE]'));
+      expect(lockAlert.body, contains('Equity: \$97.95'));
+    });
+
+    test('Test 23: Trade alert notifications ON/OFF toggle defaults to ON and persists in SQLite engine_kv_state across restarts', () async {
+      final db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
+      final persistence = PersistenceDatabase();
+      await persistence.openWithCustomDatabase(db);
+
+      // Default is ON (true)
+      expect(await persistence.getTradeAlertsEnabled(), isTrue);
+
+      // Turn OFF and verify persistence
+      await persistence.setTradeAlertsEnabled(false);
+      expect(await persistence.getTradeAlertsEnabled(), isFalse);
+
+      final snapOff = await persistence.restoreFullSnapshot(PaperBroker());
+      expect(snapOff.tradeAlertsEnabled, isFalse);
+
+      // Turn ON and verify persistence
+      await persistence.setTradeAlertsEnabled(true);
+      expect(await persistence.getTradeAlertsEnabled(), isTrue);
+
+      await persistence.close();
+    });
+
+    test('Test 24: Authoritative engine sends NO trade alert when toggle is OFF while keeping foreground service notification active', () async {
+      final db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
+      final persistence = PersistenceDatabase();
+      await persistence.openWithCustomDatabase(db);
+
+      final sentAlerts = <TradeAlertPayload>[];
+      final serviceNotifications = <String>[];
+
+      final engine = AuthoritativeTradingEngine(
+        marketService: CoinDcxMarketService(),
+        persistence: persistence,
+        onNotificationUpdate: (title, text) async {
+          serviceNotifications.add('$title|$text');
+        },
+        onTradeAlert: (alert) async {
+          sentAlerts.add(alert);
+        },
+      );
+
+      // Set toggle to OFF in SQLite
+      await persistence.setTradeAlertsEnabled(false);
+
+      const sampleAlert = TradeAlertPayload(
+        alertId: 'ENTRY:ORD-BUY-5001',
+        title: 'PAPER TRADE ENTRY — BTCUSDT (BUY)',
+        body: '[PAPER TRADE] BUY BTCUSDT',
+      );
+      final dispatchedWhenOff =
+          await engine.dispatchAlertIfEnabledAndNew(sampleAlert);
+      expect(dispatchedWhenOff, isFalse);
+      expect(sentAlerts, isEmpty);
+
+      // Pause command still updates the ongoing foreground service notification
+      await engine.handleCommand('PAUSE', nowOverrideMs: 1700000000000);
+      expect(serviceNotifications.isNotEmpty, isTrue);
+
+      await persistence.close();
+    });
+
+    test('Test 25: Duplicate alert guard prevents sending a second alert for the same order ID across restarts', () async {
+      final db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
+      final persistence = PersistenceDatabase();
+      await persistence.openWithCustomDatabase(db);
+
+      final sentAlerts = <TradeAlertPayload>[];
+      final engine1 = AuthoritativeTradingEngine(
+        marketService: CoinDcxMarketService(),
+        persistence: persistence,
+        onTradeAlert: (alert) async {
+          sentAlerts.add(alert);
+        },
+      );
+
+      const alert = TradeAlertPayload(
+        alertId: 'ENTRY:ORD-BUY-9001',
+        title: 'PAPER TRADE ENTRY — BTCUSDT (BUY)',
+        body: '[PAPER TRADE] BUY BTCUSDT',
+      );
+
+      // First dispatch succeeds
+      final firstSend = await engine1.dispatchAlertIfEnabledAndNew(alert);
+      expect(firstSend, isTrue);
+      expect(sentAlerts.length, 1);
+      expect(await persistence.getLastNotifiedOrderId(), 'ENTRY:ORD-BUY-9001');
+
+      // Simulated service recreation / second engine instance attempting the same order ID
+      final engine2 = AuthoritativeTradingEngine(
+        marketService: CoinDcxMarketService(),
+        persistence: persistence,
+        onTradeAlert: (a) async {
+          sentAlerts.add(a);
+        },
+      );
+      final duplicateSend = await engine2.dispatchAlertIfEnabledAndNew(alert);
+      expect(duplicateSend, isFalse);
+      expect(sentAlerts.length, 1);
+
+      await persistence.close();
+    });
+
+    test('Test 26: CoinDCX /exchange/ticker parser extracts valid BTCUSDT and ETHUSDT last_price and ignores malformed entries', () async {
+      final rawTickerResponse = [
+        {
+          'market': 'BTCUSDT',
+          'change_24_hour': '2.45',
+          'high': '68950.00',
+          'low': '66200.00',
+          'volume': '1420.55',
+          'last_price': '68425.75',
+          'bid': '68425.00',
+          'ask': '68426.50',
+          'timestamp': 1700054000000,
+        },
+        {
+          'market': 'B-ETH_USDT',
+          'change_24_hour': '1.12',
+          'high': '3520.00',
+          'low': '3410.00',
+          'volume': '8540.10',
+          'last_price': 3489.25,
+          'bid': '3489.00',
+          'ask': '3489.50',
+          'timestamp': 1700054000000,
+        },
+        {
+          'market': 'SOLUSDT',
+          'last_price': '185.40',
+        },
+        {
+          'market': 'BTCINR',
+          'last_price': '5800000.00',
+        },
+        {
+          'market': 'ETHUSDT',
+          'last_price': '-10.0', // invalid negative price ignored
+        },
+      ];
+
+      final parsed = CoinDcxMarketService.parseLiveTickerPrices(
+        rawList: rawTickerResponse,
+      );
+      expect(parsed['BTCUSDT'], closeTo(68425.75, 1e-6));
+      expect(parsed['ETHUSDT'], closeTo(3489.25, 1e-6));
+      expect(parsed.containsKey('SOLUSDT'), isFalse);
+
+      final mockClient = MockClient((request) async {
+        expect(request.url.toString(), CoinDcxMarketService.tickerUrl);
+        return http.Response(jsonEncode(rawTickerResponse), 200);
+      });
+      final service = CoinDcxMarketService(client: mockClient);
+      final fetched = await service.fetchLiveTickerPrices();
+      expect(fetched['BTCUSDT'], closeTo(68425.75, 1e-6));
+      expect(fetched['ETHUSDT'], closeTo(3489.25, 1e-6));
+    });
+
+    test('Test 27: Ongoing notification includes live BTC/ETH ticker prices and equity while strategy & SL/TP use only closed candles', () async {
+      final db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
+      final persistence = PersistenceDatabase();
+      await persistence.openWithCustomDatabase(db);
+
+      final nowMs = DateTime.now().toUtc().millisecondsSinceEpoch;
+      final mockClient = MockClient((request) async {
+        final url = request.url.toString();
+        if (url.contains('markets_details')) {
+          return http.Response(
+            jsonEncode([
+              {
+                'symbol': 'BTCUSDT',
+                'pair': 'B-BTC_USDT',
+                'status': 'active',
+                'base_currency_short_name': 'USDT',
+                'target_currency_short_name': 'BTC',
+                'min_notional': 1.0,
+                'min_quantity': 0.0001,
+              },
+              {
+                'symbol': 'ETHUSDT',
+                'pair': 'B-ETH_USDT',
+                'status': 'active',
+                'base_currency_short_name': 'USDT',
+                'target_currency_short_name': 'ETH',
+                'min_notional': 1.0,
+                'min_quantity': 0.001,
+              },
+            ]),
+            200,
+          );
+        }
+        if (url.contains('/exchange/ticker')) {
+          return http.Response(
+            jsonEncode([
+              {
+                'market': 'BTCUSDT',
+                'last_price': '67890.50',
+                'timestamp': nowMs,
+              },
+              {
+                'market': 'ETHUSDT',
+                'last_price': '3456.75',
+                'timestamp': nowMs,
+              },
+            ]),
+            200,
+          );
+        }
+        final is1h = request.url.queryParameters['interval'] == '1h';
+        final step = is1h ? 3600000 : 900000;
+        final baseOpen = ((nowMs ~/ step) - 65) * step;
+        final list = List.generate(65, (i) {
+          final t = baseOpen + (i * step);
+          return {
+            'time': t,
+            'open': 50000 + i * 10,
+            'high': 50050 + i * 10,
+            'low': 49950 + i * 10,
+            'close': 50020 + i * 10,
+            'volume': 12.5,
+          };
+        });
+        return http.Response(jsonEncode(list), 200);
+      });
+
+      final serviceNotifications = <String>[];
+      final mktService = CoinDcxMarketService(client: mockClient);
+      final authEngine = AuthoritativeTradingEngine(
+        marketService: mktService,
+        persistence: persistence,
+        onNotificationUpdate: (title, text) async {
+          serviceNotifications.add('$title|$text');
+        },
+      );
+
+      final started = await authEngine.handleCommand('START', nowOverrideMs: nowMs);
+      expect(started, isTrue);
+      expect(serviceNotifications.isNotEmpty, isTrue);
+
+      final lastNotif = serviceNotifications.last;
+      expect(lastNotif, contains('Eq: \$100.00'));
+      expect(lastNotif, contains('BTC: \$67890.50'));
+      expect(lastNotif, contains('ETH: \$3456.75'));
+
+      final snap = await persistence.restoreFullSnapshot(PaperBroker());
+      expect(snap.latestPrices['BTCUSDT'], closeTo(67890.50, 1e-6));
+      expect(snap.latestPrices['ETHUSDT'], closeTo(3456.75, 1e-6));
+
+      await persistence.close();
     });
   });
 }

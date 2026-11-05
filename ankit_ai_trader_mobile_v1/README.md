@@ -1,4 +1,4 @@
-# Ankit AI Trader — Phase 1 Final Candidate (Simulated Paper-Trading Engine)
+# Ankit AI Trader — Phase 1 Final Candidate (with Trade Alert Notifications & Toggle)
 
 ## Complete File Tree
 
@@ -45,46 +45,32 @@ ankit_ai_trader_mobile_v1/
       persistence_db.dart
       risk_manager.dart
       strategy_engine.dart
+      trade_alert_formatter.dart
       trading_coordinator.dart
   test/
     phase1_trading_test.dart
     widget_test.dart
 ```
 
-## Architecture & Safety Guarantees
+## Trade Alert Notifications & In-App Toggle
 
-1. **Single Authoritative Trading Engine (`AuthoritativeTradingEngine`)**:
-   - Hosted exclusively inside `TradingForegroundService`'s headless background Dart isolate (`backgroundServiceMain`).
-   - Protected by a persistent SQLite execution lease table (`execution_locks`) and idempotency table (`processed_signal_keys`).
-   - `TradingCoordinator` in the UI isolate has zero trade-execution timers and never runs `processClosedCandleStream`; it only dispatches commands (`START`, `PAUSE`, `STOP`, `RESET`, `REFRESH_QUOTES`) over `EngineCommandBridge` and reads committed SQLite snapshots.
-   - `MainActivity.kt` waits for both Android `TradingForegroundService.isRunning` and Dart `acknowledgeEngineInitialized` before reporting the service as active.
+1. **Dedicated High-Importance Notification Channel (`Trade Alerts`)**:
+   - `TradingForegroundService.kt` creates a dedicated `NotificationChannel("trade_alerts_channel", "Trade Alerts", NotificationManager.IMPORTANCE_HIGH)` completely separate from the ongoing service channel (`"ankit_trader_service"`).
+   - Every trade alert is posted as a normal dismissible notification (`setOngoing(false)`, `setAutoCancel(true)`) with a unique notification ID (`>= 2000`) so it never replaces or overwrites the persistent `"Ankit AI Trader — PAPER BOT ACTIVE"` foreground notification (`ID 1101`).
 
-2. **First-Start Historical Warm-Up Without Historical Trades**:
-   - When `lastProcessedCandleCloseMs[symbol]` is null on a fresh account, historical candles are used solely to warm up EMA 20, EMA 50, RSI 14, and ATR 14.
-   - A checkpoint is committed at the latest closed 15m candle without generating historical trades or pending signals.
-   - Only candles closing after the user's manual `START` command are evaluated for trade signals.
+2. **Events & Mandatory `PAPER TRADE` Labeling (`TradeAlertFormatter`)**:
+   - **Simulated ENTRY**: Includes `[PAPER TRADE]`, symbol, side (`BUY`), entry price, quantity, stop-loss, take-profit, and dollar amount risked.
+   - **Simulated EXIT**: Includes `[PAPER TRADE]`, symbol, exit price, exit reason (`STOP_LOSS`, `TAKE_PROFIT`, `BEARISH_EMA_CROSSOVER`, etc.), net P&L after fees and slippage, and new account equity.
+   - **Safety Locks**: Fires when the `$2.00` Daily Loss Limit, `$90.00` Maximum Drawdown / Equity Floor, or Internet Loss Pause triggers.
 
-3. **Persistent UTC-Day Baseline & Daily Loss Management ($2 Limit)**:
-   - At the first valid market valuation of each UTC day (`YYYY-MM-DD`), `PaperBroker.ensureUtcDayBaseline` establishes and persists `startOfDayEquityUsdt` in SQLite without resetting the $100 account or closing open positions.
-   - Daily P&L is computed against that baseline (`accountEquity - startOfDayEquityUsdt`), incorporating both realized P&L (with fees) and unrealized P&L.
-   - When daily loss reaches `-$2.00`, new entries are locked (`BotEngineState.lockedDailyLossLimit`), while the authoritative engine stays alive whenever `openPositions.isNotEmpty` to continue managing existing positions against Stop-Loss and Take-Profit.
+3. **In-App Toggle (`Trade alert notifications` ON/OFF)**:
+   - Persisted in SQLite `engine_kv_state` under key `'tradeAlertsEnabled'` (default: `true` / ON).
+   - `AuthoritativeTradingEngine.dispatchAlertIfEnabledAndNew` reads `getTradeAlertsEnabled()` from SQLite before sending each alert, so flipping the switch takes effect immediately without restarting the bot and without hiding the ongoing foreground service notification.
+   - Duplicate alerts are prevented via SQLite-persisted `notifiedAlertIds` and `lastNotifiedOrderId`.
+   - If Android 13+ (`POST_NOTIFICATIONS`) permission is denied, the app never crashes; the dashboard displays a warning banner with a **NOTIFICATION SETTINGS** button.
 
-4. **$90 Maximum Drawdown Floor & Emergency Liquidation**:
-   - When account equity reaches or falls below `$90.00`, `maxDrawdownLocked` is set permanently and pending signals are cleared.
-   - Open positions are liquidated using valid market prices. If a valid market quote is unavailable, the engine never invents a price—it locks the account and sets `pendingEmergencyLiquidation = true` until a valid quote arrives.
+## Device Test Checklist (Manual QA Verification)
 
-5. **Android Battery Management & OEM Restrictions**:
-   - `TradingForegroundService.kt` acquires a bounded 15-minute `PARTIAL_WAKE_LOCK` renewed on each 60-second heartbeat and released cleanly in `onDestroy()`.
-   - Because Android OEMs (Xiaomi MIUI, Vivo, Oppo, Samsung) may still throttle background network sockets under extreme battery saver policies, 24/7 uninterrupted uptime is never guaranteed; users can grant unrestricted battery usage via the **BATTERY SETTINGS** button.
-
-## Build & Verification Instructions
-
-```bash
-cd ankit_ai_trader_mobile_v1
-flutter pub get
-dart format .
-dart format --set-exit-if-changed .
-flutter analyze
-flutter test
-flutter build apk --release --android-skip-build-dependency-validation
-```
+- [ ] **Closed-App Entry & Exit Alert Verification**: Start the paper bot with **Trade alert notifications** set to **ON**, swipe/close the app UI so only the background foreground service is running, trigger a simulated entry and exit, and verify that separate dismissible heads-up notifications appear under the **"Trade Alerts"** channel labeled `[PAPER TRADE]`.
+- [ ] **Toggle OFF Verification**: Turn **Trade alert notifications** **OFF** on the dashboard, trigger a simulated trade event or safety lock, and verify that **no** trade alert notification appears while the persistent **"Ankit AI Trader — PAPER BOT ACTIVE"** foreground service notification remains visible and the bot continues running.
+- [ ] **Android 13+ Permission Denied Handling**: Deny notification permission in Android system settings, open the dashboard, and verify the app does not crash, displays the blocked-alerts notice, and opens system settings when tapping **NOTIFICATION SETTINGS**.
