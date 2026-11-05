@@ -273,7 +273,9 @@ void main() {
         closeBuilder: (i) => 100.0 + i * 0.2,
       );
 
-      final nextCandleOpen = candles15m.last.open;
+      final nextCandleOpen = candles15m
+          .firstWhere((c) => c.openTimeMs == signalCloseMs)
+          .open;
       final outcome = broker.processClosedCandleStream(
         symbol: 'BTCUSDT',
         closed15m: candles15m,
@@ -806,7 +808,7 @@ void main() {
         }
         final is1h = request.url.queryParameters['interval'] == '1h';
         final step = is1h ? 3600000 : 900000;
-        final baseOpen = ((nowMs ~/ step) - 70) * step;
+        final baseOpen = ((nowMs ~/ step) - 65) * step;
         final list = List.generate(65, (i) {
           final t = baseOpen + (i * step);
           return {
