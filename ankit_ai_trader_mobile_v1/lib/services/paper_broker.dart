@@ -211,12 +211,28 @@ class PaperBroker {
         : closed15m.where((c) => c.closeTimeMs > lastProcessed).toList();
 
     if (unprocessed.isEmpty) {
+      final latestCandle = closed15m.last;
+      final slice1h = closed1h
+          .where((c) => c.closeTimeMs <= latestCandle.closeTimeMs)
+          .toList();
+      final latestEval = strategyEngine.evaluateClosedCandles(
+        closed15m: closed15m,
+        closed1h: slice1h,
+        hasOpenPosition: openPositions.containsKey(symbol),
+      );
       return CandleStreamProcessOutcome(
         evaluations: [
           StrategyEvaluationResult(
             signalType: StrategySignalType.none,
             description: 'NO NEW CLOSED 15M CANDLES',
-            evaluatedCandleCloseMs: closed15m.last.closeTimeMs,
+            evaluatedCandleCloseMs: latestCandle.closeTimeMs,
+            ema20_15m: latestEval.ema20_15m,
+            ema50_15m: latestEval.ema50_15m,
+            rsi14_15m: latestEval.rsi14_15m,
+            atr14_15m: latestEval.atr14_15m,
+            ema20_1h: latestEval.ema20_1h,
+            ema50_1h: latestEval.ema50_1h,
+            higherTimeframeBullish: latestEval.higherTimeframeBullish,
           ),
         ],
       );

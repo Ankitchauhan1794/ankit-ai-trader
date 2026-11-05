@@ -3,6 +3,7 @@ import 'coindcx_market_service.dart';
 import 'paper_broker.dart';
 import 'persistence_db.dart';
 import 'strategy_engine.dart';
+import 'trade_alert_formatter.dart';
 
 /// The SINGLE authoritative trading execution engine.
 /// Hosted exclusively inside `TradingForegroundService`'s headless background Dart isolate.
@@ -17,6 +18,7 @@ class AuthoritativeTradingEngine {
   final PaperBroker broker;
   final String ownerId;
   final Future<void> Function(String title, String text)? onNotificationUpdate;
+  final Future<void> Function(TradeAlertPayload alert)? onTradeAlert;
 
   bool _isCycleRunning = false;
 
@@ -26,7 +28,88 @@ class AuthoritativeTradingEngine {
     PaperBroker? broker,
     this.ownerId = backgroundOwnerId,
     this.onNotificationUpdate,
+    this.onTradeAlert,
   }) : broker = broker ?? PaperBroker();
+
+  /// Sends a high-importance dismissible trade alert ONLY if:
+  /// 1. `tradeAlertsEnabled` is currently `true` (ON) in SQLite `engine_kv_state`.
+  /// 2. `alert.alertId` has never been notified before (persisted in SQLite `notifiedAlertIds`
+  ///    and `lastNotifiedOrderId` so service restarts cannot send duplicate alerts).
+  Future<bool> dispatchAlertIfEnabledAndNew(TradeAlertPayload alert) async {
+    final enabled = await persistence.getTradeAlertsEnabled();
+    if (!enabled) {
+      return false;
+    }
+    final isNew = await persistence.markAlertIdNotified(alert.alertId);
+    if (!isNew) {
+      return false;
+    }
+    if (onTradeAlert != null) {
+      await onTradeAlert!(alert);
+    }
+    return true;
+  }
+
+  /// Inspects any newly created orders/trades after a processing step and dispatches
+  /// exactly one ENTRY or EXIT alert per new simulated order ID.
+  Future<void> _emitAlertsForNewOrders({
+    required Set<String> previousOrderIds,
+    required Map<String, double> latestPrices,
+  }) async {
+    final newOrders = broker.orderHistory
+        .where((o) => !previousOrderIds.contains(o.id))
+        .toList()
+        .reversed
+        .toList();
+
+    for (final order in newOrders) {
+      if (order.side == 'BUY') {
+        PaperPosition? matchedPos = broker.openPositions[order.symbol];
+        if (matchedPos == null ||
+            matchedPos.openedAtMs != order.executedAtMs) {
+          // If position was opened and closed in the same batch, reconstruct from closedTrade
+          final closedMatch = broker.closedTrades.where(
+            (t) =>
+                t.symbol == order.symbol && t.openedAtMs == order.executedAtMs,
+          );
+          if (closedMatch.isNotEmpty) {
+            final ct = closedMatch.first;
+            matchedPos = PaperPosition(
+              id: 'POS-${order.id}',
+              symbol: ct.symbol,
+              entryPrice: ct.entryPrice,
+              quantity: ct.quantity,
+              stopLoss: ct.stopLoss,
+              takeProfit: ct.takeProfit,
+              entryFeeUsdt: order.feeUsdt,
+              signalCandleCloseMs: order.signalCandleCloseMs,
+              openedAtMs: ct.openedAtMs,
+            );
+          }
+        }
+        if (matchedPos != null) {
+          final payload = TradeAlertFormatter.formatEntryAlert(
+            buyOrder: order,
+            position: matchedPos,
+          );
+          await dispatchAlertIfEnabledAndNew(payload);
+        }
+      } else if (order.side == 'SELL') {
+        final closedMatches = broker.closedTrades.where(
+          (t) =>
+              t.symbol == order.symbol && t.closedAtMs == order.executedAtMs,
+        );
+        if (closedMatches.isNotEmpty) {
+          final payload = TradeAlertFormatter.formatExitAlert(
+            sellOrder: order,
+            closedTrade: closedMatches.first,
+            newAccountEquityUsdt: broker.accountEquity(latestPrices),
+          );
+          await dispatchAlertIfEnabledAndNew(payload);
+        }
+      }
+    }
+  }
 
   /// Handles commands dispatched from the UI (`START`, `PAUSE`, `STOP`, `RESET`, `REFRESH_QUOTES`).
   Future<bool> handleCommand(String command, {int? nowOverrideMs}) async {
@@ -53,9 +136,12 @@ class AuthoritativeTradingEngine {
               broker: broker,
               botState: BotEngineState.stoppedMaxDrawdownReached,
               latestPrices: prices,
+              closedCandlePrices: snap.closedCandlePrices,
+              liveTickerPrices: snap.liveTickerPrices,
               marketDataStatus: snap.marketDataStatus,
               statusBannerMessage:
                   'MAXIMUM DRAWDOWN REACHED — MANUAL RESET REQUIRED',
+              nowOverrideMs: nowMs,
             );
             return false;
           }
@@ -71,14 +157,20 @@ class AuthoritativeTradingEngine {
             broker: broker,
             botState: BotEngineState.pausedAfterRecoveryManualStartRequired,
             latestPrices: prices,
+            closedCandlePrices: snap.closedCandlePrices,
+            liveTickerPrices: snap.liveTickerPrices,
             marketDataStatus: snap.marketDataStatus,
             statusBannerMessage: 'BOT PAUSED MANUALLY — PRESS START TO RESUME',
             lastMarketDataUpdateMs: snap.lastMarketDataUpdateMs,
             latestEvaluations: snap.latestEvaluations,
+            nowOverrideMs: nowMs,
           );
           await _notify(
             'Ankit AI Trader — PAUSED',
-            'Paused manually. Manual START required.',
+            _formatOngoingNotificationText(
+              BotEngineState.pausedAfterRecoveryManualStartRequired,
+              prices,
+            ),
           );
           return true;
 
@@ -87,14 +179,17 @@ class AuthoritativeTradingEngine {
             broker: broker,
             botState: BotEngineState.stopped,
             latestPrices: prices,
+            closedCandlePrices: snap.closedCandlePrices,
+            liveTickerPrices: snap.liveTickerPrices,
             marketDataStatus: snap.marketDataStatus,
             statusBannerMessage: 'ENGINE STOPPED BY USER',
             lastMarketDataUpdateMs: snap.lastMarketDataUpdateMs,
             latestEvaluations: snap.latestEvaluations,
+            nowOverrideMs: nowMs,
           );
           await _notify(
             'Ankit AI Trader — STOPPED',
-            'Engine stopped by user.',
+            _formatOngoingNotificationText(BotEngineState.stopped, prices),
           );
           return true;
 
@@ -131,7 +226,7 @@ class AuthoritativeTradingEngine {
   }
 
   /// Handles network transitions reported to the authoritative service.
-  /// - Network loss pauses the engine immediately.
+  /// - Network loss pauses the engine immediately and sends a PAPER TRADE safety lock alert.
   /// - Network recovery NEVER auto-restarts trading; requires manual START.
   Future<void> handleNetworkTransition(
     bool isConnected, {
@@ -148,24 +243,37 @@ class AuthoritativeTradingEngine {
     try {
       final snap = await persistence.restoreFullSnapshot(broker);
       if (!isConnected) {
-        final nextState = (snap.botState == BotEngineState.running ||
-                snap.botState == BotEngineState.lockedDailyLossLimit)
-            ? BotEngineState.pausedNetworkLoss
-            : snap.botState;
+        final wasActive = snap.botState == BotEngineState.running ||
+            snap.botState == BotEngineState.lockedDailyLossLimit;
+        final nextState =
+            wasActive ? BotEngineState.pausedNetworkLoss : snap.botState;
         await persistence.saveFullState(
           broker: broker,
           botState: nextState,
           latestPrices: snap.latestPrices,
+          closedCandlePrices: snap.closedCandlePrices,
+          liveTickerPrices: snap.liveTickerPrices,
           marketDataStatus: MarketDataStatus.disconnected,
           statusBannerMessage:
               'INTERNET DISCONNECTED — BOT PAUSED FOR SAFETY',
           lastMarketDataUpdateMs: snap.lastMarketDataUpdateMs,
           latestEvaluations: snap.latestEvaluations,
+          nowOverrideMs: nowMs,
         );
         await _notify(
           'Ankit AI Trader — OFFLINE',
           'Internet disconnected. Bot paused for safety.',
         );
+        if (wasActive) {
+          final lockAlert = TradeAlertFormatter.formatSafetyLockAlert(
+            lockTypeKey: 'INTERNET_LOSS:$nowMs',
+            lockTitle: 'INTERNET LOSS PAUSE',
+            reasonDetail:
+                'Internet disconnected. Paper bot paused for safety; manual START required after recovery.',
+            currentEquityUsdt: broker.accountEquity(snap.latestPrices),
+          );
+          await dispatchAlertIfEnabledAndNew(lockAlert);
+        }
       } else {
         final nextState = (snap.botState == BotEngineState.pausedNetworkLoss ||
                 snap.botState == BotEngineState.running)
@@ -175,11 +283,14 @@ class AuthoritativeTradingEngine {
           broker: broker,
           botState: nextState,
           latestPrices: snap.latestPrices,
+          closedCandlePrices: snap.closedCandlePrices,
+          liveTickerPrices: snap.liveTickerPrices,
           marketDataStatus: snap.marketDataStatus,
           statusBannerMessage:
               'INTERNET RECONNECTED — BOT PAUSED (MANUAL START REQUIRED)',
           lastMarketDataUpdateMs: snap.lastMarketDataUpdateMs,
           latestEvaluations: snap.latestEvaluations,
+          nowOverrideMs: nowMs,
         );
         await _notify(
           'Ankit AI Trader — RECONNECTED (PAUSED)',
@@ -193,11 +304,6 @@ class AuthoritativeTradingEngine {
 
   /// Executes a single authoritative market-data & strategy cycle protected by
   /// the SQLite execution lock.
-  ///
-  /// Keep-Alive Rule During Daily Loss Lock:
-  /// If `botState == BotEngineState.lockedDailyLossLimit` and `broker.openPositions.isNotEmpty`,
-  /// the engine remains alive to manage existing open positions against Stop-Loss and Take-Profit
-  /// while blocking any new entries.
   Future<bool> executeAuthoritativeCycle({
     required bool allowTradingExecution,
     bool transitionToRunningOnSuccess = false,
@@ -222,6 +328,9 @@ class AuthoritativeTradingEngine {
       final latestPrices = Map<String, double>.from(snap.latestPrices);
       final latestEvaluations =
           Map<String, StrategyEvaluationResult>.from(snap.latestEvaluations);
+      final previousOrderIds = broker.orderHistory.map((o) => o.id).toSet();
+      final wasMaxDrawdownLocked = broker.maxDrawdownLocked;
+      final previousDailyLockDate = broker.lockedDailyLossUtcDate;
 
       final shouldManageActiveEngine = transitionToRunningOnSuccess ||
           snap.botState == BotEngineState.running ||
@@ -375,24 +484,71 @@ class AuthoritativeTradingEngine {
         nextBanner =
             'BOT RUNNING — PROCESSING CLOSED 15M/1H COINDCX CANDLES';
       } else {
-        nextBanner = 'MARKET QUOTES UPDATED — ENGINE ${nextState.name.toUpperCase()}';
+        nextBanner =
+            'MARKET QUOTES UPDATED — ENGINE ${nextState.name.toUpperCase()}';
+      }
+
+      final closedCandlePrices = Map<String, double>.from(latestPrices);
+      final liveTickerPrices = Map<String, double>.from(snap.liveTickerPrices);
+
+      // Fetch display-only live ticker prices after closed-candle strategy & SL/TP evaluation
+      try {
+        final liveTickers = await marketService.fetchLiveTickerPrices();
+        for (final entry in liveTickers.entries) {
+          if (entry.value > 0 && entry.value.isFinite) {
+            liveTickerPrices[entry.key] = entry.value;
+            latestPrices[entry.key] = entry.value;
+          }
+        }
+      } catch (_) {
+        // Fallback to closed-candle close prices if ticker endpoint is unavailable
       }
 
       await persistence.saveFullState(
         broker: broker,
         botState: nextState,
         latestPrices: latestPrices,
+        closedCandlePrices: closedCandlePrices,
+        liveTickerPrices: liveTickerPrices,
         marketDataStatus: MarketDataStatus.connected,
         statusBannerMessage: nextBanner,
         lastMarketDataUpdateMs: nowMs,
         latestEvaluations: latestEvaluations,
+        nowOverrideMs: nowMs,
       );
 
-      final eq = broker.accountEquity(latestPrices).toStringAsFixed(2);
-      final btc = latestPrices['BTCUSDT']?.toStringAsFixed(2) ?? '--';
+      // Emit trade alerts for any newly opened or closed orders
+      await _emitAlertsForNewOrders(
+        previousOrderIds: previousOrderIds,
+        latestPrices: latestPrices,
+      );
+
+      // Emit safety lock alerts if daily loss limit or $90 max drawdown floor just triggered
+      final currentEq = broker.accountEquity(latestPrices);
+      if (!wasMaxDrawdownLocked && broker.maxDrawdownLocked) {
+        final ddAlert = TradeAlertFormatter.formatSafetyLockAlert(
+          lockTypeKey: 'MAX_DRAWDOWN_EQUITY_FLOOR',
+          lockTitle: 'MAX DRAWDOWN / \$90 EQUITY FLOOR REACHED',
+          reasonDetail:
+              'Account equity reached or fell below \$90.00 floor. Engine stopped; manual review & reset required.',
+          currentEquityUsdt: currentEq,
+        );
+        await dispatchAlertIfEnabledAndNew(ddAlert);
+      } else if (broker.lockedDailyLossUtcDate != null &&
+          broker.lockedDailyLossUtcDate != previousDailyLockDate) {
+        final dlAlert = TradeAlertFormatter.formatSafetyLockAlert(
+          lockTypeKey: 'DAILY_LOSS_LIMIT:${broker.lockedDailyLossUtcDate}',
+          lockTitle: 'DAILY LOSS LIMIT (\$2.00) REACHED',
+          reasonDetail:
+              'New entries locked for UTC day ${broker.lockedDailyLossUtcDate}. Open positions remain managed.',
+          currentEquityUsdt: currentEq,
+        );
+        await dispatchAlertIfEnabledAndNew(dlAlert);
+      }
+
       await _notify(
-        'Ankit AI Trader — Paper Engine',
-        'State: ${nextState.name.toUpperCase()} | Eq: \$$eq | BTC: \$$btc',
+        'Ankit AI Trader — PAPER BOT ACTIVE',
+        _formatOngoingNotificationText(nextState, latestPrices),
       );
       return true;
     } catch (e) {
@@ -425,6 +581,18 @@ class AuthoritativeTradingEngine {
       await persistence.releaseExecutionLock(ownerId);
       _isCycleRunning = false;
     }
+  }
+
+  String _formatOngoingNotificationText(
+    BotEngineState state,
+    Map<String, double> displayPrices,
+  ) {
+    final eq = broker.accountEquity(displayPrices).toStringAsFixed(2);
+    final btcVal = displayPrices['BTCUSDT'] ?? 0.0;
+    final ethVal = displayPrices['ETHUSDT'] ?? 0.0;
+    final btc = btcVal > 0 ? btcVal.toStringAsFixed(2) : '--';
+    final eth = ethVal > 0 ? ethVal.toStringAsFixed(2) : '--';
+    return 'State: ${state.name.toUpperCase()} | Eq: \$$eq | BTC: \$$btc | ETH: \$$eth';
   }
 
   Future<void> _notify(String title, String text) async {

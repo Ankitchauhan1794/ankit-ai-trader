@@ -11,7 +11,14 @@ class PersistedEngineSnapshot {
   final String statusBannerMessage;
   final int? lastMarketDataUpdateMs;
   final Map<String, double> latestPrices;
+  final Map<String, double> closedCandlePrices;
+  final Map<String, double> liveTickerPrices;
   final Map<String, StrategyEvaluationResult> latestEvaluations;
+  final bool tradeAlertsEnabled;
+  final Set<String> notifiedAlertIds;
+  final int? runningSinceMs;
+  final int totalActiveMs;
+  final int lastSessionDurationMs;
 
   const PersistedEngineSnapshot({
     required this.botState,
@@ -19,7 +26,14 @@ class PersistedEngineSnapshot {
     required this.statusBannerMessage,
     this.lastMarketDataUpdateMs,
     required this.latestPrices,
+    this.closedCandlePrices = const {},
+    this.liveTickerPrices = const {},
     required this.latestEvaluations,
+    this.tradeAlertsEnabled = true,
+    this.notifiedAlertIds = const {},
+    this.runningSinceMs,
+    this.totalActiveMs = 0,
+    this.lastSessionDurationMs = 0,
   });
 }
 
@@ -131,6 +145,103 @@ class PersistenceDatabase {
     }
   }
 
+  /// Reads whether Trade Alert notifications are enabled from `engine_kv_state`.
+  /// Defaults to `true` (ON) when not yet set.
+  Future<bool> getTradeAlertsEnabled() async {
+    final db = await database;
+    final rows = await db.query(
+      'engine_kv_state',
+      where: 'key = ?',
+      whereArgs: ['tradeAlertsEnabled'],
+    );
+    if (rows.isEmpty) return true;
+    final decoded = jsonDecode(rows.first['value'] as String);
+    if (decoded is bool) return decoded;
+    return true;
+  }
+
+  /// Persists the "Trade alert notifications" ON/OFF toggle in `engine_kv_state`
+  /// so it survives app restarts and process death and takes effect immediately.
+  Future<void> setTradeAlertsEnabled(bool enabled) async {
+    final db = await database;
+    await db.insert(
+      'engine_kv_state',
+      {'key': 'tradeAlertsEnabled', 'value': jsonEncode(enabled)},
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  /// Reads the set of already-notified alert IDs (order IDs / lock event keys)
+  /// from `engine_kv_state` so service restarts cannot send duplicate alerts.
+  Future<Set<String>> getNotifiedAlertIds() async {
+    final db = await database;
+    final rows = await db.query(
+      'engine_kv_state',
+      where: 'key = ?',
+      whereArgs: ['notifiedAlertIds'],
+    );
+    if (rows.isEmpty) return <String>{};
+    final decoded = jsonDecode(rows.first['value'] as String);
+    if (decoded is List) {
+      return decoded.map((e) => e.toString()).toSet();
+    }
+    return <String>{};
+  }
+
+  /// Marks an alert ID (such as `ENTRY:ORD-BUY-...`, `EXIT:ORD-SELL-...`, or `LOCK:...`)
+  /// as sent in `engine_kv_state`. Returns `true` if newly recorded, or `false` if it was
+  /// already notified previously.
+  Future<bool> markAlertIdNotified(String alertId) async {
+    final db = await database;
+    return db.transaction<bool>((txn) async {
+      final rows = await txn.query(
+        'engine_kv_state',
+        where: 'key = ?',
+        whereArgs: ['notifiedAlertIds'],
+      );
+      final existing = <String>{};
+      if (rows.isNotEmpty) {
+        final decoded = jsonDecode(rows.first['value'] as String);
+        if (decoded is List) {
+          existing.addAll(decoded.map((e) => e.toString()));
+        }
+      }
+      if (existing.contains(alertId)) {
+        return false;
+      }
+      existing.add(alertId);
+      await txn.insert(
+        'engine_kv_state',
+        {
+          'key': 'notifiedAlertIds',
+          'value': jsonEncode(existing.toList()),
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      await txn.insert(
+        'engine_kv_state',
+        {
+          'key': 'lastNotifiedOrderId',
+          'value': jsonEncode(alertId),
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      return true;
+    });
+  }
+
+  Future<String?> getLastNotifiedOrderId() async {
+    final db = await database;
+    final rows = await db.query(
+      'engine_kv_state',
+      where: 'key = ?',
+      whereArgs: ['lastNotifiedOrderId'],
+    );
+    if (rows.isEmpty) return null;
+    final decoded = jsonDecode(rows.first['value'] as String);
+    return decoded?.toString();
+  }
+
   /// Acquires a persistent SQLite execution lease so that only the single authoritative
   /// engine can execute candle evaluations and trade mutations at any time.
   Future<bool> acquireExecutionLock({
@@ -179,13 +290,17 @@ class PersistenceDatabase {
     required PaperBroker broker,
     required BotEngineState botState,
     required Map<String, double> latestPrices,
+    Map<String, double>? closedCandlePrices,
+    Map<String, double>? liveTickerPrices,
     MarketDataStatus marketDataStatus = MarketDataStatus.connected,
     String statusBannerMessage = '',
     int? lastMarketDataUpdateMs,
     Map<String, StrategyEvaluationResult>? latestEvaluations,
+    int? nowOverrideMs,
   }) async {
     final db = await database;
-    final nowMs = DateTime.now().toUtc().millisecondsSinceEpoch;
+    final nowMs =
+        nowOverrideMs ?? DateTime.now().toUtc().millisecondsSinceEpoch;
     broker.ensureUtcDayBaseline(nowMs, latestPrices);
 
     await db.transaction((txn) async {
@@ -216,11 +331,82 @@ class PersistenceDatabase {
       if (lastMarketDataUpdateMs != null) {
         await putKv('lastMarketDataUpdateMs', lastMarketDataUpdateMs);
       }
+      // Item 2: Active timer tracking in engine_kv_state (runningSinceMs, totalActiveMs, lastSessionDurationMs)
+      final timerRows = await txn.query(
+        'engine_kv_state',
+        where: 'key IN (?, ?, ?, ?)',
+        whereArgs: [
+          'runningSinceMs',
+          'totalActiveMs',
+          'lastSessionDurationMs',
+          'latestEvaluations',
+        ],
+      );
+      final timerKv = <String, dynamic>{
+        for (final r in timerRows)
+          r['key'] as String: jsonDecode(r['value'] as String),
+      };
+      final rawRunningSince = (timerKv['runningSinceMs'] as num?)?.toInt() ?? 0;
+      int? runningSinceMs = rawRunningSince > 0 ? rawRunningSince : null;
+      int totalActiveMs = (timerKv['totalActiveMs'] as num?)?.toInt() ?? 0;
+      int lastSessionDurationMs =
+          (timerKv['lastSessionDurationMs'] as num?)?.toInt() ?? 0;
+
+      if (botState == BotEngineState.running) {
+        runningSinceMs ??= nowMs;
+      } else {
+        if (runningSinceMs != null) {
+          final elapsed = nowMs > runningSinceMs ? (nowMs - runningSinceMs) : 0;
+          totalActiveMs += elapsed;
+          lastSessionDurationMs = elapsed;
+          runningSinceMs = null;
+        }
+      }
+      await putKv('runningSinceMs', runningSinceMs ?? 0);
+      await putKv('totalActiveMs', totalActiveMs);
+      await putKv('lastSessionDurationMs', lastSessionDurationMs);
+
       await putKv('latestPrices', latestPrices);
+      if (closedCandlePrices != null) {
+        await putKv('closedCandlePrices', closedCandlePrices);
+      }
+      if (liveTickerPrices != null) {
+        await putKv('liveTickerPrices', liveTickerPrices);
+      }
       if (latestEvaluations != null) {
+        final prevEvals = <String, StrategyEvaluationResult>{};
+        if (timerKv['latestEvaluations'] is Map) {
+          (timerKv['latestEvaluations'] as Map).forEach((k, v) {
+            if (v is Map) {
+              prevEvals[k.toString()] = StrategyEvaluationResult.fromMap(
+                Map<String, dynamic>.from(v),
+              );
+            }
+          });
+        }
         final evalMap = <String, dynamic>{};
         latestEvaluations.forEach((k, v) {
-          evalMap[k] = v.toMap();
+          final prev = prevEvals[k];
+          if (v.ema20_15m == null &&
+              prev != null &&
+              prev.ema20_15m != null &&
+              v.description != 'INSUFFICIENT CANDLE HISTORY FOR EMA 50' &&
+              v.description != 'INDICATORS WARMING UP') {
+            evalMap[k] = StrategyEvaluationResult(
+              signalType: v.signalType,
+              description: v.description,
+              evaluatedCandleCloseMs: v.evaluatedCandleCloseMs,
+              ema20_15m: prev.ema20_15m,
+              ema50_15m: prev.ema50_15m,
+              rsi14_15m: prev.rsi14_15m,
+              atr14_15m: prev.atr14_15m,
+              ema20_1h: prev.ema20_1h,
+              ema50_1h: prev.ema50_1h,
+              higherTimeframeBullish: prev.higherTimeframeBullish,
+            ).toMap();
+          } else {
+            evalMap[k] = v.toMap();
+          }
         });
         await putKv('latestEvaluations', evalMap);
       }
@@ -300,6 +486,8 @@ class PersistenceDatabase {
         statusBannerMessage: 'ENGINE STOPPED — PRESS START TO RUN PAPER BOT',
         latestPrices: {'BTCUSDT': 0.0, 'ETHUSDT': 0.0},
         latestEvaluations: {},
+        tradeAlertsEnabled: true,
+        notifiedAlertIds: {},
       );
     }
 
@@ -435,13 +623,55 @@ class PersistenceDatabase {
       });
     }
 
+    final restoredClosedPrices = <String, double>{
+      'BTCUSDT': restoredPrices['BTCUSDT'] ?? 0.0,
+      'ETHUSDT': restoredPrices['ETHUSDT'] ?? 0.0,
+    };
+    if (kv['closedCandlePrices'] is Map) {
+      (kv['closedCandlePrices'] as Map).forEach((k, v) {
+        if (v is num) {
+          restoredClosedPrices[k.toString()] = v.toDouble();
+        }
+      });
+    }
+
+    final restoredLiveTickers = <String, double>{};
+    if (kv['liveTickerPrices'] is Map) {
+      (kv['liveTickerPrices'] as Map).forEach((k, v) {
+        if (v is num) {
+          restoredLiveTickers[k.toString()] = v.toDouble();
+        }
+      });
+    }
+
+    final rawRunningSince = (kv['runningSinceMs'] as num?)?.toInt() ?? 0;
+    final runningSinceMs = rawRunningSince > 0 ? rawRunningSince : null;
+    final totalActiveMs = (kv['totalActiveMs'] as num?)?.toInt() ?? 0;
+    final lastSessionDurationMs =
+        (kv['lastSessionDurationMs'] as num?)?.toInt() ?? 0;
+
+    final alertsEnabled = (kv['tradeAlertsEnabled'] as bool?) ?? true;
+    final notifiedIds = <String>{};
+    if (kv['notifiedAlertIds'] is List) {
+      for (final item in (kv['notifiedAlertIds'] as List)) {
+        notifiedIds.add(item.toString());
+      }
+    }
+
     return PersistedEngineSnapshot(
       botState: botState,
       marketDataStatus: mktStatus,
       statusBannerMessage: banner,
       lastMarketDataUpdateMs: lastUpdateMs,
       latestPrices: restoredPrices,
+      closedCandlePrices: restoredClosedPrices,
+      liveTickerPrices: restoredLiveTickers,
       latestEvaluations: restoredEvals,
+      tradeAlertsEnabled: alertsEnabled,
+      notifiedAlertIds: notifiedIds,
+      runningSinceMs: runningSinceMs,
+      totalActiveMs: totalActiveMs,
+      lastSessionDurationMs: lastSessionDurationMs,
     );
   }
 
@@ -452,6 +682,7 @@ class PersistenceDatabase {
 
   Future<void> clearAllTables() async {
     final db = await database;
+    final alertsEnabled = await getTradeAlertsEnabled();
     await db.delete('engine_kv_state');
     await db.delete('open_positions');
     await db.delete('closed_trades');
@@ -459,6 +690,7 @@ class PersistenceDatabase {
     await db.delete('equity_snapshots');
     await db.delete('execution_locks');
     await db.delete('processed_signal_keys');
+    await setTradeAlertsEnabled(alertsEnabled);
   }
 
   Future<void> close() async {

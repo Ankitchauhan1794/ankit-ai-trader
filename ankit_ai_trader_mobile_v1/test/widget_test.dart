@@ -9,7 +9,8 @@ void main() {
     databaseFactory = databaseFactoryFfi;
   });
 
-  testWidgets('1. Dashboard renders paper account, \$100 equity, and connected state',
+  testWidgets(
+      '1. Dashboard renders paper account, \$100 equity, connected state, and Trade alert notifications toggle',
       (tester) async {
     await tester.pumpWidget(
       MaterialApp(
@@ -19,6 +20,8 @@ void main() {
     await tester.pump(const Duration(milliseconds: 50));
     expect(find.text('ANKIT AI TRADER'), findsOneWidget);
     expect(find.text('PAPER TRADING MODE'), findsOneWidget);
+    expect(find.text('Trade alert notifications'), findsOneWidget);
+    expect(find.byKey(const Key('trade_alerts_toggle_switch')), findsOneWidget);
     expect(find.text('\$100.00'), findsWidgets);
     expect(find.text('INTERNET CONNECTED'), findsOneWidget);
     await tester.pumpWidget(const SizedBox.shrink());

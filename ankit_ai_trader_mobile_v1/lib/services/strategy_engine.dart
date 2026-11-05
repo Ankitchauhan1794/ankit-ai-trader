@@ -241,4 +241,80 @@ class StrategyEngine {
       reason: 'HOLD',
     );
   }
+
+  /// Read-only helper that derives the "WHY NO TRADE" line per coin showing the
+  /// first failed condition (no EMA cross, RSI outside 50-65, 1h not bullish,
+  /// risk rejected, below minimum order, locked/paused, stale data) from existing
+  /// evaluation and state snapshots without changing any strategy or risk logic.
+  static String deriveWhyNoTradeReason({
+    required BotEngineState botState,
+    required MarketDataStatus marketDataStatus,
+    required StrategyEvaluationResult? eval,
+    bool hasOpenPositionForSymbol = false,
+    bool hasOtherOpenPosition = false,
+    String? lastSizingRejectionReason,
+    StrategyConfig config = const StrategyConfig(),
+  }) {
+    if (marketDataStatus == MarketDataStatus.stale ||
+        botState == BotEngineState.pausedStaleData) {
+      return 'Why no trade: Stale data';
+    }
+    if (botState == BotEngineState.lockedDailyLossLimit ||
+        botState == BotEngineState.stoppedMaxDrawdownReached ||
+        (eval != null &&
+            (eval.description.contains('DAILY LOSS LIMIT') ||
+                eval.description.contains('MAXIMUM DRAWDOWN')))) {
+      return 'Why no trade: Locked/paused (${botState.name})';
+    }
+    if (botState != BotEngineState.running) {
+      return 'Why no trade: Locked/paused (${botState.name})';
+    }
+    if (hasOpenPositionForSymbol) {
+      return 'Position open — managing SL/TP & exit';
+    }
+    if (hasOtherOpenPosition) {
+      return 'Why no trade: Risk rejected (max 1 open position)';
+    }
+    if (lastSizingRejectionReason != null &&
+        lastSizingRejectionReason.isNotEmpty) {
+      final upper = lastSizingRejectionReason.toUpperCase();
+      if (upper.contains('MINIMUM') || upper.contains('NOTIONAL')) {
+        return 'Why no trade: Below minimum order';
+      }
+      return 'Why no trade: Risk rejected ($lastSizingRejectionReason)';
+    }
+    if (eval == null) {
+      return 'Why no trade: Awaiting market evaluation';
+    }
+
+    final desc = eval.description.toUpperCase();
+    if (desc.contains('MINIMUM') || desc.contains('NOTIONAL')) {
+      return 'Why no trade: Below minimum order';
+    }
+    if (eval.signalType == StrategySignalType.blockedByRisk ||
+        desc.contains('RISK') ||
+        desc.contains('INSUFFICIENT AVAILABLE CASH')) {
+      return 'Why no trade: Risk rejected';
+    }
+    if (eval.ema20_15m == null ||
+        eval.ema50_15m == null ||
+        eval.rsi14_15m == null) {
+      return 'Why no trade: Indicators warming up';
+    }
+    if (!eval.higherTimeframeBullish ||
+        eval.signalType == StrategySignalType.waitingHigherTimeframe ||
+        desc.contains('1H TREND NOT BULLISH') ||
+        desc.contains('1H EMA20 BELOW EMA50')) {
+      return 'Why no trade: 1h not bullish';
+    }
+    if (eval.signalType == StrategySignalType.buySignal) {
+      return 'Buy signal active — pending next 15m candle open';
+    }
+
+    final rsi = eval.rsi14_15m!;
+    if (rsi < config.rsiMin || rsi > config.rsiMax) {
+      return 'Why no trade: RSI outside 50-65 (${rsi.toStringAsFixed(1)})';
+    }
+    return 'Why no trade: No EMA cross';
+  }
 }

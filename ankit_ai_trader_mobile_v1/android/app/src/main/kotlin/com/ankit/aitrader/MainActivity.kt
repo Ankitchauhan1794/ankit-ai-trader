@@ -1,10 +1,14 @@
 package com.ankit.aitrader
 
+import android.Manifest
+import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -19,6 +23,7 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val SERVICE_CHANNEL = "com.ankit.aitrader/service"
         private const val NETWORK_EVENTS = "com.ankit.aitrader/network_events"
+        private const val REQ_POST_NOTIFICATIONS = 2401
     }
 
     private var connectivityManager: ConnectivityManager? = null
@@ -41,7 +46,7 @@ class MainActivity : FlutterActivity() {
         ).setMethodCallHandler { call, result ->
             when (call.method) {
                 "startService" -> {
-                    val title = call.argument<String>("title") ?: "Ankit AI Trader service active"
+                    val title = call.argument<String>("title") ?: "Ankit AI Trader — PAPER BOT ACTIVE"
                     val text = call.argument<String>("text")
                         ?: "Authoritative background paper engine running."
                     val intent = Intent(this, TradingForegroundService::class.java).apply {
@@ -88,7 +93,7 @@ class MainActivity : FlutterActivity() {
                     }
                 }
                 "updateNotification" -> {
-                    val title = call.argument<String>("title") ?: "Ankit AI Trader"
+                    val title = call.argument<String>("title") ?: "Ankit AI Trader — PAPER BOT ACTIVE"
                     val text = call.argument<String>("text") ?: "Paper mode active"
                     val intent = Intent(this, TradingForegroundService::class.java).apply {
                         action = TradingForegroundService.ACTION_UPDATE
@@ -129,6 +134,44 @@ class MainActivity : FlutterActivity() {
                 "checkNetworkConnected" -> {
                     result.success(isInternetAvailable())
                 }
+                "checkNotificationPermission" -> {
+                    result.success(isNotificationPermissionGranted())
+                }
+                "requestNotificationPermission" -> {
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+                                PackageManager.PERMISSION_GRANTED
+                            ) {
+                                requestPermissions(
+                                    arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                                    REQ_POST_NOTIFICATIONS
+                                )
+                            }
+                        }
+                        result.success(isNotificationPermissionGranted())
+                    } catch (_: Exception) {
+                        result.success(false)
+                    }
+                }
+                "openNotificationSettings" -> {
+                    try {
+                        val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                                putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+                            }
+                        } else {
+                            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                                data = Uri.fromParts("package", packageName, null)
+                            }
+                        }
+                        intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                        startActivity(intent)
+                        result.success(true)
+                    } catch (_: Exception) {
+                        result.success(false)
+                    }
+                }
                 "openBatterySettings" -> {
                     try {
                         val intent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
@@ -160,6 +203,20 @@ class MainActivity : FlutterActivity() {
                 eventSink = null
             }
         })
+    }
+
+    private fun isNotificationPermissionGranted(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val granted = checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+                PackageManager.PERMISSION_GRANTED
+            if (!granted) return false
+        }
+        val manager = getSystemService(NotificationManager::class.java) ?: return false
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            manager.areNotificationsEnabled()
+        } else {
+            true
+        }
     }
 
     private fun awaitServiceAndDartInitialization(

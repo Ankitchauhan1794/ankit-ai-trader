@@ -460,3 +460,41 @@ class BacktestReport {
     required this.endingEquityUsdt,
   });
 }
+
+class ActiveTimerSummary {
+  final int? runningSinceMs;
+  final int totalActiveMs;
+  final int lastSessionDurationMs;
+
+  const ActiveTimerSummary({
+    this.runningSinceMs,
+    this.totalActiveMs = 0,
+    this.lastSessionDurationMs = 0,
+  });
+
+  int currentSessionElapsedMs(int nowMs) {
+    if (runningSinceMs == null || nowMs <= runningSinceMs!) return 0;
+    return nowMs - runningSinceMs!;
+  }
+
+  int effectiveTotalActiveMs(int nowMs) {
+    return totalActiveMs + currentSessionElapsedMs(nowMs);
+  }
+
+  static String formatHhMmSs(int durationMs) {
+    final totalSec = durationMs > 0 ? durationMs ~/ 1000 : 0;
+    final h = (totalSec ~/ 3600).toString().padLeft(2, '0');
+    final m = ((totalSec % 3600) ~/ 60).toString().padLeft(2, '0');
+    final s = (totalSec % 60).toString().padLeft(2, '0');
+    return '$h:$m:$s';
+  }
+
+  static String formatDaysHhMm(int durationMs) {
+    final totalMin = durationMs > 0 ? durationMs ~/ 60000 : 0;
+    final days = totalMin ~/ (24 * 60);
+    final remMin = totalMin % (24 * 60);
+    final h = (remMin ~/ 60).toString().padLeft(2, '0');
+    final m = (remMin % 60).toString().padLeft(2, '0');
+    return '${days}d $h:$m';
+  }
+}

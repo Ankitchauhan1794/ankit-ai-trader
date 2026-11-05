@@ -4,6 +4,7 @@ import 'package:http/http.dart' as http;
 import '../models/trading_models.dart';
 
 class CoinDcxMarketService {
+  static const String tickerUrl = 'https://api.coindcx.com/exchange/ticker';
   static const String marketsDetailsUrl =
       'https://api.coindcx.com/exchange/v1/markets_details';
   static const String candlesBaseUrl =
@@ -257,5 +258,55 @@ class CoinDcxMarketService {
     if (value is num) return value.toInt();
     if (value is String) return int.tryParse(value);
     return null;
+  }
+
+  /// Fetches display-only live spot prices from `GET https://api.coindcx.com/exchange/ticker`.
+  /// Verified CoinDCX response format: a JSON List of objects containing
+  /// `market`, `change_24_hour`, `high`, `low`, `volume`, `last_price`, `bid`, `ask`, `timestamp`.
+  /// NOTE: Strictly display-only; strategy signals and Stop-Loss/Take-Profit execution
+  /// continue to use closed candles exclusively.
+  Future<Map<String, double>> fetchLiveTickerPrices({
+    List<String> targetSymbols = const ['BTCUSDT', 'ETHUSDT'],
+  }) async {
+    final uri = Uri.parse(tickerUrl);
+    final response = await _client.get(uri).timeout(timeout);
+    if (response.statusCode != 200) {
+      throw StateError('CoinDCX ticker HTTP ${response.statusCode}');
+    }
+    final decoded = jsonDecode(response.body);
+    if (decoded is! List) {
+      throw const FormatException(
+        'CoinDCX ticker response must be a JSON List.',
+      );
+    }
+    return parseLiveTickerPrices(
+      rawList: decoded,
+      targetSymbols: targetSymbols,
+    );
+  }
+
+  /// Parses CoinDCX `/exchange/ticker` JSON array into a map of positive finite
+  /// `last_price` values keyed by normalized symbol (e.g. `BTCUSDT`, `ETHUSDT`).
+  static Map<String, double> parseLiveTickerPrices({
+    required List<dynamic> rawList,
+    List<String> targetSymbols = const ['BTCUSDT', 'ETHUSDT'],
+  }) {
+    final targets = targetSymbols.map((s) => s.toUpperCase()).toSet();
+    final prices = <String, double>{};
+
+    for (final item in rawList) {
+      if (item is! Map) continue;
+      final rawMarket = (item['market'] ?? '').toString().toUpperCase().trim();
+      if (rawMarket.isEmpty) continue;
+      final normalized =
+          rawMarket.replaceAll('B-', '').replaceAll('_', '');
+      if (!targets.contains(normalized)) continue;
+
+      final price = _toDouble(item['last_price']);
+      if (price != null && price > 0 && price.isFinite) {
+        prices[normalized] = price;
+      }
+    }
+    return prices;
   }
 }
