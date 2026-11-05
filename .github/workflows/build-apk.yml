@@ -39,51 +39,15 @@ jobs:
           set -euxo pipefail
           mkdir -p workspace
 
-          if [ -f "pubspec.yaml" ] && [ -f "lib/main.dart" ]; then
+          if [ -f "ankit_ai_trader_mobile_v1/pubspec.yaml" ] && [ -f "ankit_ai_trader_mobile_v1/lib/main.dart" ]; then
+            echo "Tracked Phase 1 project found in ankit_ai_trader_mobile_v1/."
+            cp -R ankit_ai_trader_mobile_v1 workspace/
+          elif [ -f "pubspec.yaml" ] && [ -f "lib/main.dart" ]; then
             echo "Project found at repository root."
-            echo "BUILD_VARIANT=SOURCE_TREE" >> "$GITHUB_ENV"
             mkdir -p workspace/ankit_ai_trader_mobile_v1
             cp -R . workspace/ankit_ai_trader_mobile_v1/ || true
-          elif [ -f "ankit_ai_trader_mobile_v1/pubspec.yaml" ]; then
-            echo "Project found in ankit_ai_trader_mobile_v1/."
-            echo "BUILD_VARIANT=SOURCE_TREE" >> "$GITHUB_ENV"
-            cp -R ankit_ai_trader_mobile_v1 workspace/
-          elif [ -f "Ankit_AI_Trader_Phase1_Recovered_Source.tar.xz" ]; then
-            echo "Extracting independently revalidated Phase 1 source archive..."
-            xz -t Ankit_AI_Trader_Phase1_Recovered_Source.tar.xz
-            tar -xJf Ankit_AI_Trader_Phase1_Recovered_Source.tar.xz -C workspace
-            echo "BUILD_VARIANT=PHASE1" >> "$GITHUB_ENV"
-          elif compgen -G "Ankit_AI_Trader_Phase1_Source.part*.b64" > /dev/null; then
-            echo "Reassembling legacy Phase 1 source archive..."
-            cat Ankit_AI_Trader_Phase1_Source.part*.b64 > /tmp/Ankit_AI_Trader_Phase1_Source.tar.xz.b64
-            if base64 -d /tmp/Ankit_AI_Trader_Phase1_Source.tar.xz.b64 > /tmp/Ankit_AI_Trader_Phase1_Source.tar.xz \
-              && xz -t /tmp/Ankit_AI_Trader_Phase1_Source.tar.xz \
-              && tar -xJf /tmp/Ankit_AI_Trader_Phase1_Source.tar.xz -C workspace; then
-              echo "BUILD_VARIANT=PHASE1" >> "$GITHUB_ENV"
-            else
-              echo "::warning::Legacy Phase 1 archive is corrupt. Building V1.2 fallback only; it does NOT contain Phase 1 paper trading."
-              rm -rf workspace/*
-              test -f "Ankit_AI_Trader_V1_2_Source.zip.b64"
-              base64 -d Ankit_AI_Trader_V1_2_Source.zip.b64 > /tmp/Ankit_AI_Trader_V1_2_Source.zip
-              unzip -q -o /tmp/Ankit_AI_Trader_V1_2_Source.zip -d workspace
-              echo "BUILD_VARIANT=V1_2_FALLBACK" >> "$GITHUB_ENV"
-            fi
-          elif [ -f "Ankit_AI_Trader_V1_2_Source.zip.b64" ]; then
-            echo "Decoding verified V1.2 fallback source archive..."
-            base64 -d Ankit_AI_Trader_V1_2_Source.zip.b64 > /tmp/Ankit_AI_Trader_V1_2_Source.zip
-            unzip -q -o /tmp/Ankit_AI_Trader_V1_2_Source.zip -d workspace
-            echo "BUILD_VARIANT=V1_2_FALLBACK" >> "$GITHUB_ENV"
-          elif [ -f "Ankit_AI_Trader_Android_V1_1_Background_Source.zip" ]; then
-            echo "Extracting Ankit_AI_Trader_Android_V1_1_Background_Source.zip..."
-            unzip -q -o Ankit_AI_Trader_Android_V1_1_Background_Source.zip -d workspace
-            echo "BUILD_VARIANT=V1_1_FALLBACK" >> "$GITHUB_ENV"
-          elif [ -f "Ankit_AI_Trader_GitHub_Cloud_Build_Kit.zip" ]; then
-            echo "Extracting outer Ankit_AI_Trader_GitHub_Cloud_Build_Kit.zip..."
-            unzip -q -o Ankit_AI_Trader_GitHub_Cloud_Build_Kit.zip -d workspace
-            unzip -q -o workspace/Ankit_AI_Trader_Android_V1_1_Background_Source.zip -d workspace
-            echo "BUILD_VARIANT=V1_1_FALLBACK" >> "$GITHUB_ENV"
           else
-            echo "ERROR: Could not find a usable Flutter source project or archive."
+            echo "ERROR: Could not find Flutter source project in repository."
             ls -la
             exit 1
           fi
@@ -101,7 +65,9 @@ jobs:
           cp -R lib /tmp/ankit-native/lib
           cp -R test /tmp/ankit-native/test
           cp pubspec.yaml /tmp/ankit-native/pubspec.yaml
-          cp analysis_options.yaml /tmp/ankit-native/analysis_options.yaml
+          if [ -f "analysis_options.yaml" ]; then
+            cp analysis_options.yaml /tmp/ankit-native/analysis_options.yaml
+          fi
           cp android/app/src/main/AndroidManifest.xml /tmp/ankit-native/AndroidManifest.xml
           cp -R android/app/src/main/kotlin /tmp/ankit-native/kotlin
 
@@ -111,21 +77,21 @@ jobs:
           cp -R /tmp/ankit-native/lib lib
           cp -R /tmp/ankit-native/test test
           cp /tmp/ankit-native/pubspec.yaml pubspec.yaml
-          cp /tmp/ankit-native/analysis_options.yaml analysis_options.yaml
+          if [ -f "/tmp/ankit-native/analysis_options.yaml" ]; then
+            cp /tmp/ankit-native/analysis_options.yaml analysis_options.yaml
+          fi
           cp /tmp/ankit-native/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
           rm -rf android/app/src/main/kotlin
           cp -R /tmp/ankit-native/kotlin android/app/src/main/kotlin
 
-          # Remove any Kotlin DSL files created by flutter create so only Groovy build.gradle is evaluated
           rm -f android/build.gradle.kts android/settings.gradle.kts android/app/build.gradle.kts
 
-      - name: Repair Manifest, Dart Lints, Widget Test & Pin Verified Toolchain
+      - name: Repair Manifest, Deduplicate Kotlin Imports & Pin Verified Toolchain
         shell: bash
         run: |
           set -euxo pipefail
           cd workspace/ankit_ai_trader_mobile_v1
 
-          # 1. Repair literal \n in AndroidManifest.xml and fix deprecated Dart calls in main.dart
           python3 - <<'PY'
           from pathlib import Path
 
@@ -134,14 +100,6 @@ jobs:
           text = text.replace(r'>\n        <meta-data', '>\n        <meta-data')
           manifest.write_text(text, encoding="utf-8")
 
-          main_dart = Path("lib/main.dart")
-          dart_text = main_dart.read_text(encoding="utf-8")
-          dart_text = dart_text.replace("color.withOpacity(.13)", "color.withAlpha(33)")
-          dart_text = dart_text.replace("color.withOpacity(disabled ? .08 : .35)", "color.withAlpha(disabled ? 20 : 89)")
-          dart_text = dart_text.replace("activeColor: const Color(0xFF39D6A0),", "thumbColor: const WidgetStatePropertyAll<Color>(Color(0xFF39D6A0)),")
-          main_dart.write_text(dart_text, encoding="utf-8")
-
-          # Remove duplicate Kotlin import lines carried by the source archive.
           kotlin_root = Path("android/app/src/main/kotlin")
           for kt_file in kotlin_root.rglob("*.kt"):
               lines = kt_file.read_text(encoding="utf-8").splitlines()
@@ -157,11 +115,15 @@ jobs:
               kt_file.write_text("\n".join(cleaned) + "\n", encoding="utf-8")
           PY
 
-          # Preserve the complete Phase 1 widget and trading-engine test suite from the source archive.
+          cat > analysis_options.yaml <<'EOF'
+          include: package:flutter_lints/flutter.yaml
 
-          # The updated source archive already contains the Android 14+ service and network monitor.
+          linter:
+            rules:
+              prefer_const_constructors: false
+              prefer_const_literals_to_create_immutables: false
+          EOF
 
-          # 4. Write compatible Gradle 8.10.2 + AGP 8.7.3 + Kotlin 2.1.0 files
           cat > android/settings.gradle <<'EOF'
           pluginManagement {
               def flutterSdkPath = {
@@ -250,8 +212,8 @@ jobs:
                   applicationId = "com.ankit.aitrader"
                   minSdk = 23
                   targetSdk = 35
-                  versionCode = 3
-                  versionName = "1.2.0"
+                  versionCode = 6
+                  versionName = "1.5.0-phase1-final"
               }
 
               buildTypes {
@@ -272,15 +234,11 @@ jobs:
         working-directory: workspace/ankit_ai_trader_mobile_v1
         run: flutter pub get
 
-      - name: Apply Safe Dart Fixes
-        working-directory: workspace/ankit_ai_trader_mobile_v1
-        run: dart fix --apply
-
       - name: Analyze Dart Source
         working-directory: workspace/ankit_ai_trader_mobile_v1
         run: flutter analyze
 
-      - name: Run Flutter Unit, Persistence & Widget Tests
+      - name: Run Phase 1 Unit, Persistence & Widget Tests
         working-directory: workspace/ankit_ai_trader_mobile_v1
         run: flutter test
 
@@ -301,7 +259,7 @@ jobs:
       - name: Upload Ankit_AI_Trader.apk Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Ankit_AI_Trader_${{ env.BUILD_VARIANT }}_APK
+          name: Ankit_AI_Trader_APK
           path: Ankit_AI_Trader.apk
           if-no-files-found: error
           retention-days: 30
