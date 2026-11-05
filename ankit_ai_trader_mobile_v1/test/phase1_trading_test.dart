@@ -487,7 +487,7 @@ void main() {
       );
     });
 
-    test('Test 10: Realized plus unrealized daily loss against start-of-day baseline triggers $2 daily lock', () {
+    test('Test 10: Realized plus unrealized daily loss against start-of-day baseline triggers \$2 daily lock', () {
       final broker = PaperBroker();
       const day1Ms = 1700006400000; // 2023-11-15 UTC
       broker.ensureUtcDayBaseline(day1Ms, const {'BTCUSDT': 100.0});
@@ -515,7 +515,7 @@ void main() {
       expect(broker.lockedDailyLossUtcDate, RiskManager.utcDayKey(day1Ms));
     });
 
-    test('Test 11: Daily UTC reset with an open position carried across midnight establishes new baseline without resetting $100 account', () {
+    test('Test 11: Daily UTC reset with an open position carried across midnight establishes new baseline without resetting \$100 account', () {
       final broker = PaperBroker();
       const day1Ms = 1700006400000; // 2023-11-15 00:00 UTC
       const day2Ms = day1Ms + 86400000; // 2023-11-16 00:00 UTC
@@ -597,7 +597,7 @@ void main() {
       expect(broker.closedTrades.first.exitReason, 'TAKE_PROFIT');
     });
 
-    test('Test 13: $90 maximum drawdown protection liquidates with valid price or sets pendingEmergencyLiquidation if price unavailable', () {
+    test('Test 13: \$90 maximum drawdown protection liquidates with valid price or sets pendingEmergencyLiquidation if price unavailable', () {
       final broker = PaperBroker();
       const nowMs = 1700006400000;
       broker.availableCashUsdt = 40.0;
@@ -643,7 +643,7 @@ void main() {
       expect(brokerNoQuote.openPositions.isNotEmpty, isTrue);
     });
 
-    test('Test 14: Position sizing caps risk at $1 (1%), accounts for fees & slippage, and rejects oversized minNotional', () {
+    test('Test 14: Position sizing caps risk at \$1 (1%), accounts for fees & slippage, and rejects oversized minNotional', () {
       const riskCfg = RiskConfig(
         initialCapitalUsdt: 100.0,
         maxRiskPerTradeFraction: 0.01,

@@ -37,23 +37,39 @@ class RiskManager {
     return '${dt.year}-$m-$d';
   }
 
-  bool isDailyLossLimitReached(double todayRealizedPnlUsdt) {
-    return todayRealizedPnlUsdt <= -config.maxDailyLossDollars + 1e-9;
+  /// Evaluates daily loss against the persistent UTC-day start-of-day equity baseline,
+  /// incorporating both realized P&L (including trading fees) and unrealized P&L:
+  /// `dailyTotalPnl = currentEquityUsdt - startOfDayEquityUsdt`
+  bool isDailyLossLimitReachedAgainstBaseline({
+    required double currentEquityUsdt,
+    required double startOfDayEquityUsdt,
+  }) {
+    final dailyTotalPnl = currentEquityUsdt - startOfDayEquityUsdt;
+    return dailyTotalPnl <= -config.maxDailyLossDollars + 1e-9;
+  }
+
+  /// Also supports direct realized + unrealized components check.
+  bool isDailyLossLimitReached({
+    required double todayRealizedPnlUsdt,
+    required double todayUnrealizedPnlUsdt,
+  }) {
+    final totalDailyPnl = todayRealizedPnlUsdt + todayUnrealizedPnlUsdt;
+    return totalDailyPnl <= -config.maxDailyLossDollars + 1e-9;
   }
 
   bool isMaxDrawdownReached(double currentEquityUsdt) {
     return currentEquityUsdt <= config.drawdownFloorEquity + 1e-9;
   }
 
-  /// Calculates risk-capped position size using stop-loss distance (1.5 × ATR14),
-  /// slippage, round-trip fee buffer, available cash, and minimum notional rules.
   PositionSizeDecision evaluateEntryAndSize({
     required double rawNextOpenPrice,
     required double atr14,
     required StrategyConfig strategyConfig,
     required double availableCashUsdt,
     required double currentEquityUsdt,
+    required double startOfDayEquityUsdt,
     required double todayRealizedPnlUsdt,
+    required double todayUnrealizedPnlUsdt,
     required int currentOpenPositionsCount,
     double minNotionalUsdt = 1.0,
     double minQuantity = 0.00001,
@@ -65,7 +81,14 @@ class RiskManager {
       );
     }
 
-    if (isDailyLossLimitReached(todayRealizedPnlUsdt)) {
+    if (isDailyLossLimitReachedAgainstBaseline(
+          currentEquityUsdt: currentEquityUsdt,
+          startOfDayEquityUsdt: startOfDayEquityUsdt,
+        ) ||
+        isDailyLossLimitReached(
+          todayRealizedPnlUsdt: todayRealizedPnlUsdt,
+          todayUnrealizedPnlUsdt: todayUnrealizedPnlUsdt,
+        )) {
       return const PositionSizeDecision(
         approved: false,
         rejectionReason: 'DAILY LOSS LIMIT REACHED',
@@ -100,13 +123,13 @@ class RiskManager {
     final stopLossPrice = executedEntry - stopDistance;
     final takeProfitPrice = executedEntry + takeProfitDistance;
 
-    // Include conservative exit slippage + round-trip fees in per-unit risk so
-    // total realized loss at stop-loss never exceeds $1.00 (1% max risk).
     final conservativeStopExit = stopLossPrice * (1.0 - config.slippageRate);
     final entryFeePerUnit = executedEntry * config.feeRate;
     final stopExitFeePerUnit = conservativeStopExit * config.feeRate;
     final totalRiskPerUnit =
-        (executedEntry - conservativeStopExit) + entryFeePerUnit + stopExitFeePerUnit;
+        (executedEntry - conservativeStopExit) +
+            entryFeePerUnit +
+            stopExitFeePerUnit;
 
     if (totalRiskPerUnit <= 0) {
       return const PositionSizeDecision(
@@ -117,9 +140,8 @@ class RiskManager {
 
     final maxAllowedRiskDollars = config.maxRiskPerTradeDollars;
     final qtyByRisk = maxAllowedRiskDollars / totalRiskPerUnit;
-
-    // Never exceed available cash (1x spot only, no leverage/borrowing)
-    final maxCashQty = availableCashUsdt / (executedEntry * (1.0 + config.feeRate));
+    final maxCashQty =
+        availableCashUsdt / (executedEntry * (1.0 + config.feeRate));
     final quantity = math.min(qtyByRisk, maxCashQty);
 
     if (quantity < minQuantity) {

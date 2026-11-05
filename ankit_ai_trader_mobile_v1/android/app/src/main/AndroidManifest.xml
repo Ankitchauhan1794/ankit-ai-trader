@@ -36,7 +36,7 @@
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Continuous simulated paper trading candle evaluation and network connectivity monitoring." />
+                android:value="Single-engine background simulated paper trading and network monitoring." />
         </service>
 
         <meta-data

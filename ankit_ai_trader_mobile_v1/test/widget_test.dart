@@ -9,7 +9,7 @@ void main() {
     databaseFactory = databaseFactoryFfi;
   });
 
-  testWidgets('dashboard shows paper account and connected state',
+  testWidgets('1. Dashboard renders paper account, \$100 equity, and connected state',
       (tester) async {
     await tester.pumpWidget(
       MaterialApp(

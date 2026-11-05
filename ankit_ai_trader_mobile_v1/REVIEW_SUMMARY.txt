@@ -1,0 +1,31 @@
+ANKIT AI TRADER — PHASE 1 FINAL CANDIDATE REVIEW SUMMARY
+
+1. ONE AUTHORITATIVE TRADING ENGINE:
+   - Created `lib/services/authoritative_engine.dart` (`AuthoritativeTradingEngine`), which runs exclusively inside `TradingForegroundService`'s headless Dart isolate (`backgroundServiceMain`).
+   - Removed all trade-processing logic and the 30-second execution timer from `TradingCoordinator` (`lib/services/trading_coordinator.dart`). The dashboard now only dispatches commands (`START`, `PAUSE`, `STOP`, `RESET`, `REFRESH_QUOTES`) and polls SQLite snapshots passively.
+   - Added `execution_locks` and `processed_signal_keys` tables in `PersistenceDatabase` (`lib/services/persistence_db.dart`) for database-level execution locking and idempotency protection.
+   - Updated `MainActivity.kt` and `TradingForegroundService.kt` so `startService` only succeeds after both Android service creation and `acknowledgeEngineInitialized` from the background Dart isolate. Never starts a fallback engine.
+
+2. FIRST-START WARM-UP & SEQUENTIAL GAP-SAFE CANDLE PROCESSING:
+   - Fixed `PaperBroker.processClosedCandleStream` (`lib/services/paper_broker.dart`) so a fresh account (`lastProcessedCandleCloseMs[symbol] == null`) warms up EMA 20, EMA 50, RSI 14, and ATR 14 and commits a checkpoint at the latest closed 15m candle without generating historical trades.
+   - Subsequent runs process newly closed candles sequentially in chronological order, verifying contiguity (`currentCandle.openTimeMs == prevCloseCheckpoint`).
+   - Pending BUY signals execute strictly at the open of the immediate next candle C+1 (`currentCandle.openTimeMs == pending.signalCandleCloseMs`). If C+1 is missing or a gap exists, the stale signal is discarded and the engine pauses safely (`BotEngineState.pausedStaleData`).
+
+3. DAILY LOSS MANAGEMENT (REALIZED + UNREALIZED AGAINST PERSISTENT UTC BASELINE):
+   - Added persistent `currentUtcDateKey`, `startOfDayEquityUsdt`, and `dailyStartEquityByUtcDate` to `PaperBroker` and `PersistenceDatabase`.
+   - At the first valid market valuation of a new UTC day, `ensureUtcDayBaseline` records the day's starting equity without resetting the $100 account or closing carried positions.
+   - When daily loss reaches $2 (`currentEquity - startOfDayEquity <= -$2.00`), new entries are blocked, while `AuthoritativeTradingEngine.executeAuthoritativeCycle` keeps running as long as `openPositions.isNotEmpty` so existing positions continue to be checked against Stop-Loss and Take-Profit.
+
+4. $90 MAXIMUM DRAWDOWN PROTECTION:
+   - When equity reaches or falls below $90, `maxDrawdownLocked` is persisted, pending signals are cleared, and open positions are liquidated using valid market prices.
+   - If valid market prices are unavailable at the moment of drawdown breach, `pendingEmergencyLiquidation = true` is persisted without inventing an execution price.
+
+5. MARKET-DATA VALIDATION (15M & 1H):
+   - Validates HTTP status codes, JSON lists, positive finite OHLCV relationships, future timestamp rejection (`openTimeMs > nowMs`), duplicate timestamp deduplication, chronological sorting, 15m/1h freshness, and 15m/1h missing candle gaps.
+
+6. SQLITE VERSIONING & SAFE RESTORATION:
+   - Upgraded `PersistenceDatabase` to schema version 2 with safe `onUpgrade` migration and removed silent error swallowing so a database read failure pauses safely without resetting an existing account.
+
+7. TEST SUITE FIXES & EXPANSION:
+   - Fixed the undefined `risk` variable bug in `test/phase1_trading_test.dart` (Test 8/9 in the previous package).
+   - Implemented 22 total deterministic tests across `test/phase1_trading_test.dart` (21 tests) and `test/widget_test.dart` (1 widget test) covering all 20 required verification scenarios plus indicator math.

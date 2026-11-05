@@ -3,8 +3,28 @@ import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 import '../models/trading_models.dart';
 import 'paper_broker.dart';
+import 'strategy_engine.dart';
+
+class PersistedEngineSnapshot {
+  final BotEngineState botState;
+  final MarketDataStatus marketDataStatus;
+  final String statusBannerMessage;
+  final int? lastMarketDataUpdateMs;
+  final Map<String, double> latestPrices;
+  final Map<String, StrategyEvaluationResult> latestEvaluations;
+
+  const PersistedEngineSnapshot({
+    required this.botState,
+    required this.marketDataStatus,
+    required this.statusBannerMessage,
+    this.lastMarketDataUpdateMs,
+    required this.latestPrices,
+    required this.latestEvaluations,
+  });
+}
 
 class PersistenceDatabase {
+  static const int schemaVersion = 2;
   Database? _db;
 
   Future<Database> get database async {
@@ -13,15 +33,16 @@ class PersistenceDatabase {
     final fullPath = p.join(dbPath, 'ankit_ai_trader_phase1.db');
     _db = await openDatabase(
       fullPath,
-      version: 1,
+      version: schemaVersion,
       onCreate: _onCreate,
+      onUpgrade: _onUpgrade,
     );
     return _db!;
   }
 
   Future<void> openWithCustomDatabase(Database customDb) async {
     _db = customDb;
-    await _onCreate(customDb, 1);
+    await _onCreate(customDb, schemaVersion);
   }
 
   Future<void> _onCreate(Database db, int version) async {
@@ -86,14 +107,87 @@ class PersistenceDatabase {
         availableCashUsdt REAL NOT NULL
       )
     ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS execution_locks (
+        lockName TEXT PRIMARY KEY,
+        ownerId TEXT NOT NULL,
+        acquiredAtMs INTEGER NOT NULL,
+        expiresAtMs INTEGER NOT NULL
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS processed_signal_keys (
+        signalKey TEXT PRIMARY KEY,
+        processedAtMs INTEGER NOT NULL
+      )
+    ''');
+  }
+
+  Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
+    if (oldVersion < 2) {
+      await _onCreate(db, newVersion);
+    }
+  }
+
+  /// Acquires a persistent SQLite execution lease so that only the single authoritative
+  /// engine can execute candle evaluations and trade mutations at any time.
+  Future<bool> acquireExecutionLock({
+    required String ownerId,
+    required int nowMs,
+    int leaseDurationMs = 55000,
+  }) async {
+    final db = await database;
+    return db.transaction<bool>((txn) async {
+      final rows = await txn.query(
+        'execution_locks',
+        where: 'lockName = ?',
+        whereArgs: ['AUTHORITATIVE_ENGINE_LOCK'],
+      );
+      if (rows.isNotEmpty) {
+        final currentOwner = rows.first['ownerId'] as String;
+        final expiresAt = (rows.first['expiresAtMs'] as num).toInt();
+        if (currentOwner != ownerId && expiresAt > nowMs) {
+          return false;
+        }
+      }
+      await txn.insert(
+        'execution_locks',
+        {
+          'lockName': 'AUTHORITATIVE_ENGINE_LOCK',
+          'ownerId': ownerId,
+          'acquiredAtMs': nowMs,
+          'expiresAtMs': nowMs + leaseDurationMs,
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      return true;
+    });
+  }
+
+  Future<void> releaseExecutionLock(String ownerId) async {
+    final db = await database;
+    await db.delete(
+      'execution_locks',
+      where: 'lockName = ? AND ownerId = ?',
+      whereArgs: ['AUTHORITATIVE_ENGINE_LOCK', ownerId],
+    );
   }
 
   Future<void> saveFullState({
     required PaperBroker broker,
     required BotEngineState botState,
     required Map<String, double> latestPrices,
+    MarketDataStatus marketDataStatus = MarketDataStatus.connected,
+    String statusBannerMessage = '',
+    int? lastMarketDataUpdateMs,
+    Map<String, StrategyEvaluationResult>? latestEvaluations,
   }) async {
     final db = await database;
+    final nowMs = DateTime.now().toUtc().millisecondsSinceEpoch;
+    broker.ensureUtcDayBaseline(nowMs, latestPrices);
+
     await db.transaction((txn) async {
       Future<void> putKv(String k, Object v) async {
         await txn.insert(
@@ -105,9 +199,31 @@ class PersistenceDatabase {
 
       await putKv('availableCashUsdt', broker.availableCashUsdt);
       await putKv('realizedPnlUsdt', broker.realizedPnlUsdt);
+      await putKv('unrealizedPnlUsdt', broker.unrealizedPnl(latestPrices));
+      await putKv('accountEquityUsdt', broker.accountEquity(latestPrices));
+      await putKv('currentUtcDateKey', broker.currentUtcDateKey);
+      await putKv('startOfDayEquityUsdt', broker.startOfDayEquityUsdt);
+      await putKv('dailyStartEquityByUtcDate', broker.dailyStartEquityByUtcDate);
       await putKv('maxDrawdownLocked', broker.maxDrawdownLocked);
+      await putKv(
+          'pendingEmergencyLiquidation', broker.pendingEmergencyLiquidation);
       await putKv('lockedDailyLossUtcDate', broker.lockedDailyLossUtcDate ?? '');
       await putKv('botState', botState.name);
+      await putKv('marketDataStatus', marketDataStatus.name);
+      if (statusBannerMessage.isNotEmpty) {
+        await putKv('statusBannerMessage', statusBannerMessage);
+      }
+      if (lastMarketDataUpdateMs != null) {
+        await putKv('lastMarketDataUpdateMs', lastMarketDataUpdateMs);
+      }
+      await putKv('latestPrices', latestPrices);
+      if (latestEvaluations != null) {
+        final evalMap = <String, dynamic>{};
+        latestEvaluations.forEach((k, v) {
+          evalMap[k] = v.toMap();
+        });
+        await putKv('latestEvaluations', evalMap);
+      }
       await putKv('strategyConfig', broker.strategyConfig.toMap());
       await putKv('riskConfig', broker.riskConfig.toMap());
       await putKv('dailyRealizedPnl', broker.dailyRealizedPnlByUtcDate);
@@ -119,6 +235,20 @@ class PersistenceDatabase {
         'processedEntrySignalKeys',
         broker.processedEntrySignalKeys.toList(),
       );
+
+      final serializedPending = <String, Map<String, dynamic>>{};
+      broker.pendingSignalsBySymbol.forEach((sym, sig) {
+        serializedPending[sym] = sig.toMap();
+      });
+      await putKv('pendingSignalsBySymbol', serializedPending);
+
+      for (final sigKey in broker.processedEntrySignalKeys) {
+        await txn.insert(
+          'processed_signal_keys',
+          {'signalKey': sigKey, 'processedAtMs': nowMs},
+          conflictAlgorithm: ConflictAlgorithm.ignore,
+        );
+      }
 
       await txn.delete('open_positions');
       for (final pos in broker.openPositions.values) {
@@ -145,7 +275,6 @@ class PersistenceDatabase {
         );
       }
 
-      final nowMs = DateTime.now().toUtc().millisecondsSinceEpoch;
       await txn.insert(
         'equity_snapshots',
         {
@@ -158,11 +287,20 @@ class PersistenceDatabase {
     });
   }
 
-  Future<BotEngineState> restoreIntoBroker(PaperBroker broker) async {
+  /// Restores state into `broker` and returns the full `PersistedEngineSnapshot`.
+  /// CRITICAL: Never silently resets an existing account if a corrupt JSON or SQLite error occurs;
+  /// any restoration error is thrown to the caller so the engine pauses safely without wiping state.
+  Future<PersistedEngineSnapshot> restoreFullSnapshot(PaperBroker broker) async {
     final db = await database;
     final kvRows = await db.query('engine_kv_state');
     if (kvRows.isEmpty) {
-      return BotEngineState.stopped;
+      return const PersistedEngineSnapshot(
+        botState: BotEngineState.stopped,
+        marketDataStatus: MarketDataStatus.disconnected,
+        statusBannerMessage: 'ENGINE STOPPED — PRESS START TO RUN PAPER BOT',
+        latestPrices: {'BTCUSDT': 0.0, 'ETHUSDT': 0.0},
+        latestEvaluations: {},
+      );
     }
 
     final kv = <String, dynamic>{
@@ -186,7 +324,21 @@ class PersistenceDatabase {
             broker.riskConfig.initialCapitalUsdt;
     broker.realizedPnlUsdt =
         (kv['realizedPnlUsdt'] as num?)?.toDouble() ?? 0.0;
+    broker.currentUtcDateKey = (kv['currentUtcDateKey'] as String?) ?? '';
+    broker.startOfDayEquityUsdt =
+        (kv['startOfDayEquityUsdt'] as num?)?.toDouble() ??
+            broker.riskConfig.initialCapitalUsdt;
+
+    broker.dailyStartEquityByUtcDate.clear();
+    if (kv['dailyStartEquityByUtcDate'] is Map) {
+      (kv['dailyStartEquityByUtcDate'] as Map).forEach((k, v) {
+        broker.dailyStartEquityByUtcDate[k.toString()] = (v as num).toDouble();
+      });
+    }
+
     broker.maxDrawdownLocked = (kv['maxDrawdownLocked'] as bool?) ?? false;
+    broker.pendingEmergencyLiquidation =
+        (kv['pendingEmergencyLiquidation'] as bool?) ?? false;
     final lockedDay = (kv['lockedDailyLossUtcDate'] as String?) ?? '';
     broker.lockedDailyLossUtcDate = lockedDay.isEmpty ? null : lockedDay;
 
@@ -210,6 +362,20 @@ class PersistenceDatabase {
         broker.processedEntrySignalKeys.add(item.toString());
       }
     }
+    final sigKeyRows = await db.query('processed_signal_keys');
+    for (final row in sigKeyRows) {
+      broker.processedEntrySignalKeys.add(row['signalKey'] as String);
+    }
+
+    broker.pendingSignalsBySymbol.clear();
+    if (kv['pendingSignalsBySymbol'] is Map) {
+      (kv['pendingSignalsBySymbol'] as Map).forEach((k, v) {
+        if (v is Map) {
+          broker.pendingSignalsBySymbol[k.toString()] =
+              PendingEntrySignal.fromMap(Map<String, dynamic>.from(v));
+        }
+      });
+    }
 
     broker.openPositions.clear();
     final openRows = await db.query('open_positions');
@@ -232,10 +398,56 @@ class PersistenceDatabase {
     }
 
     final stateName = (kv['botState'] as String?) ?? BotEngineState.stopped.name;
-    return BotEngineState.values.firstWhere(
+    final botState = BotEngineState.values.firstWhere(
       (e) => e.name == stateName,
       orElse: () => BotEngineState.stopped,
     );
+
+    final mktName = (kv['marketDataStatus'] as String?) ??
+        MarketDataStatus.disconnected.name;
+    final mktStatus = MarketDataStatus.values.firstWhere(
+      (e) => e.name == mktName,
+      orElse: () => MarketDataStatus.disconnected,
+    );
+
+    final banner = (kv['statusBannerMessage'] as String?) ??
+        'ENGINE STOPPED — PRESS START TO RUN PAPER BOT';
+    final lastUpdateMs = (kv['lastMarketDataUpdateMs'] as num?)?.toInt();
+
+    final restoredPrices = <String, double>{
+      'BTCUSDT': 0.0,
+      'ETHUSDT': 0.0,
+    };
+    if (kv['latestPrices'] is Map) {
+      (kv['latestPrices'] as Map).forEach((k, v) {
+        restoredPrices[k.toString()] = (v as num).toDouble();
+      });
+    }
+
+    final restoredEvals = <String, StrategyEvaluationResult>{};
+    if (kv['latestEvaluations'] is Map) {
+      (kv['latestEvaluations'] as Map).forEach((k, v) {
+        if (v is Map) {
+          restoredEvals[k.toString()] = StrategyEvaluationResult.fromMap(
+            Map<String, dynamic>.from(v),
+          );
+        }
+      });
+    }
+
+    return PersistedEngineSnapshot(
+      botState: botState,
+      marketDataStatus: mktStatus,
+      statusBannerMessage: banner,
+      lastMarketDataUpdateMs: lastUpdateMs,
+      latestPrices: restoredPrices,
+      latestEvaluations: restoredEvals,
+    );
+  }
+
+  Future<BotEngineState> restoreIntoBroker(PaperBroker broker) async {
+    final snap = await restoreFullSnapshot(broker);
+    return snap.botState;
   }
 
   Future<void> clearAllTables() async {
@@ -245,6 +457,8 @@ class PersistenceDatabase {
     await db.delete('closed_trades');
     await db.delete('orders');
     await db.delete('equity_snapshots');
+    await db.delete('execution_locks');
+    await db.delete('processed_signal_keys');
   }
 
   Future<void> close() async {

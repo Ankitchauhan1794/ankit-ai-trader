@@ -25,6 +25,40 @@ class StrategyEvaluationResult {
     this.ema50_1h,
     this.higherTimeframeBullish = false,
   });
+
+  Map<String, dynamic> toMap() => {
+        'signalType': signalType.name,
+        'description': description,
+        'evaluatedCandleCloseMs': evaluatedCandleCloseMs,
+        'ema20_15m': ema20_15m,
+        'ema50_15m': ema50_15m,
+        'rsi14_15m': rsi14_15m,
+        'atr14_15m': atr14_15m,
+        'ema20_1h': ema20_1h,
+        'ema50_1h': ema50_1h,
+        'higherTimeframeBullish': higherTimeframeBullish,
+      };
+
+  factory StrategyEvaluationResult.fromMap(Map<String, dynamic> map) {
+    final sigName = (map['signalType'] as String?) ?? 'none';
+    return StrategyEvaluationResult(
+      signalType: StrategySignalType.values.firstWhere(
+        (e) => e.name == sigName,
+        orElse: () => StrategySignalType.none,
+      ),
+      description: (map['description'] as String?) ?? '',
+      evaluatedCandleCloseMs:
+          (map['evaluatedCandleCloseMs'] as num?)?.toInt() ?? 0,
+      ema20_15m: (map['ema20_15m'] as num?)?.toDouble(),
+      ema50_15m: (map['ema50_15m'] as num?)?.toDouble(),
+      rsi14_15m: (map['rsi14_15m'] as num?)?.toDouble(),
+      atr14_15m: (map['atr14_15m'] as num?)?.toDouble(),
+      ema20_1h: (map['ema20_1h'] as num?)?.toDouble(),
+      ema50_1h: (map['ema50_1h'] as num?)?.toDouble(),
+      higherTimeframeBullish:
+          (map['higherTimeframeBullish'] as bool?) ?? false,
+    );
+  }
 }
 
 class IntrabarExitDecision {
@@ -44,8 +78,6 @@ class StrategyEngine {
 
   const StrategyEngine({this.config = const StrategyConfig()});
 
-  /// Evaluates closed 15m and 1h candles up to the latest closed candle.
-  /// Never looks ahead into future candles.
   StrategyEvaluationResult evaluateClosedCandles({
     required List<Candle> closed15m,
     required List<Candle> closed1h,
@@ -176,9 +208,6 @@ class StrategyEngine {
     );
   }
 
-  /// Evaluates whether a candle hits stop-loss or take-profit for an open position.
-  /// CRITICAL CONSERVATIVE RULE: If both `low <= stopLoss` and `high >= takeProfit`
-  /// occur in the same candle and intrabar ordering is unknown, stop-loss executes first.
   IntrabarExitDecision checkStopLossOrTakeProfit({
     required PaperPosition position,
     required Candle candle,

@@ -7,6 +7,8 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -22,6 +24,7 @@ class MainActivity : FlutterActivity() {
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var eventSink: EventChannel.EventSink? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -40,18 +43,49 @@ class MainActivity : FlutterActivity() {
                 "startService" -> {
                     val title = call.argument<String>("title") ?: "Ankit AI Trader service active"
                     val text = call.argument<String>("text")
-                        ?: "Paper trading background monitor running."
+                        ?: "Authoritative background paper engine running."
                     val intent = Intent(this, TradingForegroundService::class.java).apply {
                         action = TradingForegroundService.ACTION_START
                         putExtra(TradingForegroundService.EXTRA_TITLE, title)
                         putExtra(TradingForegroundService.EXTRA_TEXT, text)
                     }
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        startForegroundService(intent)
-                    } else {
-                        startService(intent)
+                    try {
+                        TradingForegroundService.lastStartupError = null
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            startForegroundService(intent)
+                        } else {
+                            startService(intent)
+                        }
+                        awaitServiceAndDartInitialization(result, attemptsRemaining = 25)
+                    } catch (e: Exception) {
+                        TradingForegroundService.lastStartupError = e.message ?: "Start exception"
+                        result.error("SERVICE_START_FAILED", e.message, null)
                     }
-                    result.success(true)
+                }
+                "dispatchCommand" -> {
+                    val command = call.argument<String>("command") ?: ""
+                    if (command.isEmpty()) {
+                        result.error("INVALID_COMMAND", "Command cannot be empty", null)
+                        return@setMethodCallHandler
+                    }
+                    if (!TradingForegroundService.isRunning || !TradingForegroundService.isDartEngineInitialized) {
+                        result.error(
+                            "ENGINE_NOT_READY",
+                            TradingForegroundService.lastStartupError
+                                ?: "Authoritative background engine is not initialized.",
+                            null
+                        )
+                        return@setMethodCallHandler
+                    }
+                    TradingForegroundService.dispatchCommandToAuthoritativeEngine(command) { ok, errMsg ->
+                        mainHandler.post {
+                            if (ok) {
+                                result.success(true)
+                            } else {
+                                result.error("COMMAND_FAILED", errMsg ?: "Background command failed", null)
+                            }
+                        }
+                    }
                 }
                 "updateNotification" -> {
                     val title = call.argument<String>("title") ?: "Ankit AI Trader"
@@ -61,12 +95,16 @@ class MainActivity : FlutterActivity() {
                         putExtra(TradingForegroundService.EXTRA_TITLE, title)
                         putExtra(TradingForegroundService.EXTRA_TEXT, text)
                     }
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        startForegroundService(intent)
-                    } else {
-                        startService(intent)
+                    try {
+                        if (TradingForegroundService.isRunning) {
+                            startService(intent)
+                            result.success(true)
+                        } else {
+                            result.success(false)
+                        }
+                    } catch (e: Exception) {
+                        result.success(false)
                     }
-                    result.success(true)
                 }
                 "stopService" -> {
                     val intent = Intent(this, TradingForegroundService::class.java)
@@ -74,7 +112,19 @@ class MainActivity : FlutterActivity() {
                     result.success(true)
                 }
                 "isServiceRunning" -> {
-                    result.success(TradingForegroundService.isRunning)
+                    result.success(
+                        TradingForegroundService.isRunning &&
+                            TradingForegroundService.isDartEngineInitialized
+                    )
+                }
+                "getServiceStatus" -> {
+                    result.success(
+                        mapOf(
+                            "serviceRunning" to TradingForegroundService.isRunning,
+                            "dartEngineInitialized" to TradingForegroundService.isDartEngineInitialized,
+                            "lastError" to (TradingForegroundService.lastStartupError ?: "")
+                        )
+                    )
                 }
                 "checkNetworkConnected" -> {
                     result.success(isInternetAvailable())
@@ -112,6 +162,38 @@ class MainActivity : FlutterActivity() {
         })
     }
 
+    private fun awaitServiceAndDartInitialization(
+        result: MethodChannel.Result,
+        attemptsRemaining: Int
+    ) {
+        if (TradingForegroundService.lastStartupError != null) {
+            result.error(
+                "SERVICE_INIT_ERROR",
+                TradingForegroundService.lastStartupError,
+                null
+            )
+            return
+        }
+        if (TradingForegroundService.isRunning &&
+            TradingForegroundService.isDartEngineInitialized
+        ) {
+            result.success(true)
+            return
+        }
+        if (attemptsRemaining <= 0) {
+            result.error(
+                "SERVICE_INIT_TIMEOUT",
+                "Timed out waiting for TradingForegroundService and background Dart engine acknowledgement.",
+                null
+            )
+            return
+        }
+        mainHandler.postDelayed(
+            { awaitServiceAndDartInitialization(result, attemptsRemaining - 1) },
+            200L
+        )
+    }
+
     private fun isInternetAvailable(): Boolean {
         val cm = connectivityManager ?: return false
         val network = cm.activeNetwork ?: return false
@@ -125,14 +207,17 @@ class MainActivity : FlutterActivity() {
         val cm = connectivityManager ?: return
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
+                TradingForegroundService.notifyNetworkTransition(true)
                 runOnUiThread {
                     eventSink?.success(true)
                 }
             }
 
             override fun onLost(network: Network) {
+                val nowAvailable = isInternetAvailable()
+                TradingForegroundService.notifyNetworkTransition(nowAvailable)
                 runOnUiThread {
-                    eventSink?.success(isInternetAvailable())
+                    eventSink?.success(nowAvailable)
                 }
             }
 
@@ -143,6 +228,7 @@ class MainActivity : FlutterActivity() {
                 val validated =
                     networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
                         networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                TradingForegroundService.notifyNetworkTransition(validated)
                 runOnUiThread {
                     eventSink?.success(validated)
                 }

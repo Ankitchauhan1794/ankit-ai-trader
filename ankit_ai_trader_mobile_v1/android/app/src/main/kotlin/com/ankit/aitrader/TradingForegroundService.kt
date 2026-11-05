@@ -30,6 +30,59 @@ class TradingForegroundService : Service() {
 
         @Volatile
         var isRunning: Boolean = false
+
+        @Volatile
+        var isDartEngineInitialized: Boolean = false
+
+        @Volatile
+        var lastStartupError: String? = null
+
+        private var activeInstance: TradingForegroundService? = null
+
+        fun dispatchCommandToAuthoritativeEngine(
+            command: String,
+            callback: (Boolean, String?) -> Unit
+        ) {
+            val instance = activeInstance
+            val ch = instance?.backgroundChannel
+            if (instance == null || ch == null || !isRunning || !isDartEngineInitialized) {
+                callback(false, lastStartupError ?: "Authoritative background service is not active")
+                return
+            }
+            instance.handler.post {
+                ch.invokeMethod(
+                    "onCommand",
+                    mapOf("command" to command),
+                    object : MethodChannel.Result {
+                        override fun success(result: Any?) {
+                            val ok = (result as? Boolean) ?: true
+                            callback(ok, if (ok) null else "Background engine rejected command")
+                        }
+
+                        override fun error(
+                            errorCode: String,
+                            errorMessage: String?,
+                            errorDetails: Any?
+                        ) {
+                            callback(false, errorMessage ?: errorCode)
+                        }
+
+                        override fun notImplemented() {
+                            callback(false, "Command handler not implemented in background isolate")
+                        }
+                    }
+                )
+            }
+        }
+
+        fun notifyNetworkTransition(isConnected: Boolean) {
+            val instance = activeInstance ?: return
+            val ch = instance.backgroundChannel ?: return
+            if (!isRunning || !isDartEngineInitialized) return
+            instance.handler.post {
+                ch.invokeMethod("onNetworkChanged", mapOf("connected" to isConnected))
+            }
+        }
     }
 
     private var wakeLock: PowerManager.WakeLock? = null
@@ -37,43 +90,56 @@ class TradingForegroundService : Service() {
     private var backgroundChannel: MethodChannel? = null
     private val handler = Handler(Looper.getMainLooper())
     private var currentTitle = "Ankit AI Trader service active"
-    private var currentText = "Paper mode active. No live orders."
+    private var currentText = "Authoritative paper engine ready. No live orders."
 
     private val heartbeatRunnable = object : Runnable {
         override fun run() {
             if (!isRunning) return
-            backgroundChannel?.invokeMethod("onBackgroundTick", null)
+            acquireOrRenewWakeLock()
+            if (isDartEngineInitialized) {
+                backgroundChannel?.invokeMethod("onBackgroundTick", null)
+            }
             handler.postDelayed(this, 60_000L)
         }
     }
 
     override fun onCreate() {
         super.onCreate()
-        isRunning = true
-        createNotificationChannel()
-        acquireWakeLock()
-        val notification = buildNotification(currentTitle, currentText)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+        activeInstance = this
+        lastStartupError = null
+        try {
+            createNotificationChannel()
+            acquireOrRenewWakeLock()
+            val notification = buildNotification(currentTitle, currentText)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+            isRunning = true
+            ensureHeadlessFlutterEngine()
+            handler.postDelayed(heartbeatRunnable, 30_000L)
+        } catch (e: Exception) {
+            isRunning = false
+            isDartEngineInitialized = false
+            lastStartupError = "Foreground service onCreate failed: ${e.message}"
+            stopSelf()
         }
-        ensureHeadlessFlutterEngine()
-        handler.postDelayed(heartbeatRunnable, 15_000L)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        isRunning = true
         val title = intent?.getStringExtra(EXTRA_TITLE) ?: currentTitle
         val text = intent?.getStringExtra(EXTRA_TEXT) ?: currentText
         currentTitle = title
         currentText = text
-        val manager = getSystemService(NotificationManager::class.java)
-        manager?.notify(NOTIFICATION_ID, buildNotification(currentTitle, currentText))
+        if (isRunning) {
+            val manager = getSystemService(NotificationManager::class.java)
+            manager?.notify(NOTIFICATION_ID, buildNotification(currentTitle, currentText))
+        }
         return START_STICKY
     }
 
@@ -85,32 +151,54 @@ class TradingForegroundService : Service() {
             loader.ensureInitializationComplete(applicationContext, null)
 
             val engine = FlutterEngine(applicationContext)
+            val channel = MethodChannel(engine.dartExecutor.binaryMessenger, BG_CHANNEL)
+            channel.setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "acknowledgeEngineInitialized" -> {
+                        isDartEngineInitialized = true
+                        lastStartupError = null
+                        result.success(true)
+                    }
+                    "reportEngineFatalError" -> {
+                        val err = call.argument<String>("error") ?: "Background engine failure"
+                        isDartEngineInitialized = false
+                        lastStartupError = err
+                        result.success(true)
+                    }
+                    "updateServiceNotification" -> {
+                        val title = call.argument<String>("title") ?: currentTitle
+                        val text = call.argument<String>("text") ?: currentText
+                        currentTitle = title
+                        currentText = text
+                        val manager = getSystemService(NotificationManager::class.java)
+                        manager?.notify(NOTIFICATION_ID, buildNotification(currentTitle, currentText))
+                        result.success(true)
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+            backgroundEngine = engine
+            backgroundChannel = channel
+
             val entrypoint = DartExecutor.DartEntrypoint(
                 loader.findAppBundlePath(),
                 "backgroundServiceMain"
             )
             engine.dartExecutor.executeDartEntrypoint(entrypoint)
-            val channel = MethodChannel(engine.dartExecutor.binaryMessenger, BG_CHANNEL)
-            channel.setMethodCallHandler { call, result ->
-                if (call.method == "updateServiceNotification") {
-                    val title = call.argument<String>("title") ?: currentTitle
-                    val text = call.argument<String>("text") ?: currentText
-                    currentTitle = title
-                    currentText = text
-                    val manager = getSystemService(NotificationManager::class.java)
-                    manager?.notify(NOTIFICATION_ID, buildNotification(currentTitle, currentText))
-                    result.success(true)
-                } else {
-                    result.notImplemented()
-                }
-            }
-            backgroundEngine = engine
-            backgroundChannel = channel
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            isDartEngineInitialized = false
+            lastStartupError = "Headless Dart engine failed to initialize: ${e.message}"
         }
     }
 
-    private fun acquireWakeLock() {
+    private fun acquireOrRenewWakeLock() {
+        try {
+            val existing = wakeLock
+            if (existing != null && existing.isHeld) {
+                existing.release()
+            }
+        } catch (_: Exception) {
+        }
         try {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
             val wl = pm.newWakeLock(
@@ -118,7 +206,8 @@ class TradingForegroundService : Service() {
                 "AnkitAITrader::PaperEngineWakeLock"
             )
             wl.setReferenceCounted(false)
-            wl.acquire(6 * 60 * 60 * 1000L)
+            // Bounded 15-minute wake-lock lease renewed every 60-second heartbeat
+            wl.acquire(15 * 60 * 1000L)
             wakeLock = wl
         } catch (_: Exception) {
         }
@@ -128,6 +217,8 @@ class TradingForegroundService : Service() {
 
     override fun onDestroy() {
         isRunning = false
+        isDartEngineInitialized = false
+        activeInstance = null
         handler.removeCallbacksAndMessages(null)
         try {
             wakeLock?.let {
@@ -135,6 +226,7 @@ class TradingForegroundService : Service() {
             }
         } catch (_: Exception) {
         }
+        wakeLock = null
         try {
             backgroundEngine?.destroy()
         } catch (_: Exception) {
@@ -151,7 +243,7 @@ class TradingForegroundService : Service() {
                 "Trading service",
                 NotificationManager.IMPORTANCE_LOW
             )
-            channel.description = "Shows when the Ankit AI Trader background paper engine is active."
+            channel.description = "Shows when the Ankit AI Trader authoritative paper engine is active."
             val manager = getSystemService(NotificationManager::class.java)
             manager.createNotificationChannel(channel)
         }

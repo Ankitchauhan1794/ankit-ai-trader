@@ -1,0 +1,265 @@
+name: Build Ankit AI Trader APK
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main, master ]
+  push:
+    branches: [ main, master, "feature/**" ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter (Pinned Stable 3.29.2 — Pre-AGP 9 Migration)
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.29.2"
+          channel: stable
+          cache: true
+
+      - name: Locate or Extract Android Source Project
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p workspace
+
+          if [ -f "ankit_ai_trader_mobile_v1/pubspec.yaml" ] && [ -f "ankit_ai_trader_mobile_v1/lib/main.dart" ]; then
+            echo "Tracked Phase 1 project found in ankit_ai_trader_mobile_v1/."
+            cp -R ankit_ai_trader_mobile_v1 workspace/
+          elif [ -f "pubspec.yaml" ] && [ -f "lib/main.dart" ]; then
+            echo "Project found at repository root."
+            mkdir -p workspace/ankit_ai_trader_mobile_v1
+            cp -R . workspace/ankit_ai_trader_mobile_v1/ || true
+          else
+            echo "ERROR: Could not find Flutter source project in repository."
+            ls -la
+            exit 1
+          fi
+
+          test -f workspace/ankit_ai_trader_mobile_v1/pubspec.yaml
+          test -f workspace/ankit_ai_trader_mobile_v1/lib/main.dart
+
+      - name: Generate Flutter Android wrapper & preserve custom native files
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd workspace/ankit_ai_trader_mobile_v1
+
+          mkdir -p /tmp/ankit-native
+          cp -R lib /tmp/ankit-native/lib
+          cp -R test /tmp/ankit-native/test
+          cp pubspec.yaml /tmp/ankit-native/pubspec.yaml
+          if [ -f "analysis_options.yaml" ]; then
+            cp analysis_options.yaml /tmp/ankit-native/analysis_options.yaml
+          fi
+          cp android/app/src/main/AndroidManifest.xml /tmp/ankit-native/AndroidManifest.xml
+          cp -R android/app/src/main/kotlin /tmp/ankit-native/kotlin
+
+          flutter create . --platforms=android --project-name=ankit_ai_trader --org=com.ankit
+
+          rm -rf lib test
+          cp -R /tmp/ankit-native/lib lib
+          cp -R /tmp/ankit-native/test test
+          cp /tmp/ankit-native/pubspec.yaml pubspec.yaml
+          if [ -f "/tmp/ankit-native/analysis_options.yaml" ]; then
+            cp /tmp/ankit-native/analysis_options.yaml analysis_options.yaml
+          fi
+          cp /tmp/ankit-native/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+          rm -rf android/app/src/main/kotlin
+          cp -R /tmp/ankit-native/kotlin android/app/src/main/kotlin
+
+          rm -f android/build.gradle.kts android/settings.gradle.kts android/app/build.gradle.kts
+
+      - name: Repair Manifest, Deduplicate Kotlin Imports & Pin Verified Toolchain
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd workspace/ankit_ai_trader_mobile_v1
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          manifest = Path("android/app/src/main/AndroidManifest.xml")
+          text = manifest.read_text(encoding="utf-8")
+          text = text.replace(r'>\n        <meta-data', '>\n        <meta-data')
+          manifest.write_text(text, encoding="utf-8")
+
+          kotlin_root = Path("android/app/src/main/kotlin")
+          for kt_file in kotlin_root.rglob("*.kt"):
+              lines = kt_file.read_text(encoding="utf-8").splitlines()
+              seen_imports = set()
+              cleaned = []
+              for line in lines:
+                  stripped = line.strip()
+                  if stripped.startswith("import "):
+                      if stripped in seen_imports:
+                          continue
+                      seen_imports.add(stripped)
+                  cleaned.append(line)
+              kt_file.write_text("\n".join(cleaned) + "\n", encoding="utf-8")
+          PY
+
+          cat > analysis_options.yaml <<'EOF'
+          include: package:flutter_lints/flutter.yaml
+
+          linter:
+            rules:
+              prefer_const_constructors: false
+              prefer_const_literals_to_create_immutables: false
+          EOF
+
+          cat > android/settings.gradle <<'EOF'
+          pluginManagement {
+              def flutterSdkPath = {
+                  def properties = new Properties()
+                  file("local.properties").withInputStream { properties.load(it) }
+                  def flutterSdkPath = properties.getProperty("flutter.sdk")
+                  assert flutterSdkPath != null, "flutter.sdk not set in local.properties"
+                  return flutterSdkPath
+              }()
+
+              includeBuild("$flutterSdkPath/packages/flutter_tools/gradle")
+
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          plugins {
+              id "dev.flutter.flutter-plugin-loader" version "1.0.0"
+              id "com.android.application" version "8.7.3" apply false
+              id "org.jetbrains.kotlin.android" version "2.1.0" apply false
+          }
+
+          include ":app"
+          EOF
+
+          cat > android/build.gradle <<'EOF'
+          allprojects {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.buildDir = "../build"
+          subprojects {
+              project.buildDir = "${rootProject.buildDir}/${project.name}"
+          }
+          subprojects {
+              project.evaluationDependsOn(":app")
+          }
+
+          tasks.register("clean", Delete) {
+              delete rootProject.buildDir
+          }
+          EOF
+
+          cat > android/gradle/wrapper/gradle-wrapper.properties <<'EOF'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.10.2-all.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          EOF
+
+          cat > android/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx4G -XX:MaxMetaspaceSize=1G -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.enableJetifier=true
+          kotlin.code.style=official
+          EOF
+
+          cat > android/app/build.gradle <<'EOF'
+          plugins {
+              id "com.android.application"
+              id "kotlin-android"
+              id "dev.flutter.flutter-gradle-plugin"
+          }
+
+          android {
+              namespace = "com.ankit.aitrader"
+              compileSdk = 35
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+
+              defaultConfig {
+                  applicationId = "com.ankit.aitrader"
+                  minSdk = 23
+                  targetSdk = 35
+                  versionCode = 6
+                  versionName = "1.5.0-phase1-final"
+              }
+
+              buildTypes {
+                  release {
+                      signingConfig = signingConfigs.debug
+                      minifyEnabled false
+                      shrinkResources false
+                  }
+              }
+          }
+
+          flutter {
+              source = "../.."
+          }
+          EOF
+
+      - name: Install Flutter dependencies
+        working-directory: workspace/ankit_ai_trader_mobile_v1
+        run: flutter pub get
+
+      - name: Analyze Dart Source
+        working-directory: workspace/ankit_ai_trader_mobile_v1
+        run: flutter analyze
+
+      - name: Run Phase 1 Unit, Persistence & Widget Tests
+        working-directory: workspace/ankit_ai_trader_mobile_v1
+        run: flutter test
+
+      - name: Build Release APK (Bypassing Auto-Migrator)
+        working-directory: workspace/ankit_ai_trader_mobile_v1
+        run: flutter build apk --release --android-skip-build-dependency-validation
+
+      - name: Verify and Rename APK to Ankit_AI_Trader.apk
+        shell: bash
+        run: |
+          set -euxo pipefail
+          APK="workspace/ankit_ai_trader_mobile_v1/build/app/outputs/flutter-apk/app-release.apk"
+          test -s "$APK"
+          cp "$APK" ./Ankit_AI_Trader.apk
+          ls -lh ./Ankit_AI_Trader.apk
+          file ./Ankit_AI_Trader.apk
+
+      - name: Upload Ankit_AI_Trader.apk Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ankit_AI_Trader_APK
+          path: Ankit_AI_Trader.apk
+          if-no-files-found: error
+          retention-days: 30

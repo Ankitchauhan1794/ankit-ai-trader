@@ -2,10 +2,6 @@ import 'dart:math' as math;
 import '../models/trading_models.dart';
 
 class IndicatorEngine {
-  /// Calculates standard Exponential Moving Average (EMA) series.
-  /// Seeds the first EMA value at index `period - 1` with the Simple Moving Average (SMA)
-  /// of the first `period` valid closes, then applies `k = 2 / (period + 1)`.
-  /// Returns `null` at indices with insufficient history or invalid inputs.
   static List<double?> calculateEmaSeries(List<double> values, int period) {
     if (period <= 0 || values.length < period) {
       return List<double?>.filled(values.length, null);
@@ -32,8 +28,6 @@ class IndicatorEngine {
     return result;
   }
 
-  /// Calculates Wilder's Relative Strength Index (RSI) series (default period = 14).
-  /// Handles zero average loss (`avgLoss == 0`) safely without division by zero.
   static List<double?> calculateRsiSeries(List<double> closes, int period) {
     if (period <= 0 || closes.length <= period) {
       return List<double?>.filled(closes.length, null);
@@ -88,9 +82,6 @@ class IndicatorEngine {
     return 100.0 - (100.0 / (1.0 + rs));
   }
 
-  /// Calculates Wilder's Average True Range (ATR) series (default period = 14).
-  /// First True Range is `high - low` at index 0; subsequent TRs are
-  /// `max(high - low, |high - prevClose|, |low - prevClose|)`.
   static List<double?> calculateAtrSeries(List<Candle> candles, int period) {
     if (period <= 0 || candles.length < period) {
       return List<double?>.filled(candles.length, null);

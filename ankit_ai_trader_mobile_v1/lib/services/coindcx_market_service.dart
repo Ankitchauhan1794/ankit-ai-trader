@@ -21,8 +21,6 @@ class CoinDcxMarketService {
   Map<String, MarketPairMetadata> get discoveredPairs =>
       Map.unmodifiable(_discoveredPairs);
 
-  /// Discovers active BTC/USDT and ETH/USDT pair identifiers directly from CoinDCX
-  /// `/exchange/v1/markets_details` without assuming hardcoded pair strings.
   Future<Map<String, MarketPairMetadata>> discoverActiveUsdtPairs({
     List<String> targetSymbols = const ['BTCUSDT', 'ETHUSDT'],
   }) async {
@@ -60,7 +58,6 @@ class CoinDcxMarketService {
       );
       if (matchedSymbol.isEmpty) continue;
 
-      // Prefer spot pairs (`B-...`) when multiple markets exist
       if (_discoveredPairs.containsKey(matchedSymbol) &&
           _discoveredPairs[matchedSymbol]!.pair.startsWith('B-') &&
           !pair.startsWith('B-')) {
@@ -69,7 +66,8 @@ class CoinDcxMarketService {
 
       final minNotional = _toDouble(raw['min_notional']) ?? 1.0;
       final minQuantity = _toDouble(raw['min_quantity']) ?? 0.00001;
-      final basePrecision = (raw['base_currency_precision'] as num?)?.toInt() ?? 2;
+      final basePrecision =
+          (raw['base_currency_precision'] as num?)?.toInt() ?? 2;
       final targetPrecision =
           (raw['target_currency_precision'] as num?)?.toInt() ?? 5;
 
@@ -97,9 +95,6 @@ class CoinDcxMarketService {
     return Map.unmodifiable(_discoveredPairs);
   }
 
-  /// Fetches historical candles from `https://public.coindcx.com/market_data/candles`,
-  /// validates numeric fields, deduplicates timestamps, sorts chronologically,
-  /// and keeps ONLY fully closed candles.
   Future<List<Candle>> fetchClosedCandles({
     required String symbol,
     required String pair,
@@ -127,7 +122,9 @@ class CoinDcxMarketService {
 
     final decoded = jsonDecode(response.body);
     if (decoded is! List) {
-      throw const FormatException('CoinDCX candles response must be a JSON List.');
+      throw const FormatException(
+        'CoinDCX candles response must be a JSON List.',
+      );
     }
 
     return sanitizeAndFilterClosedCandles(
@@ -150,8 +147,9 @@ class CoinDcxMarketService {
     }
   }
 
-  /// Validates, deduplicates, sorts chronologically, and filters out incomplete
-  /// or malformed candles.
+  /// Validates OHLCV fields, rejects future timestamps (`openTimeMs > nowMs`),
+  /// rejects incomplete candles (`closeTimeMs > nowMs`), deduplicates timestamps,
+  /// and sorts chronologically.
   static List<Candle> sanitizeAndFilterClosedCandles({
     required List<dynamic> rawList,
     required String symbol,
@@ -179,6 +177,10 @@ class CoinDcxMarketService {
       }
 
       final openTimeMs = rawTime < 100000000000 ? rawTime * 1000 : rawTime;
+      // Reject future candles
+      if (openTimeMs > nowMs) {
+        continue;
+      }
       final closeTimeMs = openTimeMs + intervalMs;
 
       final candle = Candle(
@@ -196,7 +198,6 @@ class CoinDcxMarketService {
       if (!candle.isValid) continue;
       if (!candle.isClosedAt(nowMs)) continue;
 
-      // Deduplicate by openTimeMs
       byOpenTime[openTimeMs] = candle;
     }
 
@@ -205,7 +206,6 @@ class CoinDcxMarketService {
     return sorted;
   }
 
-  /// Checks whether the candle series is stale or contains missing gaps near the tail.
   static bool isDataStale({
     required List<Candle> closedCandles,
     required String interval,
@@ -214,7 +214,6 @@ class CoinDcxMarketService {
     if (closedCandles.isEmpty) return true;
     final intervalMs = intervalDurationMs(interval);
     final latest = closedCandles.last;
-    // If latest closed candle closed more than 2.5 intervals ago, data is stale.
     if (nowMs - latest.closeTimeMs > (intervalMs * 2.5).round()) {
       return true;
     }

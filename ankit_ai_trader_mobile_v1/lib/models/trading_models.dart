@@ -80,8 +80,8 @@ class Candle {
 }
 
 class MarketPairMetadata {
-  final String symbol; // e.g. BTCUSDT
-  final String pair; // e.g. B-BTC_USDT
+  final String symbol;
+  final String pair;
   final String baseCurrency;
   final String targetCurrency;
   final double minNotional;
@@ -157,8 +157,8 @@ class RiskConfig {
   final double maxDailyLossFraction; // 0.02 = 2% ($2)
   final double maxTotalDrawdownFraction; // 0.10 = 10% ($10)
   final int maxOpenPositions; // 1
-  final double feeRate; // default 0.001 (0.10% configurable)
-  final double slippageRate; // default 0.0005 (0.05% configurable)
+  final double feeRate;
+  final double slippageRate;
 
   const RiskConfig({
     this.initialCapitalUsdt = 100.0,
@@ -207,7 +207,7 @@ class RiskConfig {
 class SimulatedOrder {
   final String id;
   final String symbol;
-  final String side; // BUY or SELL
+  final String side;
   final double requestedPrice;
   final double executedPrice;
   final double quantity;
@@ -411,6 +411,26 @@ class PendingEntrySignal {
     required this.ema20,
     required this.ema50,
   });
+
+  Map<String, dynamic> toMap() => {
+        'symbol': symbol,
+        'signalCandleCloseMs': signalCandleCloseMs,
+        'atr14': atr14,
+        'rsi14': rsi14,
+        'ema20': ema20,
+        'ema50': ema50,
+      };
+
+  factory PendingEntrySignal.fromMap(Map<String, dynamic> map) {
+    return PendingEntrySignal(
+      symbol: map['symbol'] as String,
+      signalCandleCloseMs: (map['signalCandleCloseMs'] as num).toInt(),
+      atr14: (map['atr14'] as num).toDouble(),
+      rsi14: (map['rsi14'] as num).toDouble(),
+      ema20: (map['ema20'] as num).toDouble(),
+      ema50: (map['ema50'] as num).toDouble(),
+    );
+  }
 }
 
 class BacktestReport {

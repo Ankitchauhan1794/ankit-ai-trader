@@ -2,9 +2,10 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'models/trading_models.dart';
+import 'services/authoritative_engine.dart';
 import 'services/coindcx_market_service.dart';
-import 'services/paper_broker.dart';
 import 'services/persistence_db.dart';
+import 'services/strategy_engine.dart';
 import 'services/trading_coordinator.dart';
 
 void main() {
@@ -12,107 +13,59 @@ void main() {
   runApp(const AnkitTraderApp());
 }
 
-/// Headless entrypoint invoked by `TradingForegroundService.kt` when the screen is locked
-/// or the main Activity is swiped away. Restores SQLite state and only processes candles
-/// if the user had explicitly left the bot in `BotEngineState.running`.
+/// The single authoritative headless Dart entrypoint started by `TradingForegroundService.kt`.
+/// Acknowledges initialization to the native service only after `PersistenceDatabase`
+/// is verified ready. All paper trading execution happens exclusively here.
 @pragma('vm:entry-point')
-void backgroundServiceMain() {
+Future<void> backgroundServiceMain() async {
   WidgetsFlutterBinding.ensureInitialized();
   const channel = MethodChannel('com.ankit.aitrader/background_worker');
   final marketService = CoinDcxMarketService();
   final persistence = PersistenceDatabase();
-  final broker = PaperBroker();
+
+  late final AuthoritativeTradingEngine engine;
+  engine = AuthoritativeTradingEngine(
+    marketService: marketService,
+    persistence: persistence,
+    onNotificationUpdate: (title, text) async {
+      try {
+        await channel.invokeMethod('updateServiceNotification', {
+          'title': title,
+          'text': text,
+        });
+      } catch (_) {}
+    },
+  );
 
   channel.setMethodCallHandler((call) async {
-    if (call.method == 'onBackgroundTick') {
-      try {
-        final state = await persistence.restoreIntoBroker(broker);
-        if (state != BotEngineState.running) {
-          return true;
-        }
-        final pairs = await marketService.discoverActiveUsdtPairs();
-        final nowMs = DateTime.now().toUtc().millisecondsSinceEpoch;
-        final latestPrices = <String, double>{};
-
-        for (final symbol in ['BTCUSDT', 'ETHUSDT']) {
-          final meta = pairs[symbol];
-          if (meta == null) continue;
-          final closed15m = await marketService.fetchClosedCandles(
-            symbol: symbol,
-            pair: meta.pair,
-            interval: '15m',
-            limit: 120,
-            nowEpochMs: nowMs,
-          );
-          final closed1h = await marketService.fetchClosedCandles(
-            symbol: symbol,
-            pair: meta.pair,
-            interval: '1h',
-            limit: 120,
-            nowEpochMs: nowMs,
-          );
-          if (closed15m.isEmpty ||
-              closed1h.isEmpty ||
-              CoinDcxMarketService.isDataStale(
-                closedCandles: closed15m,
-                interval: '15m',
-                nowMs: nowMs,
-              )) {
-            await persistence.saveFullState(
-              broker: broker,
-              botState: BotEngineState.pausedStaleData,
-              latestPrices: latestPrices,
-            );
-            return false;
-          }
-          latestPrices[symbol] = closed15m.last.close;
-          broker.processClosedCandleStep(
-            symbol: symbol,
-            closed15m: closed15m,
-            closed1h: closed1h,
-            latestPrices: latestPrices,
-            minNotionalUsdt: meta.minNotional,
-            minQuantity: meta.minQuantity,
-          );
-        }
-
-        BotEngineState nextState = BotEngineState.running;
-        if (broker.maxDrawdownLocked) {
-          nextState = BotEngineState.stoppedMaxDrawdownReached;
-        } else if (broker.isDailyLockedAt(nowMs)) {
-          nextState = BotEngineState.lockedDailyLossLimit;
-        }
-
-        await persistence.saveFullState(
-          broker: broker,
-          botState: nextState,
-          latestPrices: latestPrices,
+    switch (call.method) {
+      case 'onCommand':
+        final cmd = (call.arguments as Map?)?['command']?.toString() ?? '';
+        return await engine.handleCommand(cmd);
+      case 'onBackgroundTick':
+        return await engine.executeAuthoritativeCycle(
+          allowTradingExecution: true,
         );
-
-        final eq = broker.accountEquity(latestPrices).toStringAsFixed(2);
-        await channel.invokeMethod('updateServiceNotification', {
-          'title': 'Ankit AI Trader — Paper Engine',
-          'text': 'State: ${nextState.name.toUpperCase()} | Equity: \$$eq USDT',
-        });
-      } catch (_) {
-        // Network loss or timeout in background: pause safely and require manual START
-        try {
-          await persistence.restoreIntoBroker(broker);
-          await persistence.saveFullState(
-            broker: broker,
-            botState: BotEngineState.pausedAfterRecoveryManualStartRequired,
-            latestPrices: const {},
-          );
-          await channel.invokeMethod('updateServiceNotification', {
-            'title': 'Ankit AI Trader — PAUSED',
-            'text': 'Network/data interrupted. Manual START required.',
-          });
-        } catch (_) {}
-      }
-      return true;
+      case 'onNetworkChanged':
+        final connected =
+            (call.arguments as Map?)?['connected'] as bool? ?? false;
+        await engine.handleNetworkTransition(connected);
+        return true;
+      default:
+        return false;
     }
-    return false;
   });
+
+  try {
+    await persistence.database;
+    await channel.invokeMethod('acknowledgeEngineInitialized');
+  } catch (e) {
+    try {
+      await channel.invokeMethod('reportEngineFatalError', {
+        'error': e.toString(),
+      });
+    } catch (_) {}
+  }
 }
 
 class AnkitTraderApp extends StatelessWidget {
@@ -194,7 +147,7 @@ class _DashboardPageState extends State<DashboardPage> {
     final cash = broker.availableCashUsdt;
     final realized = broker.realizedPnlUsdt;
     final unrealized = broker.unrealizedPnl(prices);
-    final dailyPnl = broker.todayRealizedPnl(nowMs);
+    final dailyPnl = broker.currentUtcDayTotalPnl(nowMs, prices);
     final drawdown = broker.currentDrawdownUsdt(prices);
 
     final btcPrice = prices['BTCUSDT'] ?? 0.0;
@@ -203,7 +156,8 @@ class _DashboardPageState extends State<DashboardPage> {
     final ethEval = _coordinator.latestEvaluations['ETHUSDT'];
 
     final isBotRunning = _coordinator.engineState == BotEngineState.running &&
-        _coordinator.marketDataStatus == MarketDataStatus.connected;
+        _coordinator.marketDataStatus == MarketDataStatus.connected &&
+        _coordinator.foregroundServiceActive;
 
     return Scaffold(
       appBar: AppBar(
@@ -292,7 +246,9 @@ class _DashboardPageState extends State<DashboardPage> {
               : Colors.orangeAccent,
         ),
         _statusChip(
-          fgsActive ? 'FOREGROUND SERVICE: ACTIVE' : 'FOREGROUND SERVICE: IDLE',
+          fgsActive
+              ? 'FOREGROUND SERVICE: ACTIVE'
+              : 'FOREGROUND SERVICE: IDLE',
           fgsActive ? const Color(0xFF4C8DFF) : Colors.grey,
         ),
         _statusChip(
@@ -412,7 +368,8 @@ class _DashboardPageState extends State<DashboardPage> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(label, style: const TextStyle(color: Colors.white54, fontSize: 11)),
+        Text(label,
+            style: const TextStyle(color: Colors.white54, fontSize: 11)),
         const SizedBox(height: 2),
         Text(
           value,
@@ -526,8 +483,7 @@ class _DashboardPageState extends State<DashboardPage> {
           style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
         ),
         OutlinedButton(
-          onPressed: () =>
-              _coordinator.pollMarketDataAndEvaluate(allowTradingExecution: false),
+          onPressed: () => _coordinator.requestPassiveQuoteRefresh(),
           child: const Text('REFRESH QUOTES'),
         ),
         OutlinedButton(
