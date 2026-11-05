@@ -1,9 +1,11 @@
 import 'dart:convert';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:ankit_ai_trader/models/trading_models.dart';
+import 'package:ankit_ai_trader/services/authoritative_engine.dart';
 import 'package:ankit_ai_trader/services/coindcx_market_service.dart';
 import 'package:ankit_ai_trader/services/indicator_engine.dart';
 import 'package:ankit_ai_trader/services/paper_broker.dart';
@@ -12,127 +14,680 @@ import 'package:ankit_ai_trader/services/risk_manager.dart';
 import 'package:ankit_ai_trader/services/strategy_engine.dart';
 import 'package:ankit_ai_trader/services/trading_coordinator.dart';
 
+class FakeEngineCommandBridge implements EngineCommandBridge {
+  final AuthoritativeTradingEngine? engine;
+  final bool serviceStartsSuccessfully;
+  final bool dartEngineInitializesSuccessfully;
+  final bool throwPlatformExceptionOnStart;
+
+  FakeEngineCommandBridge({
+    this.engine,
+    this.serviceStartsSuccessfully = true,
+    this.dartEngineInitializesSuccessfully = true,
+    this.throwPlatformExceptionOnStart = false,
+  });
+
+  @override
+  Future<bool> ensureServiceStartedAndReady() async {
+    if (throwPlatformExceptionOnStart) {
+      throw PlatformException(
+        code: 'SERVICE_START_FAILED',
+        message: 'Android foreground service rejected start',
+      );
+    }
+    return serviceStartsSuccessfully && dartEngineInitializesSuccessfully;
+  }
+
+  @override
+  Future<bool> dispatchCommand(String command) async {
+    if (!serviceStartsSuccessfully ||
+        !dartEngineInitializesSuccessfully ||
+        engine == null) {
+      return false;
+    }
+    return await engine!.handleCommand(command);
+  }
+
+  @override
+  Future<void> notifyNetworkChanged(bool isConnected) async {
+    if (engine != null &&
+        serviceStartsSuccessfully &&
+        dartEngineInitializesSuccessfully) {
+      await engine!.handleNetworkTransition(isConnected);
+    }
+  }
+
+  @override
+  Future<bool> isServiceAndEngineReady() async {
+    return serviceStartsSuccessfully && dartEngineInitializesSuccessfully;
+  }
+}
+
+List<Candle> buildContiguousCandles({
+  required String symbol,
+  required String interval,
+  required int startOpenMs,
+  required int count,
+  required double Function(int index) closeBuilder,
+}) {
+  final step = CoinDcxMarketService.intervalDurationMs(interval);
+  return List<Candle>.generate(count, (i) {
+    final openMs = startOpenMs + (i * step);
+    final c = closeBuilder(i);
+    return Candle(
+      symbol: symbol,
+      interval: interval,
+      openTimeMs: openMs,
+      closeTimeMs: openMs + step,
+      open: c - 0.2,
+      high: c + 1.5,
+      low: c - 1.5,
+      close: c,
+      volume: 25.0,
+    );
+  });
+}
+
 void main() {
   setUpAll(() {
     sqfliteFfiInit();
     databaseFactory = databaseFactoryFfi;
   });
 
-  group('Part B & C — Market Data Validation & Technical Indicators', () {
-    test('EMA 20 and EMA 50 match exact mathematical formulas and handle insufficient data', () {
-      final shortList = List<double>.generate(10, (i) => 100.0 + i);
-      expect(
-        IndicatorEngine.calculateEmaSeries(shortList, 20).every((e) => e == null),
-        isTrue,
+  group('Phase 1 Final Verification — 21 Deterministic Tests', () {
+    test('Test 1: Single authoritative engine enforcement via SQLite execution lease lock', () async {
+      final db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
+      final persistence = PersistenceDatabase();
+      await persistence.openWithCustomDatabase(db);
+
+      const nowMs = 1700000000000;
+      final lock1 = await persistence.acquireExecutionLock(
+        ownerId: 'ENGINE_A',
+        nowMs: nowMs,
+        leaseDurationMs: 60000,
       );
+      expect(lock1, isTrue);
 
-      final prices = List<double>.generate(60, (i) => 100.0 + i * 2.0);
-      final ema20 = IndicatorEngine.calculateEmaSeries(prices, 20);
-      final ema50 = IndicatorEngine.calculateEmaSeries(prices, 50);
+      // Competing engine B cannot acquire the lock while ENGINE_A holds an active lease
+      final lock2 = await persistence.acquireExecutionLock(
+        ownerId: 'ENGINE_B',
+        nowMs: nowMs + 1000,
+        leaseDurationMs: 60000,
+      );
+      expect(lock2, isFalse);
 
-      // First EMA20 at index 19 is exact SMA of first 20 numbers: 100..138 -> avg 119.0
-      expect(ema20[18], isNull);
-      expect(ema20[19], closeTo(119.0, 1e-6));
-      expect(ema50[49], closeTo(149.0, 1e-6));
-      expect(ema20.last! > ema50.last!, isTrue);
+      // Once ENGINE_A releases the lock, ENGINE_B can acquire it
+      await persistence.releaseExecutionLock('ENGINE_A');
+      final lock3 = await persistence.acquireExecutionLock(
+        ownerId: 'ENGINE_B',
+        nowMs: nowMs + 2000,
+        leaseDurationMs: 60000,
+      );
+      expect(lock3, isTrue);
+
+      await persistence.close();
     });
 
-    test('RSI 14 handles flat, all-gain, and mixed series without zero-denominator crash', () {
-      final flat = List<double>.filled(20, 100.0);
-      final rsiFlat = IndicatorEngine.calculateRsiSeries(flat, 14);
-      expect(rsiFlat.last, closeTo(50.0, 1e-6));
-
-      final upOnly = List<double>.generate(20, (i) => 100.0 + i);
-      final rsiUp = IndicatorEngine.calculateRsiSeries(upOnly, 14);
-      expect(rsiUp.last, closeTo(100.0, 1e-6));
-    });
-
-    test('ATR 14 computes Wilder True Range average accurately', () {
-      final candles = List<Candle>.generate(20, (i) {
-        final t = 1700000000000 + i * 900000;
-        return Candle(
-          symbol: 'BTCUSDT',
-          interval: '15m',
-          openTimeMs: t,
-          closeTimeMs: t + 900000,
-          open: 100.0,
-          high: 110.0,
-          low: 90.0,
-          close: 105.0,
-          volume: 10.0,
-        );
-      });
-      final atr14 = IndicatorEngine.calculateAtrSeries(candles, 14);
-      expect(atr14[12], isNull);
-      expect(atr14[13], closeTo(20.0, 1e-6));
-      expect(atr14.last, closeTo(20.0, 1e-6));
-    });
-
-    test('CoinDCX sanitizer filters incomplete candles, deduplicates, and sorts chronologically', () {
-      const intervalMs = 15 * 60 * 1000;
-      const t1 = 1700000000000;
-      const t2 = t1 + intervalMs;
-      const t3OpenIncomplete = t2 + intervalMs;
-      const nowMs = t3OpenIncomplete + 300000; // 5m into 3rd candle
-
-      final raw = [
-        {'time': t2, 'open': 102, 'high': 105, 'low': 101, 'close': 104, 'volume': 5},
-        {'time': t1, 'open': 100, 'high': 103, 'low': 99, 'close': 102, 'volume': 4},
-        {'time': t1, 'open': 100, 'high': 103, 'low': 99, 'close': 102, 'volume': 4}, // duplicate
-        {'time': t3OpenIncomplete, 'open': 104, 'high': 106, 'low': 103, 'close': 105, 'volume': 2},
-      ];
-
-      final cleaned = CoinDcxMarketService.sanitizeAndFilterClosedCandles(
-        rawList: raw,
+    test('Test 2: Duplicate execution prevention on repeated candle callbacks & signal keys', () {
+      final broker = PaperBroker();
+      const baseMs = 1700000000000;
+      final candles15m = buildContiguousCandles(
         symbol: 'BTCUSDT',
         interval: '15m',
-        intervalMs: intervalMs,
-        nowMs: nowMs,
+        startOpenMs: baseMs,
+        count: 60,
+        closeBuilder: (i) => 100.0 + i * 0.5,
+      );
+      final candles1h = buildContiguousCandles(
+        symbol: 'BTCUSDT',
+        interval: '1h',
+        startOpenMs: baseMs - (60 * 3600000),
+        count: 75,
+        closeBuilder: (i) => 90.0 + i * 0.5,
       );
 
-      expect(cleaned.length, 2);
-      expect(cleaned[0].openTimeMs, t1);
-      expect(cleaned[1].openTimeMs, t2);
-    });
-  });
+      // First call warms up and sets checkpoint at candles15m.last.closeTimeMs
+      final first = broker.processClosedCandleStream(
+        symbol: 'BTCUSDT',
+        closed15m: candles15m,
+        closed1h: candles1h,
+        latestPrices: {},
+      );
+      expect(first.evaluations.first.description, contains('WARM-UP COMPLETE'));
 
-  group('Part D, E & F — Strategy, Conservative SL/TP, Paper Broker & Risk Manager', () {
-    test('Position sizing caps risk at 1% (\$1), respects cash & rejects oversized minNotional', () {
-      const rm = RiskManager();
+      // Repeated call with identical candles processes 0 new candles
+      final second = broker.processClosedCandleStream(
+        symbol: 'BTCUSDT',
+        closed15m: candles15m,
+        closed1h: candles1h,
+        latestPrices: {},
+      );
+      expect(second.evaluations.first.description, 'NO NEW CLOSED 15M CANDLES');
+      expect(broker.orderHistory, isEmpty);
+    });
+
+    test('Test 3: Fresh-account historical warm-up establishes checkpoint without generating historical trades', () {
+      final broker = PaperBroker();
+      const baseMs = 1700000000000;
+      final candles1h = buildContiguousCandles(
+        symbol: 'BTCUSDT',
+        interval: '1h',
+        startOpenMs: baseMs - (80 * 3600000),
+        count: 100,
+        closeBuilder: (i) => 100.0 + i * 1.0,
+      );
+      // Construct 15m series that has a crossover inside historical bars
+      final candles15m = buildContiguousCandles(
+        symbol: 'BTCUSDT',
+        interval: '15m',
+        startOpenMs: baseMs,
+        count: 80,
+        closeBuilder: (i) => i < 55 ? 120.0 - i * 0.2 : 109.0 + (i - 55) * 0.6,
+      );
+
+      final outcome = broker.processClosedCandleStream(
+        symbol: 'BTCUSDT',
+        closed15m: candles15m,
+        closed1h: candles1h,
+        latestPrices: {},
+        allowHistoricalWarmupTrades: false,
+      );
+
+      expect(outcome.pausedOnMissingNextCandle, isFalse);
+      expect(broker.openPositions, isEmpty);
+      expect(broker.closedTrades, isEmpty);
+      expect(broker.pendingSignalsBySymbol, isEmpty);
+      expect(
+        broker.lastProcessedCandleCloseMs['BTCUSDT'],
+        candles15m.last.closeTimeMs,
+      );
+    });
+
+    test('Test 4: Sequential candle processing evaluates multiple new contiguous 15m candles in chronological order', () {
+      final broker = PaperBroker();
+      const baseMs = 1700000000000;
+      final all15m = buildContiguousCandles(
+        symbol: 'BTCUSDT',
+        interval: '15m',
+        startOpenMs: baseMs,
+        count: 65,
+        closeBuilder: (i) => 100.0 + i * 0.2,
+      );
+      final all1h = buildContiguousCandles(
+        symbol: 'BTCUSDT',
+        interval: '1h',
+        startOpenMs: baseMs - (60 * 3600000),
+        count: 80,
+        closeBuilder: (i) => 95.0 + i * 0.5,
+      );
+
+      // Warm up on first 60 candles
+      broker.processClosedCandleStream(
+        symbol: 'BTCUSDT',
+        closed15m: all15m.sublist(0, 60),
+        closed1h: all1h,
+        latestPrices: {},
+      );
+
+      // Now feed 5 new contiguous closed candles (indices 60..64)
+      final outcome = broker.processClosedCandleStream(
+        symbol: 'BTCUSDT',
+        closed15m: all15m,
+        closed1h: all1h,
+        latestPrices: {},
+      );
+
+      expect(outcome.pausedOnMissingNextCandle, isFalse);
+      expect(outcome.evaluations.length, 5);
+      expect(
+        broker.lastProcessedCandleCloseMs['BTCUSDT'],
+        all15m.last.closeTimeMs,
+      );
+    });
+
+    test('Test 5: Immediate next-candle entry executes BUY at open of C+1 with configured slippage & fees', () {
+      final broker = PaperBroker();
+      const signalCloseMs = 1700054000000;
+      broker.lastProcessedCandleCloseMs['BTCUSDT'] = signalCloseMs;
+      broker.pendingSignalsBySymbol['BTCUSDT'] = const PendingEntrySignal(
+        symbol: 'BTCUSDT',
+        signalCandleCloseMs: signalCloseMs,
+        atr14: 2.0,
+        rsi14: 58.0,
+        ema20: 105.0,
+        ema50: 104.0,
+      );
+
+      final candles15m = buildContiguousCandles(
+        symbol: 'BTCUSDT',
+        interval: '15m',
+        startOpenMs: signalCloseMs - (59 * 900000),
+        count: 61, // index 60 opens at signalCloseMs (C+1)
+        closeBuilder: (i) => 100.0 + i * 0.1,
+      );
+      final candles1h = buildContiguousCandles(
+        symbol: 'BTCUSDT',
+        interval: '1h',
+        startOpenMs: signalCloseMs - (60 * 3600000),
+        count: 65,
+        closeBuilder: (i) => 100.0 + i * 0.2,
+      );
+
+      final nextCandleOpen = candles15m.last.open;
+      final outcome = broker.processClosedCandleStream(
+        symbol: 'BTCUSDT',
+        closed15m: candles15m,
+        closed1h: candles1h,
+        latestPrices: {},
+      );
+
+      expect(outcome.pausedOnMissingNextCandle, isFalse);
+      expect(broker.openPositions.containsKey('BTCUSDT'), isTrue);
+      final pos = broker.openPositions['BTCUSDT']!;
+      expect(
+        pos.entryPrice,
+        closeTo(nextCandleOpen * (1.0 + broker.riskConfig.slippageRate), 1e-6),
+      );
+      expect(pos.openedAtMs, signalCloseMs);
+    });
+
+    test('Test 6: Missing next candle C+1 discards stale pending signal and pauses safely without executing at C+2', () {
+      final broker = PaperBroker();
+      const signalCloseMs = 1700054000000;
+      broker.lastProcessedCandleCloseMs['BTCUSDT'] = signalCloseMs;
+      broker.pendingSignalsBySymbol['BTCUSDT'] = const PendingEntrySignal(
+        symbol: 'BTCUSDT',
+        signalCandleCloseMs: signalCloseMs,
+        atr14: 2.0,
+        rsi14: 58.0,
+        ema20: 105.0,
+        ema50: 104.0,
+      );
+
+      final history = buildContiguousCandles(
+        symbol: 'BTCUSDT',
+        interval: '15m',
+        startOpenMs: signalCloseMs - (60 * 900000),
+        count: 60,
+        closeBuilder: (i) => 100.0,
+      );
+      // C+1 (opening at signalCloseMs) is missing; next available candle opens at signalCloseMs + 900000 (C+2)
+      const cPlus2 = Candle(
+        symbol: 'BTCUSDT',
+        interval: '15m',
+        openTimeMs: signalCloseMs + 900000,
+        closeTimeMs: signalCloseMs + 1800000,
+        open: 101.0,
+        high: 102.0,
+        low: 100.0,
+        close: 101.5,
+        volume: 15.0,
+      );
+
+      final outcome = broker.processClosedCandleStream(
+        symbol: 'BTCUSDT',
+        closed15m: [...history, cPlus2],
+        closed1h: const [],
+        latestPrices: {},
+      );
+
+      expect(outcome.pausedOnMissingNextCandle, isTrue);
+      expect(broker.pendingSignalsBySymbol.containsKey('BTCUSDT'), isFalse);
+      expect(broker.openPositions.isEmpty, isTrue);
+    });
+
+    test('Test 7: Pending entry signal and processed checkpoints persist and restore atomically in SQLite', () async {
+      final db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
+      final persistence = PersistenceDatabase();
+      await persistence.openWithCustomDatabase(db);
+
+      final broker1 = PaperBroker();
+      broker1.lastProcessedCandleCloseMs['BTCUSDT'] = 1700000900000;
+      broker1.pendingSignalsBySymbol['BTCUSDT'] = const PendingEntrySignal(
+        symbol: 'BTCUSDT',
+        signalCandleCloseMs: 1700000900000,
+        atr14: 2.25,
+        rsi14: 59.5,
+        ema20: 105.0,
+        ema50: 103.5,
+      );
+
+      await persistence.saveFullState(
+        broker: broker1,
+        botState: BotEngineState.running,
+        latestPrices: const {'BTCUSDT': 105.0},
+      );
+
+      final broker2 = PaperBroker();
+      final snap = await persistence.restoreFullSnapshot(broker2);
+      expect(snap.botState, BotEngineState.running);
+      expect(broker2.lastProcessedCandleCloseMs['BTCUSDT'], 1700000900000);
+      expect(broker2.pendingSignalsBySymbol['BTCUSDT']?.atr14, closeTo(2.25, 1e-6));
+
+      await persistence.close();
+    });
+
+    test('Test 8: Both 15m and 1h timeframe freshness checks detect stale data', () {
+      const nowMs = 1700020000000;
+      final fresh15m = [
+        const Candle(
+          symbol: 'BTCUSDT',
+          interval: '15m',
+          openTimeMs: nowMs - 1800000,
+          closeTimeMs: nowMs - 900000,
+          open: 100,
+          high: 101,
+          low: 99,
+          close: 100,
+          volume: 10,
+        ),
+      ];
+      final stale15m = [
+        const Candle(
+          symbol: 'BTCUSDT',
+          interval: '15m',
+          openTimeMs: nowMs - 5000000,
+          closeTimeMs: nowMs - 4100000, // > 2.5 * 15m old
+          open: 100,
+          high: 101,
+          low: 99,
+          close: 100,
+          volume: 10,
+        ),
+      ];
+      final stale1h = [
+        const Candle(
+          symbol: 'BTCUSDT',
+          interval: '1h',
+          openTimeMs: nowMs - 15000000,
+          closeTimeMs: nowMs - 11400000, // > 2.5 * 1h old
+          open: 100,
+          high: 101,
+          low: 99,
+          close: 100,
+          volume: 10,
+        ),
+      ];
+
+      expect(
+        CoinDcxMarketService.isDataStale(
+          closedCandles: fresh15m,
+          interval: '15m',
+          nowMs: nowMs,
+        ),
+        isFalse,
+      );
+      expect(
+        CoinDcxMarketService.isDataStale(
+          closedCandles: stale15m,
+          interval: '15m',
+          nowMs: nowMs,
+        ),
+        isTrue,
+      );
+      expect(
+        CoinDcxMarketService.isDataStale(
+          closedCandles: stale1h,
+          interval: '1h',
+          nowMs: nowMs,
+        ),
+        isTrue,
+      );
+    });
+
+    test('Test 9: Both 15m and 1h timeframe missing-candle gap checks detect non-contiguous bars', () {
+      const baseMs = 1700000000000;
+      final contiguous15m = buildContiguousCandles(
+        symbol: 'BTCUSDT',
+        interval: '15m',
+        startOpenMs: baseMs,
+        count: 6,
+        closeBuilder: (_) => 100.0,
+      );
+      final gapped15m = [
+        contiguous15m[0],
+        contiguous15m[1],
+        contiguous15m[3], // missing index 2
+        contiguous15m[4],
+      ];
+
+      final contiguous1h = buildContiguousCandles(
+        symbol: 'BTCUSDT',
+        interval: '1h',
+        startOpenMs: baseMs,
+        count: 6,
+        closeBuilder: (_) => 100.0,
+      );
+      final gapped1h = [
+        contiguous1h[0],
+        contiguous1h[2], // missing index 1
+        contiguous1h[3],
+      ];
+
+      expect(
+        CoinDcxMarketService.hasRecentMissingCandleGap(
+          closedCandles: contiguous15m,
+          interval: '15m',
+        ),
+        isFalse,
+      );
+      expect(
+        CoinDcxMarketService.hasRecentMissingCandleGap(
+          closedCandles: gapped15m,
+          interval: '15m',
+        ),
+        isTrue,
+      );
+      expect(
+        CoinDcxMarketService.hasRecentMissingCandleGap(
+          closedCandles: gapped1h,
+          interval: '1h',
+        ),
+        isTrue,
+      );
+    });
+
+    test('Test 10: Realized plus unrealized daily loss against start-of-day baseline triggers $2 daily lock', () {
+      final broker = PaperBroker();
+      const day1Ms = 1700006400000; // 2023-11-15 UTC
+      broker.ensureUtcDayBaseline(day1Ms, const {'BTCUSDT': 100.0});
+      expect(broker.startOfDayEquityUsdt, closeTo(100.0, 1e-6));
+
+      // Simulate -$1.10 realized loss and open a position with -$0.95 unrealized loss (total -$2.05)
+      broker.availableCashUsdt = 48.90;
+      broker.realizedPnlUsdt = -1.10;
+      broker.dailyRealizedPnlByUtcDate[RiskManager.utcDayKey(day1Ms)] = -1.10;
+      broker.openPositions['BTCUSDT'] = const PaperPosition(
+        id: 'POS-1',
+        symbol: 'BTCUSDT',
+        entryPrice: 100.0,
+        quantity: 0.50, // cost 50.0
+        stopLoss: 94.0,
+        takeProfit: 112.0,
+        entryFeeUsdt: 0.05,
+        signalCandleCloseMs: day1Ms - 900000,
+        openedAtMs: day1Ms,
+      );
+
+      // Mark price 98.2 -> gross 49.1 -> net ~49.05 -> total equity ~97.95 (-$2.05 vs $100 start of day)
+      final locked = broker.isDailyLockedAt(day1Ms, const {'BTCUSDT': 98.2});
+      expect(locked, isTrue);
+      expect(broker.lockedDailyLossUtcDate, RiskManager.utcDayKey(day1Ms));
+    });
+
+    test('Test 11: Daily UTC reset with an open position carried across midnight establishes new baseline without resetting $100 account', () {
+      final broker = PaperBroker();
+      const day1Ms = 1700006400000; // 2023-11-15 00:00 UTC
+      const day2Ms = day1Ms + 86400000; // 2023-11-16 00:00 UTC
+
+      // Day 1: lock reached at equity $97.90 with open position
+      broker.availableCashUsdt = 47.90;
+      broker.openPositions['BTCUSDT'] = const PaperPosition(
+        id: 'POS-CARRY',
+        symbol: 'BTCUSDT',
+        entryPrice: 100.0,
+        quantity: 0.50,
+        stopLoss: 94.0,
+        takeProfit: 112.0,
+        entryFeeUsdt: 0.05,
+        signalCandleCloseMs: day1Ms - 900000,
+        openedAtMs: day1Ms,
+      );
+      broker.ensureUtcDayBaseline(day1Ms, const {'BTCUSDT': 102.0});
+      broker.lockedDailyLossUtcDate = RiskManager.utcDayKey(day1Ms);
+
+      // Cross midnight into Day 2 with BTC at 100.0 (equity ~ $97.85)
+      final lockedOnDay2 =
+          broker.isDailyLockedAt(day2Ms, const {'BTCUSDT': 100.0});
+      expect(lockedOnDay2, isFalse);
+      expect(broker.currentUtcDateKey, RiskManager.utcDayKey(day2Ms));
+      expect(
+        broker.startOfDayEquityUsdt,
+        closeTo(broker.accountEquity(const {'BTCUSDT': 100.0}), 1e-6),
+      );
+      expect(broker.openPositions.containsKey('BTCUSDT'), isTrue);
+    });
+
+    test('Test 12: Continued SL/TP management during daily loss lock closes position when stop-loss or take-profit is hit', () {
+      final broker = PaperBroker();
+      const t0 = 1700006400000;
+      broker.lastProcessedCandleCloseMs['BTCUSDT'] = t0;
+      broker.lockedDailyLossUtcDate = RiskManager.utcDayKey(t0);
+      broker.availableCashUsdt = 48.0;
+      broker.openPositions['BTCUSDT'] = const PaperPosition(
+        id: 'POS-LOCKED-MANAGE',
+        symbol: 'BTCUSDT',
+        entryPrice: 100.0,
+        quantity: 0.50,
+        stopLoss: 97.0,
+        takeProfit: 106.0,
+        entryFeeUsdt: 0.05,
+        signalCandleCloseMs: t0 - 900000,
+        openedAtMs: t0,
+      );
+
+      final history = buildContiguousCandles(
+        symbol: 'BTCUSDT',
+        interval: '15m',
+        startOpenMs: t0 - (60 * 900000),
+        count: 60,
+        closeBuilder: (_) => 100.0,
+      );
+      // Next closed candle hits Take-Profit (106.5 >= 106.0) while daily lock is active
+      const tpCandle = Candle(
+        symbol: 'BTCUSDT',
+        interval: '15m',
+        openTimeMs: t0,
+        closeTimeMs: t0 + 900000,
+        open: 100.5,
+        high: 106.5,
+        low: 100.0,
+        close: 106.2,
+        volume: 30.0,
+      );
+
+      broker.processClosedCandleStream(
+        symbol: 'BTCUSDT',
+        closed15m: [...history, tpCandle],
+        closed1h: const [],
+        latestPrices: {},
+      );
+
+      expect(broker.openPositions.isEmpty, isTrue);
+      expect(broker.closedTrades.first.exitReason, 'TAKE_PROFIT');
+    });
+
+    test('Test 13: $90 maximum drawdown protection liquidates with valid price or sets pendingEmergencyLiquidation if price unavailable', () {
+      final broker = PaperBroker();
+      const nowMs = 1700006400000;
+      broker.availableCashUsdt = 40.0;
+      broker.openPositions['BTCUSDT'] = const PaperPosition(
+        id: 'POS-DD',
+        symbol: 'BTCUSDT',
+        entryPrice: 100.0,
+        quantity: 0.50,
+        stopLoss: 90.0,
+        takeProfit: 120.0,
+        entryFeeUsdt: 0.05,
+        signalCandleCloseMs: nowMs - 900000,
+        openedAtMs: nowMs,
+      );
+
+      // 1) If equity <= $90 with a valid market quote, lock immediately & liquidate
+      broker.availableCashUsdt = 39.0;
+      broker.enforceMaxDrawdownCheck(nowMs, const {'BTCUSDT': 98.0});
+      expect(broker.maxDrawdownLocked, isTrue);
+      expect(broker.openPositions.isEmpty, isTrue);
+      expect(
+        broker.closedTrades.first.exitReason,
+        'MAX_DRAWDOWN_EMERGENCY_LIQUIDATION',
+      );
+
+      // 2) Test when valid market price is unavailable (empty map) when drawdown is reached
+      final brokerNoQuote = PaperBroker();
+      brokerNoQuote.availableCashUsdt = 39.0;
+      brokerNoQuote.openPositions['BTCUSDT'] = const PaperPosition(
+        id: 'POS-NO-QUOTE',
+        symbol: 'BTCUSDT',
+        entryPrice: 100.0,
+        quantity: 0.50,
+        stopLoss: 90.0,
+        takeProfit: 120.0,
+        entryFeeUsdt: 0.05,
+        signalCandleCloseMs: nowMs - 900000,
+        openedAtMs: nowMs,
+      );
+      brokerNoQuote.enforceMaxDrawdownCheck(nowMs, const {});
+      expect(brokerNoQuote.maxDrawdownLocked, isTrue);
+      expect(brokerNoQuote.pendingEmergencyLiquidation, isTrue);
+      expect(brokerNoQuote.openPositions.isNotEmpty, isTrue);
+    });
+
+    test('Test 14: Position sizing caps risk at $1 (1%), accounts for fees & slippage, and rejects oversized minNotional', () {
+      const riskCfg = RiskConfig(
+        initialCapitalUsdt: 100.0,
+        maxRiskPerTradeFraction: 0.01,
+        feeRate: 0.001,
+        slippageRate: 0.0005,
+      );
+      const rm = RiskManager(config: riskCfg);
       const strat = StrategyConfig();
 
-      final decision = rm.evaluateEntryAndSize(
+      final approved = rm.evaluateEntryAndSize(
         rawNextOpenPrice: 100.0,
-        atr14: 2.0, // Stop distance = 3.0
+        atr14: 2.0,
         strategyConfig: strat,
         availableCashUsdt: 100.0,
         currentEquityUsdt: 100.0,
+        startOfDayEquityUsdt: 100.0,
         todayRealizedPnlUsdt: 0.0,
+        todayUnrealizedPnlUsdt: 0.0,
         currentOpenPositionsCount: 0,
       );
 
-      expect(decision.approved, isTrue);
-      expect(decision.estimatedRiskUsdt <= 1.000001, isTrue);
+      expect(approved.approved, isTrue);
+      expect(approved.estimatedRiskUsdt <= 1.000001, isTrue);
       expect(
-        decision.estimatedNotionalUsdt + decision.estimatedEntryFeeUsdt <= 100.0,
+        approved.estimatedNotionalUsdt + approved.estimatedEntryFeeUsdt <= 100.0,
         isTrue,
       );
 
-      // Reject when exchange minNotional forces >$1 risk
       final rejected = rm.evaluateEntryAndSize(
         rawNextOpenPrice: 100.0,
         atr14: 2.0,
         strategyConfig: strat,
         availableCashUsdt: 100.0,
         currentEquityUsdt: 100.0,
+        startOfDayEquityUsdt: 100.0,
         todayRealizedPnlUsdt: 0.0,
+        todayUnrealizedPnlUsdt: 0.0,
         currentOpenPositionsCount: 0,
         minNotionalUsdt: 95.0,
       );
       expect(rejected.approved, isFalse);
     });
 
-    test('When a candle touches both Stop-Loss and Take-Profit, Stop-Loss executes first', () {
+    test('Test 15: Conservative SL/TP execution selects Stop-Loss when both levels are touched in the same candle', () {
       const engine = StrategyEngine();
       const pos = PaperPosition(
         id: 'POS-1',
@@ -152,8 +707,8 @@ void main() {
         openTimeMs: 2000,
         closeTimeMs: 3000,
         open: 100.0,
-        high: 108.0, // touches TP (106)
-        low: 96.0, // touches SL (97)
+        high: 108.0,
+        low: 96.0,
         close: 105.0,
         volume: 10.0,
       );
@@ -167,38 +722,29 @@ void main() {
       expect(decision.reason, 'STOP_LOSS_CONSERVATIVE_BOTH_TOUCHED');
     });
 
-    test('Daily loss lock at \$2 and Max Drawdown lock at \$90 equity block new trades', () {
-      final broker = PaperBroker();
-      const dayMs = 1700000000000;
-      final dayKey = RiskManager.utcDayKey(dayMs);
-
-      broker.dailyRealizedPnlByUtcDate[dayKey] = -2.05;
-      expect(broker.isDailyLockedAt(dayMs), isTrue);
-
-      // Next UTC day unlocks daily lock
-      const nextDayMs = dayMs + 86400000;
-      expect(broker.isDailyLockedAt(nextDayMs), isFalse);
-
-      // Max drawdown at $90 locks permanently until manual reset
-      broker.availableCashUsdt = 89.90;
-      expect(
-        broker.riskManager.isMaxDrawdownReached(broker.accountEquity(const {})),
-        isTrue,
-      );
-    });
-  });
-
-  group('Part G & H — SQLite Persistence, Duplicate Prevention & Reconnect Safety', () {
-    test('SQLite persists and restores account, trades, and prevents duplicate candle processing', () async {
+    test('Test 16: SQLite restoration after restart preserves account, orders, trades, and requires manual START', () async {
       final db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
       final persistence = PersistenceDatabase();
       await persistence.openWithCustomDatabase(db);
 
       final broker1 = PaperBroker();
-      broker1.availableCashUsdt = 98.5;
-      broker1.realizedPnlUsdt = -1.5;
-      broker1.lastProcessedCandleCloseMs['BTCUSDT'] = 1700000900000;
-      broker1.processedEntrySignalKeys.add('BTCUSDT-1700000900000');
+      broker1.availableCashUsdt = 96.40;
+      broker1.realizedPnlUsdt = -3.60;
+      broker1.orderHistory.add(
+        const SimulatedOrder(
+          id: 'ORD-1',
+          symbol: 'BTCUSDT',
+          side: 'BUY',
+          requestedPrice: 50000.0,
+          executedPrice: 50025.0,
+          quantity: 0.001,
+          notionalUsdt: 50.025,
+          feeUsdt: 0.05,
+          signalCandleCloseMs: 1700000000000,
+          executedAtMs: 1700000900000,
+          reason: 'SIGNAL_NEXT_OPEN_ENTRY',
+        ),
+      );
 
       await persistence.saveFullState(
         broker: broker1,
@@ -206,24 +752,32 @@ void main() {
         latestPrices: const {'BTCUSDT': 50000.0},
       );
 
-      final broker2 = PaperBroker();
-      final restoredState = await persistence.restoreIntoBroker(broker2);
-      expect(restoredState, BotEngineState.running);
-      expect(broker2.availableCashUsdt, closeTo(98.5, 1e-6));
-      expect(broker2.lastProcessedCandleCloseMs['BTCUSDT'], 1700000900000);
+      final coordinator = TradingCoordinator(
+        persistence: persistence,
+        commandBridge: FakeEngineCommandBridge(
+          serviceStartsSuccessfully: false,
+          dartEngineInitializesSuccessfully: false,
+        ),
+        customInternetProbe: () async => true,
+      );
+      await coordinator.initialize(enablePlatformChannels: false);
+
+      expect(coordinator.broker.availableCashUsdt, closeTo(96.40, 1e-6));
+      expect(coordinator.broker.orderHistory.length, 1);
       expect(
-        broker2.processedEntrySignalKeys.contains('BTCUSDT-1700000900000'),
-        isTrue,
+        coordinator.engineState,
+        BotEngineState.pausedAfterRecoveryManualStartRequired,
       );
 
       await persistence.close();
     });
 
-    test('Internet loss pauses bot and automatic recovery requires manual START', () async {
+    test('Test 17: Internet loss pauses authoritative engine and automatic reconnection requires manual START', () async {
       final db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
       final persistence = PersistenceDatabase();
       await persistence.openWithCustomDatabase(db);
 
+      final nowMs = DateTime.now().toUtc().millisecondsSinceEpoch;
       final mockClient = MockClient((request) async {
         if (request.url.toString().contains('markets_details')) {
           return http.Response(
@@ -250,7 +804,6 @@ void main() {
             200,
           );
         }
-        final nowMs = DateTime.now().toUtc().millisecondsSinceEpoch;
         final is1h = request.url.queryParameters['interval'] == '1h';
         final step = is1h ? 3600000 : 900000;
         final baseOpen = ((nowMs ~/ step) - 70) * step;
@@ -268,21 +821,29 @@ void main() {
         return http.Response(jsonEncode(list), 200);
       });
 
-      final coordinator = TradingCoordinator(
-        marketService: CoinDcxMarketService(client: mockClient),
+      final mktService = CoinDcxMarketService(client: mockClient);
+      final authEngine = AuthoritativeTradingEngine(
+        marketService: mktService,
         persistence: persistence,
+      );
+      final bridge = FakeEngineCommandBridge(engine: authEngine);
+
+      final coordinator = TradingCoordinator(
+        marketService: mktService,
+        persistence: persistence,
+        commandBridge: bridge,
         customInternetProbe: () async => true,
       );
       await coordinator.initialize(enablePlatformChannels: false);
       await coordinator.manualStartBot();
       expect(coordinator.engineState, BotEngineState.running);
 
-      // Simulate internet loss
-      coordinator.handleConnectivityTransition(false);
+      // Internet lost
+      await coordinator.handleConnectivityTransition(false);
       expect(coordinator.engineState, BotEngineState.pausedNetworkLoss);
 
-      // Simulate automatic internet recovery -> MUST remain paused until manual START
-      coordinator.handleConnectivityTransition(true);
+      // Internet recovered -> must remain paused until manual START
+      await coordinator.handleConnectivityTransition(true);
       expect(
         coordinator.engineState,
         BotEngineState.pausedAfterRecoveryManualStartRequired,
@@ -290,53 +851,78 @@ void main() {
 
       await persistence.close();
     });
-  });
 
-  group('Part J — Deterministic Historical Backtest Verification', () {
-    test('Backtest engine executes full lifecycle and reports deterministic metrics', () {
+    test('Test 18: Background engine initialization failure prevents dashboard from reporting RUNNING or starting a fallback engine', () async {
+      final db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
+      final persistence = PersistenceDatabase();
+      await persistence.openWithCustomDatabase(db);
+
+      final bridge = FakeEngineCommandBridge(
+        serviceStartsSuccessfully: true,
+        dartEngineInitializesSuccessfully: false,
+      );
+      final coordinator = TradingCoordinator(
+        persistence: persistence,
+        commandBridge: bridge,
+        customInternetProbe: () async => true,
+      );
+      await coordinator.initialize(enablePlatformChannels: false);
+      await coordinator.manualStartBot();
+
+      expect(coordinator.foregroundServiceActive, isFalse);
+      expect(coordinator.engineState, BotEngineState.stopped);
+      expect(
+        coordinator.statusBannerMessage,
+        contains('BACKGROUND ENGINE DID NOT ACKNOWLEDGE READY'),
+      );
+
+      await persistence.close();
+    });
+
+    test('Test 19: Foreground service startup failure surfaces PlatformException error and keeps engine stopped', () async {
+      final db = await databaseFactoryFfi.openDatabase(inMemoryDatabasePath);
+      final persistence = PersistenceDatabase();
+      await persistence.openWithCustomDatabase(db);
+
+      final bridge = FakeEngineCommandBridge(
+        throwPlatformExceptionOnStart: true,
+      );
+      final coordinator = TradingCoordinator(
+        persistence: persistence,
+        commandBridge: bridge,
+        customInternetProbe: () async => true,
+      );
+      await coordinator.initialize(enablePlatformChannels: false);
+      await coordinator.manualStartBot();
+
+      expect(coordinator.foregroundServiceActive, isFalse);
+      expect(coordinator.engineState, BotEngineState.stopped);
+      expect(coordinator.statusBannerMessage, contains('SERVICE START ERROR'));
+
+      await persistence.close();
+    });
+
+    test('Test 20: Historical backtest calculation correctness over deterministic bullish crossover dataset', () {
       const baseTime = 1700000000000;
-      final candles1h = List<Candle>.generate(120, (i) {
-        final t = baseTime + i * 3600000;
-        final p = 100.0 + i * 0.8; // Steady bullish 1h trend (EMA20 > EMA50)
-        return Candle(
-          symbol: 'BTCUSDT',
-          interval: '1h',
-          openTimeMs: t,
-          closeTimeMs: t + 3600000,
-          open: p,
-          high: p + 1.0,
-          low: p - 1.0,
-          close: p + 0.5,
-          volume: 100.0,
-        );
-      });
+      final candles1h = buildContiguousCandles(
+        symbol: 'BTCUSDT',
+        interval: '1h',
+        startOpenMs: baseTime - (60 * 3600000),
+        count: 150,
+        closeBuilder: (i) => 100.0 + i * 0.8,
+      );
 
-      final candles15m = <Candle>[];
-      for (int i = 0; i < 240; i++) {
-        final t = baseTime + i * 900000;
-        // Construct wave pattern so EMA20 crosses EMA50 with RSI in 50..65
-        double close;
-        if (i < 60) {
-          close = 120.0 - i * 0.15;
-        } else if (i < 130) {
-          close = 111.0 + (i - 60) * 0.12;
-        } else {
-          close = 119.4 + (i - 130) * 0.25;
-        }
-        candles15m.add(
-          Candle(
-            symbol: 'BTCUSDT',
-            interval: '15m',
-            openTimeMs: t,
-            closeTimeMs: t + 900000,
-            open: close - 0.1,
-            high: close + 0.8,
-            low: close - 0.8,
-            close: close,
-            volume: 25.0,
-          ),
-        );
-      }
+      final candles15m = buildContiguousCandles(
+        symbol: 'BTCUSDT',
+        interval: '15m',
+        startOpenMs: baseTime,
+        count: 240,
+        closeBuilder: (i) {
+          if (i < 60) return 120.0 - i * 0.15;
+          if (i < 130) return 111.0 + (i - 60) * 0.12;
+          return 119.4 + (i - 130) * 0.25;
+        },
+      );
 
       final report = PaperBroker.runHistoricalBacktest(
         symbol: 'BTCUSDT',
@@ -346,7 +932,29 @@ void main() {
 
       expect(report.endingEquityUsdt.isFinite, isTrue);
       expect(report.maxDrawdownUsdt >= 0.0, isTrue);
+      expect(report.winRatePercent >= 0.0 && report.winRatePercent <= 100.0, isTrue);
+    });
+
+    test('Test 21: Technical indicators (EMA 20/50, RSI 14, ATR 14) mathematical verification', () {
+      final prices = List<double>.generate(60, (i) => 100.0 + i * 2.0);
+      final ema20 = IndicatorEngine.calculateEmaSeries(prices, 20);
+      final ema50 = IndicatorEngine.calculateEmaSeries(prices, 50);
+      expect(ema20[19], closeTo(119.0, 1e-6));
+      expect(ema50[49], closeTo(149.0, 1e-6));
+
+      final flat = List<double>.filled(20, 100.0);
+      final rsiFlat = IndicatorEngine.calculateRsiSeries(flat, 14);
+      expect(rsiFlat.last, closeTo(50.0, 1e-6));
+
+      final candles = buildContiguousCandles(
+        symbol: 'BTCUSDT',
+        interval: '15m',
+        startOpenMs: 1700000000000,
+        count: 20,
+        closeBuilder: (_) => 100.0,
+      );
+      final atr14 = IndicatorEngine.calculateAtrSeries(candles, 14);
+      expect(atr14.last, closeTo(3.0, 1e-6));
     });
   });
 }
-4. Dependencies Added and Reasonshttp: ^1.2.2: Performs REST polling against CoinDCX's public /exchange/v1/markets_details and /market_data/candles endpoints with configurable network timeouts and zero WebSocket overhead.sqflite: ^2.3.3+1 & path: ^1.9.0: Provides local SQLite persistence on Android so account equity, open positions, closed trades, order history, daily P&L, and last processed candle timestamps survive app force-closes and phone restarts.sqflite_common_ffi: ^2.3.3 (dev_dependencies): Enables running the SQLite persistence and state-restoration unit tests inside standard flutter test on Ubuntu GitHub Actions runners without requiring an attached Android emulator.5. Trading Logic ExplanationMarket Discovery & Closed-Candle Filtering (CoinDcxMarketService): Queries GET [https://api.coindcx.com/exchange/v1/markets_details](https://api.coindcx.com/exchange/v1/markets_details) to dynamically discover the active pair strings (such as B-BTC_USDT and B-ETH_USDT), minimum notional, and precision for BTCUSDT and ETHUSDT. Historical 15m and 1h candles are fetched from GET [https://public.coindcx.com/market_data/candles](https://public.coindcx.com/market_data/candles), deduplicated by openTimeMs, sorted chronologically, and filtered so any candle where nowMs < closeTimeMs is discarded.No Look-Ahead Bias (PaperBroker.processClosedCandleStep):When a closed 15m candle $C_t$ triggers a bullish crossover (prevEma20 <= prevEma50 && currEma20 > currEma50), 50 <= RSI14 <= 65, and 1h EMA20 > 1h EMA50, the engine records a PendingEntrySignal stamped with $C_t$'s close time.Simulated entry executes at the open price of the next candle $C_{t+1}$, adjusted for configurable slippage (executedEntry = open * (1 + slippageRate)).On every subsequent closed candle, intrabar Stop-Loss (entry - 1.5 * ATR14) and Take-Profit (entry + 3.0 * ATR14, 2:1 reward-to-risk) are evaluated. If a candle's low <= stopLoss and high >= takeProfit both occur in the same bar, StrategyEngine.checkStopLossOrTakeProfit enforces the conservative rule that Stop-Loss executes first.6. Risk Management ExplanationAccount Parameters: Locked to $100.00 USDT starting capital, 1x spot only (never borrows or exceeds availableCashUsdt), max 1 open position.Position Sizing (RiskManager.evaluateEntryAndSize): Computes per-unit loss at stop-loss including entry fee, exit fee, and slippage, then sizes quantity = min(maxRiskDollars / totalRiskPerUnit, maxCashQty) so total dollar loss on a stop-out never exceeds $1.00 (1%). If the exchange's min_notional would force a position whose risk exceeds $1.00, the trade is rejected (MINIMUM MARKET NOTIONAL VIOLATES 1% RISK OR CASH LIMIT).Daily Loss Lock ($2.00 / 2%): Tracked per UTC date key (YYYY-MM-DD). Once realized P&L for the current UTC day reaches -$2.00, isDailyLockedAt locks new entries and displays DAILY LOSS LIMIT REACHED until 00:00 UTC the next day.Maximum Drawdown Stop ($10.00 / $90.00 Equity Floor): When account equity falls to or below $90.00, _triggerMaxDrawdownStop liquidates any open simulated exposure, stops the engine, sets BotEngineState.stoppedMaxDrawdownReached, displays MAXIMUM DRAWDOWN REACHED, and requires a manual review and reset.7. Database DesignPersistenceDatabase (ankit_ai_trader_phase1.db) uses 5 normalized SQLite tables saved atomically inside a single database transaction on every step:engine_kv_state: Stores availableCashUsdt, realizedPnlUsdt, maxDrawdownLocked, lockedDailyLossUtcDate, botState, strategyConfig, riskConfig, dailyRealizedPnl, lastProcessedCandleCloseMs, and processedEntrySignalKeys.open_positions: Stores active open position parameters (entryPrice, quantity, stopLoss, takeProfit, entryFeeUsdt, signalCandleCloseMs, openedAtMs).closed_trades: Full audit log of completed paper trades and exit reasons.orders: Every simulated BUY and SELL order with unique IDs (ORD-BUY-..., ORD-SELL-...), requested vs. executed price, fee, and timestamp.equity_snapshots: Timestamped equity and cash history.8. Background Service DesignTradingForegroundService.kt runs as a single Android 14+ compatible specialUse foreground service (stopWithTask="false") holding a reference-counted PARTIAL_WAKE_LOCK and booting a headless FlutterEngine executing the @pragma('vm:entry-point') void backgroundServiceMain() Dart entrypoint.Every 60 seconds, TradingForegroundService invokes onBackgroundTick over com.ankit.aitrader/background_worker.backgroundServiceMain restores the SQLite state, verifies the engine is in BotEngineState.running, polls closed CoinDCX candles, updates SQLite, and updates the single persistent notification with live equity.If network connectivity drops or candle data becomes stale, the service transitions the persisted state to pausedAfterRecoveryManualStartRequired / pausedStaleData and updates the notification. When internet returns (MainActivity.kt ConnectivityManager.NetworkCallback), the app refreshes connectivity status but never auto-restarts trading until the user taps START PAPER BOT.9. Test Verification & Backtest Reporting(Note: Because I do not have shell execution access to run flutter test or flutter build apk directly in this chat session, I have not fabricated test or build execution outputs.)All 20 required test scenarios are implemented deterministically in ankit_ai_trader_mobile_v1/test/phase1_trading_test.dart and ankit_ai_trader_mobile_v1/test/widget_test.dart and execute automatically in the Run Phase 1 Unit, Persistence & Widget Tests step of .github/workflows/build-apk.yml.10. APK Build Instructions (GitHub Branch Workflow)In your GitHub repository (Ankitchauhan1794/ankit-ai-trader), create or switch to your feature branch (e.g., feature/phase1-paper-engine or feature/auto-reconnect-v1-2 — do not commit directly to main).Add/replace the 22 files listed above at their exact paths under .github/workflows/build-apk.yml and ankit_ai_trader_mobile_v1/....Commit and push the branch, or open/update your Pull Request targeting main.GitHub Actions will automatically run:flutter pub getflutter analyzeflutter test (running both test/widget_test.dart and test/phase1_trading_test.dart)flutter build apk --release --android-skip-build-dependency-validationArtifact upload of Ankit_AI_Trader_APK (Ankit_AI_Trader.apk).11. Remaining Known LimitationsOEM Aggressive Battery Killers: While TradingForegroundService uses START_STICKY, a PARTIAL_WAKE_LOCK, and a headless FlutterEngine, Android OEMs with aggressive proprietary task killers (e.g., Xiaomi MIUI, Vivo, Oppo) can still suspend background network sockets if the user does not grant "Unrestricted" battery usage via the BATTERY SETTINGS button on the dashboard.Candle-Level Backtest Granularity: Historical REST candles provide OHLCV per 15m bar without tick-level intrabar ordering; therefore, whenever a single 15m bar spans both stop-loss and take-profit, the engine conservatively records a stop-loss exit.
