@@ -94,7 +94,6 @@ class StrategyEngine {
     }
 
     final closes15m = closed15m.map((c) => c.close).toList();
-    final closes1h = closed1h.map((c) => c.close).toList();
 
     final ema20Series15m =
         IndicatorEngine.calculateEmaSeries(closes15m, config.fastEmaPeriod);
