@@ -5,7 +5,7 @@ on:
   pull_request:
     branches: [ main, master ]
   push:
-    branches: [ main, master, "feature/**" ]
+    branches: [ main, master, "feature/**", "self_healing" ]
 
 permissions:
   contents: read
@@ -68,7 +68,9 @@ jobs:
           if [ -f "analysis_options.yaml" ]; then
             cp analysis_options.yaml /tmp/ankit-native/analysis_options.yaml
           fi
-          cp android/app/src/main/AndroidManifest.xml /tmp/ankit-native/AndroidManifest.xml
+          if [ -f "android/app/src/main/AndroidManifest.xml" ]; then
+            cp android/app/src/main/AndroidManifest.xml /tmp/ankit-native/AndroidManifest.xml
+          fi
           cp -R android/app/src/main/kotlin /tmp/ankit-native/kotlin
 
           flutter create . --platforms=android --project-name=ankit_ai_trader --org=com.ankit
@@ -80,7 +82,9 @@ jobs:
           if [ -f "/tmp/ankit-native/analysis_options.yaml" ]; then
             cp /tmp/ankit-native/analysis_options.yaml analysis_options.yaml
           fi
-          cp /tmp/ankit-native/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+          if [ -f "/tmp/ankit-native/AndroidManifest.xml" ]; then
+            cp /tmp/ankit-native/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+          fi
           rm -rf android/app/src/main/kotlin
           cp -R /tmp/ankit-native/kotlin android/app/src/main/kotlin
 
