@@ -1,518 +1,442 @@
-import 'dart:math' as math;
 import '../models/trading_models.dart';
 import 'risk_manager.dart';
 import 'strategy_engine.dart';
 
 class CandleStreamOutcome {
-  final List<StrategyEvaluationResult> evaluations;
-  final bool pausedOnMissingNextCandle;
-  final String pauseReason;
+  final bool blockedByRisk;
+  final BotEngineState? triggeredSafetyState;
+  final String? safetyMessage;
+  final List<SimulatedOrder> newOrders;
+  final List<ClosedPaperTrade> newClosedTrades;
+  final String? whyNoTradeReason;
 
   const CandleStreamOutcome({
-    required this.evaluations,
-    this.pausedOnMissingNextCandle = false,
-    this.pauseReason = '',
+    this.blockedByRisk = false,
+    this.triggeredSafetyState,
+    this.safetyMessage,
+    this.newOrders = const [],
+    this.newClosedTrades = const [],
+    this.whyNoTradeReason,
   });
 }
 
 class PaperBroker {
-  StrategyConfig strategyConfig;
-  RiskConfig riskConfig;
+  final RiskManager riskManager;
+  final double feeRate;
+  final double slippageRate;
 
-  late double availableCashUsdt;
-  double realizedPnlUsdt = 0.0;
-  String currentUtcDateKey = '';
-  late double startOfDayEquityUsdt;
-  final Map<String, double> dailyStartEquityByUtcDate = {};
-  final Map<String, double> dailyRealizedPnlByUtcDate = {};
-
-  bool maxDrawdownLocked = false;
-  bool pendingEmergencyLiquidation = false;
+  double availableCashUsdt;
+  bool maxDrawdownLocked;
   String? lockedDailyLossUtcDate;
+  int? lastStopLossClosedAtMs;
 
-  final Map<String, PaperPosition> openPositions = {};
+  final List<PaperPosition> openPositions = [];
+  final List<SimulatedOrder> orders = [];
   final List<ClosedPaperTrade> closedTrades = [];
-  final List<SimulatedOrder> orderHistory = [];
-  final Map<String, int> lastProcessedCandleCloseMs = {};
-  final Set<String> processedEntrySignalKeys = {};
   final Map<String, PendingEntrySignal> pendingSignalsBySymbol = {};
+  final Set<String> processedEntrySignalKeys = {};
+  final Map<String, double> dailyStartEquityByUtcDate = {};
+  final Map<String, int> lastProcessedCandleCloseMs = {};
 
   PaperBroker({
-    this.strategyConfig = const StrategyConfig(),
-    this.riskConfig = const RiskConfig(),
-  }) {
-    availableCashUsdt = riskConfig.initialCapitalUsdt;
-    startOfDayEquityUsdt = riskConfig.initialCapitalUsdt;
+    this.riskManager = const RiskManager(),
+    this.feeRate = 0.001,
+    this.slippageRate = 0.0005,
+    double? initialCashUsdt,
+    this.maxDrawdownLocked = false,
+    this.lockedDailyLossUtcDate,
+    this.lastStopLossClosedAtMs,
+  }) : availableCashUsdt =
+            initialCashUsdt ?? riskManager.config.initialCapitalUsdt;
+
+  double accountEquityUsdt(Map<String, double> markPrices) {
+    double unrealizedVal = 0.0;
+    for (final pos in openPositions) {
+      final mark = markPrices[pos.symbol] ?? pos.entryPrice;
+      final gross = mark * pos.quantity;
+      final exitFee = gross * feeRate;
+      unrealizedVal += (gross - exitFee);
+    }
+    return availableCashUsdt + unrealizedVal;
   }
 
-  RiskManager get riskManager => RiskManager(config: riskConfig);
-  StrategyEngine get strategyEngine => StrategyEngine(config: strategyConfig);
+  double startOfDayEquityUsdt(int nowMs, Map<String, double> markPrices) {
+    final utcDay = RiskManager.utcDateString(nowMs);
+    return dailyStartEquityByUtcDate.putIfAbsent(
+      utcDay,
+      () => accountEquityUsdt(markPrices),
+    );
+  }
+
+  bool isDailyLockedAt(int nowMs) {
+    final utcDay = RiskManager.utcDateString(nowMs);
+    return lockedDailyLossUtcDate == utcDay;
+  }
+
+  bool enforceMaxDrawdownCheck(Map<String, double> markPrices) {
+    final eq = accountEquityUsdt(markPrices);
+    if (riskManager.isMaxDrawdownReached(eq)) {
+      maxDrawdownLocked = true;
+      return true;
+    }
+    return maxDrawdownLocked;
+  }
 
   void manualResetPaperAccount() {
-    availableCashUsdt = riskConfig.initialCapitalUsdt;
-    realizedPnlUsdt = 0.0;
-    currentUtcDateKey = '';
-    startOfDayEquityUsdt = riskConfig.initialCapitalUsdt;
-    dailyStartEquityByUtcDate.clear();
-    dailyRealizedPnlByUtcDate.clear();
+    availableCashUsdt = riskManager.config.initialCapitalUsdt;
     maxDrawdownLocked = false;
-    pendingEmergencyLiquidation = false;
     lockedDailyLossUtcDate = null;
+    lastStopLossClosedAtMs = null;
     openPositions.clear();
+    orders.clear();
     closedTrades.clear();
-    orderHistory.clear();
-    lastProcessedCandleCloseMs.clear();
+    pendingSignalsBySymbol.clear();
     processedEntrySignalKeys.clear();
-    pendingSignalsBySymbol.clear();
+    dailyStartEquityByUtcDate.clear();
+    lastProcessedCandleCloseMs.clear();
   }
 
-  double unrealizedPnl(Map<String, double> latestPrices) {
-    double total = 0.0;
-    for (final pos in openPositions.values) {
-      final rawMark = latestPrices[pos.symbol];
-      final mark = (rawMark != null && rawMark > 0) ? rawMark : pos.entryPrice;
-      final exitExec = mark * (1.0 - riskConfig.slippageRate);
-      final grossProceeds = exitExec * pos.quantity;
-      final exitFee = grossProceeds * riskConfig.feeRate;
-      final costBasis = pos.entryPrice * pos.quantity;
-      total += (grossProceeds - exitFee - costBasis);
-    }
-    return total;
-  }
-
-  double accountEquity(Map<String, double> latestPrices) {
-    double openValueAfterExitFee = 0.0;
-    for (final pos in openPositions.values) {
-      final rawMark = latestPrices[pos.symbol];
-      final mark = (rawMark != null && rawMark > 0) ? rawMark : pos.entryPrice;
-      final exitExec = mark * (1.0 - riskConfig.slippageRate);
-      final grossProceeds = exitExec * pos.quantity;
-      final exitFee = grossProceeds * riskConfig.feeRate;
-      openValueAfterExitFee += (grossProceeds - exitFee);
-    }
-    return availableCashUsdt + openValueAfterExitFee;
-  }
-
-  double currentDrawdownUsdt(Map<String, double> latestPrices) {
-    final eq = accountEquity(latestPrices);
-    return math.max(0.0, riskConfig.initialCapitalUsdt - eq);
-  }
-
-  void ensureUtcDayBaseline(int nowMs, Map<String, double> latestPrices) {
-    final dayKey = RiskManager.utcDayKey(nowMs);
-    if (currentUtcDateKey != dayKey) {
-      currentUtcDateKey = dayKey;
-      final eq = accountEquity(latestPrices);
-      final base = dailyStartEquityByUtcDate[dayKey] ?? eq;
-      dailyStartEquityByUtcDate[dayKey] = base;
-      startOfDayEquityUsdt = base;
-      dailyRealizedPnlByUtcDate.putIfAbsent(dayKey, () => 0.0);
-      if (lockedDailyLossUtcDate != null && lockedDailyLossUtcDate != dayKey) {
-        lockedDailyLossUtcDate = null;
-      }
-    }
-  }
-
-  double currentUtcDayTotalPnl(int nowMs, Map<String, double> latestPrices) {
-    ensureUtcDayBaseline(nowMs, latestPrices);
-    return accountEquity(latestPrices) - startOfDayEquityUsdt;
-  }
-
-  bool isDailyLockedAt(int nowMs, Map<String, double> latestPrices) {
-    ensureUtcDayBaseline(nowMs, latestPrices);
-    final dayKey = currentUtcDateKey;
-    if (lockedDailyLossUtcDate == dayKey) {
-      return true;
-    }
-    final eq = accountEquity(latestPrices);
-    if (riskManager.isDailyLossLimitReached(
-      currentEquityUsdt: eq,
-      startOfDayEquityUsdt: startOfDayEquityUsdt,
-    )) {
-      lockedDailyLossUtcDate = dayKey;
-      return true;
-    }
-    return false;
-  }
-
-  void enforceMaxDrawdownCheck(int nowMs, Map<String, double> latestPrices) {
-    final eq = accountEquity(latestPrices);
-    if (!maxDrawdownLocked && !riskManager.isMaxDrawdownReached(eq)) {
-      return;
-    }
-    maxDrawdownLocked = true;
-    pendingSignalsBySymbol.clear();
-
-    if (openPositions.isEmpty) {
-      pendingEmergencyLiquidation = false;
-      return;
-    }
-
-    final symbols = openPositions.keys.toList();
-    bool anyMissingQuote = false;
-    for (final sym in symbols) {
-      final quote = latestPrices[sym];
-      if (quote != null && quote > 0) {
-        final pos = openPositions[sym]!;
-        _closePositionInternal(
-          position: pos,
-          rawExitReferencePrice: quote,
-          closedAtMs: nowMs,
-          signalCandleCloseMs: pos.signalCandleCloseMs,
-          exitReason: 'MAX_DRAWDOWN_EMERGENCY_LIQUIDATION',
-        );
-      } else {
-        anyMissingQuote = true;
-      }
-    }
-    pendingEmergencyLiquidation = anyMissingQuote;
-  }
-
-  void _closePositionInternal({
+  ClosedPaperTrade _closePositionInternal({
     required PaperPosition position,
-    required double rawExitReferencePrice,
+    required double triggerPrice,
     required int closedAtMs,
-    required int signalCandleCloseMs,
     required String exitReason,
+    required List<SimulatedOrder> newOrdersOut,
   }) {
-    final exitExecPrice =
-        rawExitReferencePrice * (1.0 - riskConfig.slippageRate);
-    final grossProceeds = exitExecPrice * position.quantity;
-    final exitFeeUsdt = grossProceeds * riskConfig.feeRate;
-    final netProceeds = grossProceeds - exitFeeUsdt;
-
-    final costBasis = position.entryPrice * position.quantity;
-    final totalFees = position.entryFeeUsdt + exitFeeUsdt;
-    final netPnl = netProceeds - costBasis - position.entryFeeUsdt;
-
+    final executedExitPrice = triggerPrice * (1.0 - slippageRate);
+    final exitNotional = executedExitPrice * position.quantity;
+    final exitFee = exitNotional * feeRate;
+    final netProceeds = exitNotional - exitFee;
     availableCashUsdt += netProceeds;
-    realizedPnlUsdt += netPnl;
 
-    final dayKey = RiskManager.utcDayKey(closedAtMs);
-    dailyRealizedPnlByUtcDate[dayKey] =
-        (dailyRealizedPnlByUtcDate[dayKey] ?? 0.0) + netPnl;
+    final totalFees = position.entryFeeUsdt + exitFee;
+    final realizedPnl =
+        (exitNotional - position.investedNotionalUsdt) - totalFees;
 
-    openPositions.remove(position.symbol);
-
-    final orderId = 'ORD-SELL-${position.symbol}-$closedAtMs';
-    orderHistory.insert(
-      0,
-      SimulatedOrder(
-        id: orderId,
-        symbol: position.symbol,
-        side: 'SELL',
-        requestedPrice: rawExitReferencePrice,
-        executedPrice: exitExecPrice,
-        quantity: position.quantity,
-        notionalUsdt: grossProceeds,
-        feeUsdt: exitFeeUsdt,
-        signalCandleCloseMs: signalCandleCloseMs,
-        executedAtMs: closedAtMs,
-        reason: exitReason,
-      ),
+    final sellOrder = SimulatedOrder(
+      id: 'ORD_SELL_${position.symbol}_$closedAtMs',
+      symbol: position.symbol,
+      side: 'SELL',
+      requestedPrice: triggerPrice,
+      executedPrice: executedExitPrice,
+      quantity: position.quantity,
+      notionalUsdt: exitNotional,
+      feeUsdt: exitFee,
+      signalCandleCloseMs: position.signalCandleCloseMs,
+      executedAtMs: closedAtMs,
+      reason: exitReason,
     );
+    orders.insert(0, sellOrder);
+    newOrdersOut.add(sellOrder);
 
-    closedTrades.insert(
-      0,
-      ClosedPaperTrade(
-        id: 'TRD-${position.symbol}-$closedAtMs',
-        symbol: position.symbol,
-        entryPrice: position.entryPrice,
-        exitPrice: exitExecPrice,
-        quantity: position.quantity,
-        stopLoss: position.stopLoss,
-        takeProfit: position.takeProfit,
-        totalFeesUsdt: totalFees,
-        realizedPnlUsdt: netPnl,
-        openedAtMs: position.openedAtMs,
-        closedAtMs: closedAtMs,
-        exitReason: exitReason,
-      ),
+    final closedTrade = ClosedPaperTrade(
+      id: 'TRD_${position.id}_$closedAtMs',
+      symbol: position.symbol,
+      entryPrice: position.entryPrice,
+      exitPrice: executedExitPrice,
+      quantity: position.quantity,
+      stopLoss: position.stopLoss,
+      takeProfit: position.takeProfit,
+      totalFeesUsdt: totalFees,
+      realizedPnlUsdt: realizedPnl,
+      openedAtMs: position.openedAtMs,
+      closedAtMs: closedAtMs,
+      exitReason: exitReason,
     );
+    closedTrades.insert(0, closedTrade);
+    openPositions.removeWhere((p) => p.id == position.id);
+
+    if (exitReason.startsWith('STOP_LOSS')) {
+      lastStopLossClosedAtMs = closedAtMs;
+    }
+    return closedTrade;
+  }
+
+  List<ClosedPaperTrade> checkStopLossOrTakeProfit({
+    required String symbol,
+    required Candle candle,
+    required List<SimulatedOrder> newOrdersOut,
+  }) {
+    final matching = openPositions.where((p) => p.symbol == symbol).toList();
+    if (matching.isEmpty) return const [];
+
+    final closedNow = <ClosedPaperTrade>[];
+    for (final pos in matching) {
+      final hitSl = candle.low <= pos.stopLoss;
+      final hitTp = candle.high >= pos.takeProfit;
+      if (hitSl && hitTp) {
+        closedNow.add(_closePositionInternal(
+          position: pos,
+          triggerPrice: pos.stopLoss,
+          closedAtMs: candle.closeTimeMs,
+          exitReason: 'STOP_LOSS_CONSERVATIVE_BOTH_TOUCHED',
+          newOrdersOut: newOrdersOut,
+        ));
+      } else if (hitSl) {
+        closedNow.add(_closePositionInternal(
+          position: pos,
+          triggerPrice: pos.stopLoss,
+          closedAtMs: candle.closeTimeMs,
+          exitReason: 'STOP_LOSS',
+          newOrdersOut: newOrdersOut,
+        ));
+      } else if (hitTp) {
+        closedNow.add(_closePositionInternal(
+          position: pos,
+          triggerPrice: pos.takeProfit,
+          closedAtMs: candle.closeTimeMs,
+          exitReason: 'TAKE_PROFIT',
+          newOrdersOut: newOrdersOut,
+        ));
+      }
+    }
+    return closedNow;
   }
 
   CandleStreamOutcome processClosedCandleStream({
     required String symbol,
-    required List<Candle> closed15m,
-    required List<Candle> closed1h,
-    required Map<String, double> latestPrices,
-    double minNotionalUsdt = 1.0,
-    double minQuantity = 0.000001,
-    bool allowHistoricalWarmupTrades = false,
+    required List<Candle> closedCandles15m,
+    required List<Candle> closedCandles1h,
+    required StrategyEngine strategyEngine,
+    required MarketPairMetadata pairMetadata,
+    required Map<String, double> currentMarkPrices,
+    LiveMarketTicker? liveTicker,
+    bool allowNewEntries = true,
   }) {
-    if (closed15m.isEmpty) {
-      return const CandleStreamOutcome(evaluations: []);
+    if (closedCandles15m.isEmpty) {
+      return const CandleStreamOutcome(
+        whyNoTradeReason: 'Why no trade: Stale data',
+      );
     }
 
-    final evaluations = <StrategyEvaluationResult>[];
-    final lastCheckpointMs = lastProcessedCandleCloseMs[symbol];
+    final latestCandle = closedCandles15m.last;
+    final marks = Map<String, double>.from(currentMarkPrices);
+    marks[symbol] = liveTicker?.lastPrice ?? latestCandle.close;
 
-    // Fresh account historical warm-up: establish checkpoint on latest bar without historical trades
-    if (lastCheckpointMs == null && !allowHistoricalWarmupTrades) {
-      final latestCandle = closed15m.last;
-      lastProcessedCandleCloseMs[symbol] = latestCandle.closeTimeMs;
-      final eval = strategyEngine.evaluateClosedCandles(
-        closed15m: closed15m,
-        closed1h: closed1h,
-        hasOpenPosition: openPositions.containsKey(symbol),
+    final newOrders = <SimulatedOrder>[];
+    final newClosed = <ClosedPaperTrade>[];
+
+    // 1. Always evaluate SL/TP exits on the newly closed candle first
+    final slTpClosed = checkStopLossOrTakeProfit(
+      symbol: symbol,
+      candle: latestCandle,
+      newOrdersOut: newOrders,
+    );
+    newClosed.addAll(slTpClosed);
+
+    // 2. Re-evaluate equity & safety locks after any exits
+    final equityNow = accountEquityUsdt(marks);
+    if (enforceMaxDrawdownCheck(marks)) {
+      return CandleStreamOutcome(
+        blockedByRisk: true,
+        triggeredSafetyState: BotEngineState.stoppedMaxDrawdownReached,
+        safetyMessage:
+            'Account equity reached or fell below \$90.00 floor. Engine stopped; manual review & reset required.',
+        newOrders: newOrders,
+        newClosedTrades: newClosed,
+        whyNoTradeReason: 'Why no trade: Locked/paused (Max Drawdown)',
       );
-      evaluations.add(
-        StrategyEvaluationResult(
-          signalType: StrategySignalType.none,
-          description: 'WARM-UP COMPLETE — ${eval.description}',
-          evaluatedCandleCloseMs: latestCandle.closeTimeMs,
-          ema20_15m: eval.ema20_15m,
-          ema50_15m: eval.ema50_15m,
-          rsi14_15m: eval.rsi14_15m,
-          atr14_15m: eval.atr14_15m,
-          ema20_1h: eval.ema20_1h,
-          ema50_1h: eval.ema50_1h,
-          higherTimeframeBullish: eval.higherTimeframeBullish,
-        ),
-      );
-      return CandleStreamOutcome(evaluations: evaluations);
     }
 
-    final newIndices = <int>[];
-    for (int i = 0; i < closed15m.length; i++) {
-      if (lastCheckpointMs == null ||
-          closed15m[i].closeTimeMs > lastCheckpointMs) {
-        newIndices.add(i);
+    final sodEquity = startOfDayEquityUsdt(latestCandle.closeTimeMs, marks);
+    if (isDailyLockedAt(latestCandle.closeTimeMs) ||
+        riskManager.isDailyLossLimitReached(
+          startOfDayEquityUsdt: sodEquity,
+          currentEquityUsdt: equityNow,
+        )) {
+      lockedDailyLossUtcDate =
+          RiskManager.utcDateString(latestCandle.closeTimeMs);
+      return CandleStreamOutcome(
+        blockedByRisk: true,
+        triggeredSafetyState: BotEngineState.lockedDailyLossLimit,
+        safetyMessage: 'DAILY LOSS LIMIT (\$2.00) REACHED',
+        newOrders: newOrders,
+        newClosedTrades: newClosed,
+        whyNoTradeReason: 'Why no trade: Locked/paused (Daily Loss Limit)',
+      );
+    }
+
+    // 3. Evaluate strategy on closed candles
+    final eval = strategyEngine.evaluateClosedCandles(
+      symbol: symbol,
+      closedCandles15m: closedCandles15m,
+      closedCandles1h: closedCandles1h,
+    );
+
+    // 4. If bearish crossover occurs while holding a position, close at market
+    if (eval.signal == StrategySignalType.sell) {
+      final openForSym =
+          openPositions.where((p) => p.symbol == symbol).toList();
+      for (final pos in openForSym) {
+        newClosed.add(_closePositionInternal(
+          position: pos,
+          triggerPrice: liveTicker?.bid ?? latestCandle.close,
+          closedAtMs: latestCandle.closeTimeMs,
+          exitReason: 'BEARISH_EMA_CROSS_EXIT',
+          newOrdersOut: newOrders,
+        ));
       }
     }
 
-    if (newIndices.isEmpty) {
-      final eval = strategyEngine.evaluateClosedCandles(
-        closed15m: closed15m,
-        closed1h: closed1h,
-        hasOpenPosition: openPositions.containsKey(symbol),
+    lastProcessedCandleCloseMs[symbol] = latestCandle.closeTimeMs;
+
+    if (!allowNewEntries) {
+      return CandleStreamOutcome(
+        newOrders: newOrders,
+        newClosedTrades: newClosed,
+        whyNoTradeReason: eval.reason,
       );
-      evaluations.add(
-        StrategyEvaluationResult(
-          signalType: StrategySignalType.none,
-          description: 'NO NEW CLOSED 15M CANDLES',
-          evaluatedCandleCloseMs: closed15m.last.closeTimeMs,
-          ema20_15m: eval.ema20_15m,
-          ema50_15m: eval.ema50_15m,
-          rsi14_15m: eval.rsi14_15m,
-          atr14_15m: eval.atr14_15m,
-          ema20_1h: eval.ema20_1h,
-          ema50_1h: eval.ema50_1h,
-          higherTimeframeBullish: eval.higherTimeframeBullish,
-        ),
-      );
-      return CandleStreamOutcome(evaluations: evaluations);
     }
 
-    for (final idx in newIndices) {
-      final candle = closed15m[idx];
-      final priceMap = <String, double>{
-        ...latestPrices,
-        symbol: candle.close,
-      };
-      ensureUtcDayBaseline(candle.closeTimeMs, priceMap);
-
-      // 1) Check pending entry signal from previous candle C (must execute at open of C+1)
-      final pending = pendingSignalsBySymbol[symbol];
-      if (pending != null) {
-        if (candle.openTimeMs == pending.signalCandleCloseMs) {
-          pendingSignalsBySymbol.remove(symbol);
-          final sigKey = '$symbol:${pending.signalCandleCloseMs}';
-          if (!processedEntrySignalKeys.contains(sigKey) &&
-              !maxDrawdownLocked &&
-              !isDailyLockedAt(candle.openTimeMs, priceMap)) {
-            final sizing = riskManager.evaluateEntryAndSize(
-              rawNextOpenPrice: candle.open,
-              atr14: pending.atr14,
-              strategyConfig: strategyConfig,
-              availableCashUsdt: availableCashUsdt,
-              currentEquityUsdt: accountEquity(priceMap),
-              startOfDayEquityUsdt: startOfDayEquityUsdt,
-              todayRealizedPnlUsdt:
-                  dailyRealizedPnlByUtcDate[currentUtcDateKey] ?? 0.0,
-              todayUnrealizedPnlUsdt: unrealizedPnl(priceMap),
-              currentOpenPositionsCount: openPositions.length,
-              minNotionalUsdt: minNotionalUsdt,
-              minQuantity: minQuantity,
-            );
-            if (sizing.approved) {
-              processedEntrySignalKeys.add(sigKey);
-              availableCashUsdt -=
-                  (sizing.estimatedNotionalUsdt + sizing.estimatedEntryFeeUsdt);
-              final posId = 'POS-$symbol-${candle.openTimeMs}';
-              openPositions[symbol] = PaperPosition(
-                id: posId,
-                symbol: symbol,
-                entryPrice: sizing.estimatedEntryPrice,
-                quantity: sizing.quantity,
-                stopLoss: sizing.stopLossPrice,
-                takeProfit: sizing.takeProfitPrice,
-                entryFeeUsdt: sizing.estimatedEntryFeeUsdt,
-                signalCandleCloseMs: pending.signalCandleCloseMs,
-                openedAtMs: candle.openTimeMs,
-              );
-              orderHistory.insert(
-                0,
-                SimulatedOrder(
-                  id: 'ORD-BUY-$symbol-${candle.openTimeMs}',
-                  symbol: symbol,
-                  side: 'BUY',
-                  requestedPrice: candle.open,
-                  executedPrice: sizing.estimatedEntryPrice,
-                  quantity: sizing.quantity,
-                  notionalUsdt: sizing.estimatedNotionalUsdt,
-                  feeUsdt: sizing.estimatedEntryFeeUsdt,
-                  signalCandleCloseMs: pending.signalCandleCloseMs,
-                  executedAtMs: candle.openTimeMs,
-                  reason: 'SIGNAL_NEXT_OPEN_ENTRY',
-                ),
-              );
-            }
-          }
-        } else if (candle.openTimeMs > pending.signalCandleCloseMs) {
-          // Missing C+1 candle: discard stale signal and pause safely
-          pendingSignalsBySymbol.remove(symbol);
-          lastProcessedCandleCloseMs[symbol] = candle.closeTimeMs;
-          return CandleStreamOutcome(
-            evaluations: evaluations,
-            pausedOnMissingNextCandle: true,
-            pauseReason:
-                'MISSING NEXT CANDLE C+1 FOR $symbol PENDING SIGNAL (${pending.signalCandleCloseMs})',
-          );
-        }
-      }
-
-      // 2) Manage open position SL/TP on current closed candle
-      final openPos = openPositions[symbol];
-      if (openPos != null) {
-        final exitDec = strategyEngine.checkStopLossOrTakeProfit(
-          position: openPos,
-          candle: candle,
+    if (eval.signal == StrategySignalType.buy) {
+      final signalKey = '${symbol}_${eval.evaluatedCandleCloseMs}';
+      if (processedEntrySignalKeys.contains(signalKey)) {
+        return CandleStreamOutcome(
+          newOrders: newOrders,
+          newClosedTrades: newClosed,
+          whyNoTradeReason:
+              'Why no trade: Duplicate candle signal already processed ($signalKey)',
         );
-        if (exitDec.shouldExit) {
-          _closePositionInternal(
-            position: openPos,
-            rawExitReferencePrice: exitDec.exitReferencePrice,
-            closedAtMs: candle.closeTimeMs,
-            signalCandleCloseMs: openPos.signalCandleCloseMs,
-            exitReason: exitDec.reason,
-          );
-        }
       }
 
-      // 3) Enforce max drawdown & daily loss check
-      enforceMaxDrawdownCheck(candle.closeTimeMs, priceMap);
-      final dailyLocked = isDailyLockedAt(candle.closeTimeMs, priceMap);
+      // Use live ask price if fresh, otherwise closed candle price, plus slippage
+      final baseAsk = (liveTicker != null &&
+              liveTicker.ask > 0 &&
+              (latestCandle.closeTimeMs - liveTicker.timestampMs).abs() <=
+                  15 * 60 * 1000)
+          ? liveTicker.ask
+          : latestCandle.close;
+      final executedBuyPrice = baseAsk * (1.0 + slippageRate);
 
-      // 4) Evaluate strategy on prefix up to idx
-      final prefix15m = closed15m.sublist(0, idx + 1);
-      final eval = strategyEngine.evaluateClosedCandles(
-        closed15m: prefix15m,
-        closed1h: closed1h,
-        hasOpenPosition: openPositions.containsKey(symbol),
+      final sizing = riskManager.evaluateEntrySizing(
+        symbol: symbol,
+        entryFillPrice: executedBuyPrice,
+        atr14: eval.atr14_15m,
+        currentEquityUsdt: accountEquityUsdt(marks),
+        availableCashUsdt: availableCashUsdt,
+        startOfDayEquityUsdt: sodEquity,
+        openPositions: openPositions,
+        pairMetadata: pairMetadata,
+        feeRate: feeRate,
+        lastStopLossClosedAtMs: lastStopLossClosedAtMs,
+        nowMs: latestCandle.closeTimeMs,
       );
-      evaluations.add(eval);
 
-      if (eval.signalType == StrategySignalType.buyEntry &&
-          !maxDrawdownLocked &&
-          !dailyLocked &&
-          !openPositions.containsKey(symbol) &&
-          openPositions.length < riskConfig.maxConcurrentOpenPositions) {
-        final sigKey = '$symbol:${candle.closeTimeMs}';
-        if (!processedEntrySignalKeys.contains(sigKey) &&
-            eval.atr14_15m != null &&
-            eval.rsi14_15m != null &&
-            eval.ema20_15m != null &&
-            eval.ema50_15m != null) {
-          pendingSignalsBySymbol[symbol] = PendingEntrySignal(
-            symbol: symbol,
-            signalCandleCloseMs: candle.closeTimeMs,
-            atr14: eval.atr14_15m!,
-            rsi14: eval.rsi14_15m!,
-            ema20: eval.ema20_15m!,
-            ema50: eval.ema50_15m!,
-          );
-        }
+      if (!sizing.approved) {
+        return CandleStreamOutcome(
+          newOrders: newOrders,
+          newClosedTrades: newClosed,
+          whyNoTradeReason:
+              sizing.rejectionReason ?? 'Why no trade: Risk rejected',
+        );
       }
 
-      lastProcessedCandleCloseMs[symbol] = candle.closeTimeMs;
+      final entryFee = sizing.notionalUsdt * feeRate;
+      final totalDebit = sizing.notionalUsdt + entryFee;
+      availableCashUsdt -= totalDebit;
+      processedEntrySignalKeys.add(signalKey);
+
+      final buyOrder = SimulatedOrder(
+        id: 'ORD_BUY_${symbol}_${latestCandle.closeTimeMs}',
+        symbol: symbol,
+        side: 'BUY',
+        requestedPrice: baseAsk,
+        executedPrice: executedBuyPrice,
+        quantity: sizing.quantity,
+        notionalUsdt: sizing.notionalUsdt,
+        feeUsdt: entryFee,
+        signalCandleCloseMs: eval.evaluatedCandleCloseMs,
+        executedAtMs: latestCandle.closeTimeMs,
+        reason: eval.reason,
+      );
+      orders.insert(0, buyOrder);
+      newOrders.add(buyOrder);
+
+      final newPos = PaperPosition(
+        id: 'POS_${symbol}_${latestCandle.closeTimeMs}',
+        symbol: symbol,
+        entryPrice: executedBuyPrice,
+        quantity: sizing.quantity,
+        stopLoss: sizing.stopLossPrice,
+        takeProfit: sizing.takeProfitPrice,
+        entryFeeUsdt: entryFee,
+        signalCandleCloseMs: eval.evaluatedCandleCloseMs,
+        openedAtMs: latestCandle.closeTimeMs,
+      );
+      openPositions.add(newPos);
+
+      return CandleStreamOutcome(
+        newOrders: newOrders,
+        newClosedTrades: newClosed,
+        whyNoTradeReason: eval.reason,
+      );
     }
 
-    return CandleStreamOutcome(evaluations: evaluations);
+    return CandleStreamOutcome(
+      newOrders: newOrders,
+      newClosedTrades: newClosed,
+      whyNoTradeReason: eval.reason,
+    );
   }
 
   static BacktestReport runHistoricalBacktest({
     required String symbol,
     required List<Candle> candles15m,
     required List<Candle> candles1h,
-    StrategyConfig strategyConfig = const StrategyConfig(),
-    RiskConfig riskConfig = const RiskConfig(),
+    MarketPairMetadata? pairMetadata,
   }) {
-    final simBroker = PaperBroker(
-      strategyConfig: strategyConfig,
-      riskConfig: riskConfig,
-    );
-    simBroker.processClosedCandleStream(
-      symbol: symbol,
-      closed15m: candles15m,
-      closed1h: candles1h,
-      latestPrices: {},
-      allowHistoricalWarmupTrades: true,
-    );
+    final broker = PaperBroker();
+    const strategy = StrategyEngine();
+    final meta = pairMetadata ??
+        MarketPairMetadata(
+          symbol: symbol,
+          baseCurrency: symbol.contains('BTC') ? 'BTC' : 'ETH',
+          quoteCurrency: 'USDT',
+        );
 
-    final trades = simBroker.closedTrades.reversed.toList();
-    final total = trades.length;
-    int wins = 0;
-    int losses = 0;
-    double grossProfit = 0.0;
-    double grossLoss = 0.0;
-    double sumRR = 0.0;
+    double peakEquity = broker.availableCashUsdt;
+    double maxDrawdown = 0.0;
 
-    double runningEq = riskConfig.initialCapitalUsdt;
-    double peakEq = runningEq;
-    double maxDd = 0.0;
+    for (int i = 55; i < candles15m.length; i++) {
+      final slice15m = candles15m.sublist(0, i + 1);
+      final curCloseMs = slice15m.last.closeTimeMs;
+      final slice1h =
+          candles1h.where((c) => c.closeTimeMs <= curCloseMs).toList();
+      if (slice1h.length < 52) continue;
 
-    for (final t in trades) {
-      runningEq += t.realizedPnlUsdt;
-      if (runningEq > peakEq) peakEq = runningEq;
-      final dd = peakEq - runningEq;
-      if (dd > maxDd) maxDd = dd;
+      broker.processClosedCandleStream(
+        symbol: symbol,
+        closedCandles15m: slice15m,
+        closedCandles1h: slice1h,
+        strategyEngine: strategy,
+        pairMetadata: meta,
+        currentMarkPrices: {symbol: slice15m.last.close},
+      );
 
-      if (t.realizedPnlUsdt >= 0) {
-        wins++;
-        grossProfit += t.realizedPnlUsdt;
-      } else {
-        losses++;
-        grossLoss += t.realizedPnlUsdt.abs();
-      }
-
-      final riskPerUnit = (t.entryPrice - t.stopLoss).abs();
-      final unitRiskUsdt = riskPerUnit * t.quantity;
-      if (unitRiskUsdt > 0) {
-        sumRR += (t.realizedPnlUsdt / unitRiskUsdt);
-      }
+      final eq = broker.accountEquityUsdt({symbol: slice15m.last.close});
+      if (eq > peakEquity) peakEquity = eq;
+      final dd = peakEquity - eq;
+      if (dd > maxDrawdown) maxDrawdown = dd;
     }
 
-    final endingEq = candles15m.isNotEmpty
-        ? simBroker.accountEquity({symbol: candles15m.last.close})
-        : simBroker.availableCashUsdt;
-    final netPnl = endingEq - riskConfig.initialCapitalUsdt;
+    final lastPrice = candles15m.isNotEmpty ? candles15m.last.close : 0.0;
+    final endingEq = broker.accountEquityUsdt({symbol: lastPrice});
+    final total = broker.closedTrades.length;
+    final wins =
+        broker.closedTrades.where((t) => t.realizedPnlUsdt > 0).length;
+    final losses = total - wins;
     final winRate = total > 0 ? (wins / total) * 100.0 : 0.0;
-    final pf = grossLoss > 0
-        ? (grossProfit / grossLoss)
-        : (grossProfit > 0 ? 99.99 : 0.0);
-    final avgRR = total > 0 ? (sumRR / total) : 0.0;
 
     return BacktestReport(
+      symbol: symbol,
+      totalCandlesEvaluated: candles15m.length,
       totalTrades: total,
       winningTrades: wins,
       losingTrades: losses,
-      winRatePercent: winRate,
-      netPnlUsdt: netPnl,
+      winRatePct: winRate,
+      netPnlUsdt: endingEq - broker.riskManager.config.initialCapitalUsdt,
       endingEquityUsdt: endingEq,
-      profitFactor: pf,
-      maxDrawdownUsdt: maxDd,
-      averageRewardToRisk: avgRR,
+      maxDrawdownUsdt: maxDrawdown,
     );
   }
 }

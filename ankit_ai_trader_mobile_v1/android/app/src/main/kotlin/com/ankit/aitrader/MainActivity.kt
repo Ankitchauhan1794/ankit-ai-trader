@@ -1,38 +1,47 @@
 package com.ankit.aitrader
 
-import android.Manifest
 import android.app.NotificationManager
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
-import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.provider.Settings
+import androidx.core.app.ActivityCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
+
     companion object {
         private const val SERVICE_CHANNEL = "com.ankit.aitrader/service"
         private const val NETWORK_EVENTS = "com.ankit.aitrader/network_events"
-        private const val REQ_POST_NOTIFICATIONS = 2401
-        // Step 1(e): Raise cold-start timeout from 5s (25 * 200ms) to 15s (75 * 200ms)
-        private const val START_TIMEOUT_ATTEMPTS = 75
-        private const val START_POLL_INTERVAL_MS = 200L
+        private const val REQ_POST_NOTIFICATIONS = 4001
+        private const val START_POLL_INTERVAL_MS = 500L
+        private const val START_TIMEOUT_ATTEMPTS = 40
+
+        @Volatile
+        private var activeEventSink: EventChannel.EventSink? = null
+        private val uiHandler = Handler(Looper.getMainLooper())
+
+        fun forwardNetworkEventToUi(connected: Boolean) {
+            uiHandler.post {
+                activeEventSink?.success(connected)
+            }
+        }
     }
 
-    private var connectivityManager: ConnectivityManager? = null
-    private var networkCallback: ConnectivityManager.NetworkCallback? = null
-    private var eventSink: EventChannel.EventSink? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private lateinit var connectivityManager: ConnectivityManager
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -49,30 +58,60 @@ class MainActivity : FlutterActivity() {
         ).setMethodCallHandler { call, result ->
             when (call.method) {
                 "startService" -> {
-                    val title = call.argument<String>("title") ?: "Ankit AI Trader — PAPER BOT ACTIVE"
+                    val title = call.argument<String>("title")
+                        ?: "Ankit AI Trader — PAPER BOT ACTIVE"
                     val text = call.argument<String>("text")
                         ?: "Authoritative background paper engine running."
-                    val intent = Intent(this, TradingForegroundService::class.java).apply {
-                        action = TradingForegroundService.ACTION_START
-                        putExtra(TradingForegroundService.EXTRA_TITLE, title)
-                        putExtra(TradingForegroundService.EXTRA_TEXT, text)
-                    }
                     try {
-                        TradingForegroundService.lastStartupError = null
+                        val intent = Intent(this, TradingForegroundService::class.java).apply {
+                            action = TradingForegroundService.ACTION_START
+                            putExtra(TradingForegroundService.EXTRA_TITLE, title)
+                            putExtra(TradingForegroundService.EXTRA_TEXT, text)
+                        }
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                             startForegroundService(intent)
                         } else {
                             startService(intent)
                         }
-                        awaitServiceAndDartInitialization(result, attemptsRemaining = START_TIMEOUT_ATTEMPTS)
+                        awaitServiceAndDartInitialization(0, result)
                     } catch (e: Exception) {
                         TradingForegroundService.lastStartupError = e.message ?: "Start exception"
                         result.error("SERVICE_START_FAILED", e.message, null)
                     }
                 }
+                "stopService" -> {
+                    TradingForegroundService.syncDesiredStateToPrefs(applicationContext, "STOPPED")
+                    val intent = Intent(this, TradingForegroundService::class.java)
+                    stopService(intent)
+                    result.success(true)
+                }
+                "isServiceRunning" -> {
+                    result.success(
+                        TradingForegroundService.isRunning &&
+                            TradingForegroundService.isDartEngineInitialized
+                    )
+                }
+                "getServiceStatus" -> {
+                    val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+                    val ignoringBatteryOptimizations = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        pm?.isIgnoringBatteryOptimizations(packageName) ?: false
+                    } else {
+                        true
+                    }
+                    result.success(
+                        mapOf(
+                            "serviceRunning" to TradingForegroundService.isRunning,
+                            "dartEngineInitialized" to TradingForegroundService.isDartEngineInitialized,
+                            "lastError" to TradingForegroundService.lastStartupError,
+                            "lastHeartbeatTickError" to TradingForegroundService.lastHeartbeatTickError,
+                            "lastNativeHeartbeatEpochMs" to TradingForegroundService.lastNativeHeartbeatEpochMs,
+                            "ignoringBatteryOptimizations" to ignoringBatteryOptimizations
+                        )
+                    )
+                }
                 "dispatchCommand" -> {
                     val command = call.argument<String>("command") ?: ""
-                    if (command.isEmpty()) {
+                    if (command.isBlank()) {
                         result.error("INVALID_COMMAND", "Command cannot be empty", null)
                         return@setMethodCallHandler
                     }
@@ -85,112 +124,78 @@ class MainActivity : FlutterActivity() {
                         )
                         return@setMethodCallHandler
                     }
-                    TradingForegroundService.dispatchCommandToAuthoritativeEngine(command) { ok, errMsg ->
+                    TradingForegroundService.dispatchCommandToAuthoritativeEngine(command) { ok, err ->
                         mainHandler.post {
                             if (ok) {
                                 result.success(true)
                             } else {
-                                result.error("COMMAND_FAILED", errMsg ?: "Background command failed", null)
+                                result.error("COMMAND_FAILED", err ?: "Background command failed", null)
                             }
                         }
                     }
                 }
-                "notifyNetworkChanged" -> {
-                    val connected = call.argument<Boolean>("connected") ?: true
-                    TradingForegroundService.notifyNetworkTransition(connected)
-                    result.success(true)
-                }
                 "updateNotification" -> {
-                    val title = call.argument<String>("title") ?: "Ankit AI Trader — PAPER BOT ACTIVE"
+                    val title = call.argument<String>("title") ?: "Ankit AI Trader"
                     val text = call.argument<String>("text") ?: "Paper mode active"
                     val intent = Intent(this, TradingForegroundService::class.java).apply {
                         action = TradingForegroundService.ACTION_UPDATE
                         putExtra(TradingForegroundService.EXTRA_TITLE, title)
                         putExtra(TradingForegroundService.EXTRA_TEXT, text)
                     }
-                    try {
-                        if (TradingForegroundService.isRunning) {
-                            startService(intent)
-                            result.success(true)
-                        } else {
-                            result.success(false)
-                        }
-                    } catch (e: Exception) {
-                        result.success(false)
-                    }
-                }
-                "stopService" -> {
-                    val intent = Intent(this, TradingForegroundService::class.java)
-                    stopService(intent)
+                    startService(intent)
                     result.success(true)
-                }
-                "isServiceRunning" -> {
-                    result.success(
-                        TradingForegroundService.isRunning &&
-                            TradingForegroundService.isDartEngineInitialized
-                    )
-                }
-                "getServiceStatus" -> {
-                    result.success(
-                        mapOf(
-                            "serviceRunning" to TradingForegroundService.isRunning,
-                            "dartEngineInitialized" to TradingForegroundService.isDartEngineInitialized,
-                            "lastError" to (TradingForegroundService.lastStartupError ?: ""),
-                            "lastHeartbeatTickError" to (TradingForegroundService.lastHeartbeatTickError ?: ""),
-                            "lastNativeHeartbeatEpochMs" to TradingForegroundService.lastNativeHeartbeatEpochMs
-                        )
-                    )
                 }
                 "checkNetworkConnected" -> {
                     result.success(isInternetAvailable())
+                }
+                "notifyNetworkChanged" -> {
+                    val connected = call.argument<Boolean>("connected") ?: isInternetAvailable()
+                    TradingForegroundService.notifyNetworkTransition(connected)
+                    result.success(true)
                 }
                 "checkNotificationPermission" -> {
                     result.success(isNotificationPermissionGranted())
                 }
                 "requestNotificationPermission" -> {
-                    try {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
-                                PackageManager.PERMISSION_GRANTED
-                            ) {
-                                requestPermissions(
-                                    arrayOf(Manifest.permission.POST_NOTIFICATIONS),
-                                    REQ_POST_NOTIFICATIONS
-                                )
-                            }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+                            PackageManager.PERMISSION_GRANTED
+                        ) {
+                            ActivityCompat.requestPermissions(
+                                this,
+                                arrayOf(android.Manifest.permission.POST_NOTIFICATIONS),
+                                REQ_POST_NOTIFICATIONS
+                            )
                         }
-                        result.success(isNotificationPermissionGranted())
-                    } catch (_: Exception) {
-                        result.success(false)
                     }
+                    result.success(isNotificationPermissionGranted())
                 }
                 "openNotificationSettings" -> {
                     try {
-                        val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
-                                putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
-                            }
-                        } else {
-                            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                                data = Uri.fromParts("package", packageName, null)
-                            }
+                        val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                            putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
                         }
-                        intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
                         startActivity(intent)
-                        result.success(true)
                     } catch (_: Exception) {
-                        result.success(false)
+                        val fallback = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                            data = Uri.fromParts("package", packageName, null)
+                        }
+                        startActivity(fallback)
                     }
+                    result.success(true)
+                }
+                "isIgnoringBatteryOptimizations" -> {
+                    val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+                    val ignoring = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        pm?.isIgnoringBatteryOptimizations(packageName) ?: false
+                    } else {
+                        true
+                    }
+                    result.success(ignoring)
                 }
                 "openBatterySettings" -> {
-                    try {
-                        val intent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
-                        intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
-                        startActivity(intent)
-                        result.success(true)
-                    } catch (e: Exception) {
-                        result.success(false)
-                    }
+                    openBatteryAndOemSettings()
+                    result.success(true)
                 }
                 else -> result.notImplemented()
             }
@@ -201,126 +206,108 @@ class MainActivity : FlutterActivity() {
             NETWORK_EVENTS
         ).setStreamHandler(object : EventChannel.StreamHandler {
             override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
-                eventSink = events
-                registerConnectivityCallback()
+                activeEventSink = events
                 runOnUiThread {
-                    eventSink?.success(isInternetAvailable())
+                    activeEventSink?.success(isInternetAvailable())
                 }
             }
 
             override fun onCancel(arguments: Any?) {
-                unregisterConnectivityCallback()
-                eventSink = null
+                activeEventSink = null
             }
         })
     }
 
+    private fun openBatteryAndOemSettings() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+                if (pm != null && !pm.isIgnoringBatteryOptimizations(packageName)) {
+                    val reqIntent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                        data = Uri.parse("package:$packageName")
+                    }
+                    startActivity(reqIntent)
+                    return
+                }
+            }
+        } catch (_: Exception) {
+        }
+
+        // OnePlus / OxygenOS / ColorOS specific background auto-launch settings fallback
+        val oemComponents = listOf(
+            ComponentName("com.coloros.safecenter", "com.coloros.safecenter.permission.startup.StartupAppListActivity"),
+            ComponentName("com.oneplus.security", "com.oneplus.security.chainlaunch.view.ChainLaunchAppListActivity"),
+            ComponentName("com.oplus.battery", "com.oplus.powermanager.fuelgaue.PowerConsumptionActivity")
+        )
+        for (comp in oemComponents) {
+            try {
+                val oemIntent = Intent().apply { component = comp }
+                if (packageManager.resolveActivity(oemIntent, PackageManager.MATCH_DEFAULT_ONLY) != null) {
+                    startActivity(oemIntent)
+                    return
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        try {
+            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+        } catch (_: Exception) {
+            val fallback = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                data = Uri.fromParts("package", packageName, null)
+            }
+            startActivity(fallback)
+        }
+    }
+
     private fun isNotificationPermissionGranted(): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val granted = checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+            if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
                 PackageManager.PERMISSION_GRANTED
-            if (!granted) return false
+            ) {
+                return false
+            }
         }
-        val manager = getSystemService(NotificationManager::class.java) ?: return false
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            manager.areNotificationsEnabled()
-        } else {
-            true
-        }
+        val nm = getSystemService(NotificationManager::class.java)
+        return nm?.areNotificationsEnabled() ?: true
     }
 
     private fun awaitServiceAndDartInitialization(
-        result: MethodChannel.Result,
-        attemptsRemaining: Int
+        attempt: Int,
+        result: MethodChannel.Result
     ) {
-        if (TradingForegroundService.lastStartupError != null) {
-            result.error(
-                "SERVICE_INIT_ERROR",
-                TradingForegroundService.lastStartupError,
-                null
-            )
+        val err = TradingForegroundService.lastStartupError
+        if (!err.isNullOrBlank()) {
+            result.error("SERVICE_INIT_ERROR", err, null)
             return
         }
-        if (TradingForegroundService.isRunning &&
-            TradingForegroundService.isDartEngineInitialized
-        ) {
+        if (TradingForegroundService.isRunning && TradingForegroundService.isDartEngineInitialized) {
             result.success(true)
             return
         }
-        if (attemptsRemaining <= 0) {
+        if (attempt >= START_TIMEOUT_ATTEMPTS) {
             result.error(
                 "SERVICE_INIT_TIMEOUT",
-                "starting…",
+                TradingForegroundService.lastStartupError
+                    ?: "Timed out waiting for background Dart engine initialization",
                 null
             )
             return
         }
-        mainHandler.postDelayed(
-            { awaitServiceAndDartInitialization(result, attemptsRemaining - 1) },
-            START_POLL_INTERVAL_MS
-        )
+        mainHandler.postDelayed({
+            awaitServiceAndDartInitialization(attempt + 1, result)
+        }, START_POLL_INTERVAL_MS)
     }
 
     private fun isInternetAvailable(): Boolean {
-        val cm = connectivityManager ?: return false
-        val network = cm.activeNetwork ?: return false
-        val caps = cm.getNetworkCapabilities(network) ?: return false
+        val active = connectivityManager.activeNetwork ?: return false
+        val caps = connectivityManager.getNetworkCapabilities(active) ?: return false
         return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
             caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
     }
 
-    private fun registerConnectivityCallback() {
-        unregisterConnectivityCallback()
-        val cm = connectivityManager ?: return
-        val callback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                runOnUiThread {
-                    eventSink?.success(true)
-                }
-            }
-
-            override fun onLost(network: Network) {
-                val nowAvailable = isInternetAvailable()
-                if (!nowAvailable) {
-                    TradingForegroundService.notifyNetworkTransition(false)
-                }
-                runOnUiThread {
-                    eventSink?.success(nowAvailable)
-                }
-            }
-
-            override fun onCapabilitiesChanged(
-                network: Network,
-                networkCapabilities: NetworkCapabilities
-            ) {
-                val validated =
-                    networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
-                        networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-                if (!validated) {
-                    TradingForegroundService.notifyNetworkTransition(false)
-                }
-                runOnUiThread {
-                    eventSink?.success(validated)
-                }
-            }
-        }
-        networkCallback = callback
-        cm.registerDefaultNetworkCallback(callback)
-    }
-
-    private fun unregisterConnectivityCallback() {
-        val cm = connectivityManager ?: return
-        networkCallback?.let {
-            try {
-                cm.unregisterNetworkCallback(it)
-            } catch (_: Exception) {
-            }
-        }
-        networkCallback = null
-    }
-
     override fun onDestroy() {
-        unregisterConnectivityCallback()
+        activeEventSink = null
         super.onDestroy()
     }
 }

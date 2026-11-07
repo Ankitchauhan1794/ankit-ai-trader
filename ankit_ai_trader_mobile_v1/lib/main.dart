@@ -2,20 +2,12 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'models/trading_models.dart';
+import 'screens/dashboard_screen.dart';
 import 'services/authoritative_engine.dart';
 import 'services/coindcx_market_service.dart';
 import 'services/persistence_db.dart';
-import 'services/strategy_engine.dart';
 import 'services/trading_coordinator.dart';
 
-void main() {
-  WidgetsFlutterBinding.ensureInitialized();
-  runApp(const AnkitTraderApp());
-}
-
-/// The single authoritative headless Dart entrypoint started by `TradingForegroundService.kt`.
-/// Acknowledges initialization to the native service only after `PersistenceDatabase`
-/// is verified ready. All paper trading execution and trade alert notifications happen exclusively here.
 @pragma('vm:entry-point')
 Future<void> backgroundServiceMain() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -23,7 +15,6 @@ Future<void> backgroundServiceMain() async {
   final marketService = CoinDcxMarketService();
   final persistence = PersistenceDatabase();
 
-  Timer? retryTimer;
   late final AuthoritativeTradingEngine engine;
   engine = AuthoritativeTradingEngine(
     marketService: marketService,
@@ -45,13 +36,12 @@ Future<void> backgroundServiceMain() async {
         });
       } catch (_) {}
     },
-    onScheduleRetry: (delayMs, reason) async {
-      retryTimer?.cancel();
-      retryTimer = Timer(Duration(milliseconds: delayMs), () {
-        unawaited(
-          engine.executeAuthoritativeCycle(allowTradingExecution: true),
-        );
-      });
+    onSyncUserIntention: (intention) async {
+      try {
+        await channel.invokeMethod('syncUserIntention', {
+          'intention': intention.name.toUpperCase(),
+        });
+      } catch (_) {}
     },
   );
 
@@ -77,6 +67,8 @@ Future<void> backgroundServiceMain() async {
   try {
     await persistence.database;
     await channel.invokeMethod('acknowledgeEngineInitialized');
+    // Stage 6: Automatically resume trading session if userIntention == running
+    await engine.restoreSessionIfRunningIntended();
   } catch (e) {
     try {
       await channel.invokeMethod('reportEngineFatalError', {
@@ -86,69 +78,73 @@ Future<void> backgroundServiceMain() async {
   }
 }
 
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  runApp(const AnkitTraderApp());
+}
+
 class AnkitTraderApp extends StatelessWidget {
-  const AnkitTraderApp({super.key});
+  final TradingCoordinator? coordinator;
+
+  const AnkitTraderApp({super.key, this.coordinator});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Ankit AI Trader',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData.dark().copyWith(
-        scaffoldBackgroundColor: const Color(0xFF0B101B),
-        colorScheme: const ColorScheme.dark(
-          primary: Color(0xFF39D6A0),
-          secondary: Color(0xFF4C8DFF),
+      theme: ThemeData.dark(useMaterial3: true).copyWith(
+        scaffoldBackgroundColor: const Color(0xFF0B0F19),
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF00E676),
+          brightness: Brightness.dark,
         ),
       ),
-      home: const DashboardPage(),
+      home: DashboardPage(coordinator: coordinator),
     );
   }
 }
 
 class DashboardPage extends StatefulWidget {
-  final Future<bool> Function()? internetChecker;
-  final TradingCoordinator? injectedCoordinator;
+  final TradingCoordinator? coordinator;
 
-  const DashboardPage({
-    super.key,
-    this.internetChecker,
-    this.injectedCoordinator,
-  });
+  const DashboardPage({super.key, this.coordinator});
 
   @override
   State<DashboardPage> createState() => _DashboardPageState();
 }
 
-class _DashboardPageState extends State<DashboardPage> {
+class _DashboardPageState extends State<DashboardPage>
+    with WidgetsBindingObserver {
   late final TradingCoordinator _coordinator;
-  bool _ownsCoordinator = false;
+  late final bool _ownsCoordinator;
 
   @override
   void initState() {
     super.initState();
-    if (widget.injectedCoordinator != null) {
-      _coordinator = widget.injectedCoordinator!;
-    } else {
-      _ownsCoordinator = true;
-      _coordinator = TradingCoordinator(
-        customInternetProbe: widget.internetChecker,
-      );
-      unawaited(
-        _coordinator.initialize(
-          enablePlatformChannels: widget.internetChecker == null,
-        ),
-      );
-    }
+    WidgetsBinding.instance.addObserver(this);
+    _ownsCoordinator = widget.coordinator == null;
+    _coordinator = widget.coordinator ?? TradingCoordinator();
     _coordinator.addListener(_onCoordinatorChanged);
+    _coordinator.initialize(enablePlatformChannels: _ownsCoordinator);
   }
 
   void _onCoordinatorChanged() {
-    if (mounted) setState(() {});
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _coordinator.refreshStateFromDatabase(isInitialLoad: false);
+    }
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _coordinator.removeListener(_onCoordinatorChanged);
     if (_ownsCoordinator) {
       _coordinator.dispose();
@@ -158,431 +154,309 @@ class _DashboardPageState extends State<DashboardPage> {
 
   @override
   Widget build(BuildContext context) {
-    final broker = _coordinator.broker;
-    final prices = _coordinator.latestPrices;
-    final nowMs = DateTime.now().toUtc().millisecondsSinceEpoch;
-    final equity = broker.accountEquity(prices);
-    final cash = broker.availableCashUsdt;
-    final realized = broker.realizedPnlUsdt;
-    final unrealized = broker.unrealizedPnl(prices);
-    final dailyPnl = broker.currentUtcDayTotalPnl(nowMs, prices);
-    final drawdown = broker.currentDrawdownUsdt(prices);
-
-    final closedPrices = _coordinator.closedCandlePrices;
-    final liveTickers = _coordinator.liveTickerPrices;
-    final btcPrice = (closedPrices['BTCUSDT'] ?? 0.0) > 0
-        ? closedPrices['BTCUSDT']!
-        : (prices['BTCUSDT'] ?? 0.0);
-    final ethPrice = (closedPrices['ETHUSDT'] ?? 0.0) > 0
-        ? closedPrices['ETHUSDT']!
-        : (prices['ETHUSDT'] ?? 0.0);
-    final btcLiveTicker = liveTickers['BTCUSDT'] ?? 0.0;
-    final ethLiveTicker = liveTickers['ETHUSDT'] ?? 0.0;
-    final btcEval = _coordinator.latestEvaluations['BTCUSDT'];
-    final ethEval = _coordinator.latestEvaluations['ETHUSDT'];
-
-    final isBotRunning = _coordinator.engineState == BotEngineState.running &&
-        _coordinator.marketDataStatus == MarketDataStatus.connected &&
-        _coordinator.foregroundServiceActive;
-
     return Scaffold(
       appBar: AppBar(
-        backgroundColor: const Color(0xFF111827),
         title: const Text(
-          'ANKIT AI TRADER',
-          style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1.1),
+          'Ankit AI Trader — PAPER BOT',
+          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
         ),
         actions: [
-          Container(
-            margin: const EdgeInsets.symmetric(vertical: 10, horizontal: 12),
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-            decoration: BoxDecoration(
-              color: const Color(0xFF39D6A0).withAlpha(33),
-              borderRadius: BorderRadius.circular(6),
-              border: Border.all(color: const Color(0xFF39D6A0)),
-            ),
-            child: const Center(
-              child: Text(
-                'PAPER TRADING MODE',
-                style: TextStyle(
-                  color: Color(0xFF39D6A0),
-                  fontSize: 11,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
+          Padding(
+            padding: const EdgeInsets.only(right: 12),
+            child: Center(
+              child: _statusChip(_coordinator.engineState),
             ),
           ),
         ],
       ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(14),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
+      body: RefreshIndicator(
+        onRefresh: () =>
+            _coordinator.refreshStateFromDatabase(isInitialLoad: false),
+        child: ListView(
+          padding: const EdgeInsets.all(12),
           children: [
-            _buildStatusGrid(isBotRunning),
-            const SizedBox(height: 12),
             _buildBannerCard(),
-            const SizedBox(height: 12),
-            _buildTradeAlertsToggleCard(),
-            const SizedBox(height: 12),
-            _buildAccountMetricsCard(
-              equity: equity,
-              cash: cash,
-              realized: realized,
-              unrealized: unrealized,
-              dailyPnl: dailyPnl,
-              drawdown: drawdown,
+            const SizedBox(height: 8),
+            OnePlusBatteryOptimizationCard(
+              ignoringBatteryOptimizations:
+                  _coordinator.ignoringBatteryOptimizations,
+              onOpenSettings: _coordinator.openBatteryOptimizationSettings,
             ),
+            const SizedBox(height: 8),
+            _buildControlButtons(),
             const SizedBox(height: 12),
-            _buildLiveMarketCard(
-              btcClosedPrice: btcPrice,
-              ethClosedPrice: ethPrice,
-              btcLivePrice: btcLiveTicker,
-              ethLivePrice: ethLiveTicker,
-              btcEval: btcEval,
-              ethEval: ethEval,
-            ),
+            _buildStatusGrid(),
             const SizedBox(height: 12),
-            _buildControlButtons(isBotRunning),
+            _buildAccountMetricsCard(),
+            const SizedBox(height: 12),
+            _buildLiveMarketCard(),
             const SizedBox(height: 12),
             _buildOpenPositionsCard(),
             const SizedBox(height: 12),
             _buildRecentTradesCard(),
             const SizedBox(height: 12),
+            _buildTradeAlertsToggleCard(),
+            const SizedBox(height: 12),
             _buildBacktestCard(),
+            const SizedBox(height: 24),
           ],
         ),
       ),
     );
   }
 
-  Widget _buildTradeAlertsToggleCard() {
-    final enabled = _coordinator.tradeAlertsEnabled;
-    final permGranted = _coordinator.notificationPermissionGranted;
-
+  Widget _statusChip(BotEngineState state) {
+    Color bg;
+    String label;
+    switch (state) {
+      case BotEngineState.running:
+        bg = Colors.green.shade700;
+        label = 'RUNNING';
+        break;
+      case BotEngineState.pausedNetworkLoss:
+        bg = Colors.orange.shade800;
+        label = 'AUTO-RECOVERY (NET)';
+        break;
+      case BotEngineState.pausedStaleData:
+        bg = Colors.orange.shade800;
+        label = 'AUTO-RECOVERY (DATA)';
+        break;
+      case BotEngineState.pausedAfterRecoveryManualStartRequired:
+        bg = Colors.amber.shade800;
+        label = 'PAUSED';
+        break;
+      case BotEngineState.lockedDailyLossLimit:
+        bg = Colors.red.shade800;
+        label = 'DAILY LOSS LOCK';
+        break;
+      case BotEngineState.stoppedMaxDrawdownReached:
+        bg = Colors.red.shade900;
+        label = 'MAX DRAWDOWN STOP';
+        break;
+      case BotEngineState.stopped:
+        bg = Colors.blueGrey.shade700;
+        label = 'STOPPED';
+        break;
+    }
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
       decoration: BoxDecoration(
-        color: const Color(0xFF161F30),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: Colors.white12),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'Trade alert notifications',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.bold,
-                        fontSize: 13,
-                      ),
-                    ),
-                    const SizedBox(height: 2),
-                    Text(
-                      enabled
-                          ? 'ON — High-importance PAPER TRADE alerts for entries, exits & safety locks'
-                          : 'OFF — Trade alerts muted (persistent service notification stays active)',
-                      style: const TextStyle(color: Colors.white70, fontSize: 11),
-                    ),
-                  ],
-                ),
-              ),
-              Switch(
-                key: const Key('trade_alerts_toggle_switch'),
-                value: enabled,
-                thumbColor: const WidgetStatePropertyAll<Color>(
-                  Color(0xFF39D6A0),
-                ),
-                onChanged: (val) => _coordinator.setTradeAlertsEnabled(val),
-              ),
-            ],
-          ),
-          if (!permGranted) ...[
-            const SizedBox(height: 8),
-            Container(
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                color: Colors.redAccent.withAlpha(33),
-                borderRadius: BorderRadius.circular(6),
-                border: Border.all(color: Colors.redAccent),
-              ),
-              child: Row(
-                children: [
-                  const Expanded(
-                    child: Text(
-                      'Notification permission is blocked on Android 13+. Trade alerts cannot be shown until enabled in settings.',
-                      style: TextStyle(color: Colors.white, fontSize: 11),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  OutlinedButton(
-                    onPressed: () => _coordinator.openNotificationSettings(),
-                    child: const Text('NOTIFICATION SETTINGS'),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ],
-      ),
-    );
-  }
-
-  Widget _buildStatusGrid(bool isBotRunning) {
-    final netConnected = _coordinator.internetConnected;
-    final mktStatus = _coordinator.marketDataStatus;
-    final fgsActive = _coordinator.foregroundServiceActive;
-
-    return Wrap(
-      spacing: 8,
-      runSpacing: 8,
-      children: [
-        _statusChip(
-          netConnected ? 'INTERNET CONNECTED' : 'INTERNET DISCONNECTED',
-          netConnected ? const Color(0xFF39D6A0) : Colors.redAccent,
-        ),
-        _statusChip(
-          'MARKET DATA: ${mktStatus.name.toUpperCase()}',
-          mktStatus == MarketDataStatus.connected
-              ? const Color(0xFF39D6A0)
-              : Colors.orangeAccent,
-        ),
-        _statusChip(
-          fgsActive
-              ? 'FOREGROUND SERVICE: ACTIVE'
-              : 'FOREGROUND SERVICE: IDLE',
-          fgsActive ? const Color(0xFF4C8DFF) : Colors.grey,
-        ),
-        _statusChip(
-          isBotRunning
-              ? 'BOT RUNNING'
-              : 'ENGINE: ${_coordinator.engineState.name.toUpperCase()}',
-          isBotRunning ? const Color(0xFF39D6A0) : Colors.amberAccent,
-        ),
-      ],
-    );
-  }
-
-  Widget _statusChip(String label, Color color) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(
-        color: color.withAlpha(33),
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: color.withAlpha(89)),
+        color: bg,
+        borderRadius: BorderRadius.circular(12),
       ),
       child: Text(
         label,
-        style: TextStyle(
-          color: color,
-          fontSize: 11,
-          fontWeight: FontWeight.bold,
-        ),
+        style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
       ),
     );
   }
 
   Widget _buildBannerCard() {
-    final lastUpdate = _coordinator.lastMarketDataUpdateUtc != null
-        ? _coordinator.lastMarketDataUpdateUtc!.toIso8601String()
-        : 'Never';
-    final nowMs = DateTime.now().toUtc().millisecondsSinceEpoch;
-    final timer = _coordinator.activeTimerSummary;
-    final isRunning = _coordinator.engineState == BotEngineState.running;
-    final activeText = isRunning
-        ? 'Active for ${ActiveTimerSummary.formatHhMmSs(timer.currentSessionElapsedMs(nowMs))}'
-        : 'Last session ${ActiveTimerSummary.formatHhMmSs(timer.lastSessionDurationMs)}';
-    final totalActiveText =
-        'Total active ${ActiveTimerSummary.formatDaysHhMm(timer.effectiveTotalActiveMs(nowMs))}';
-
-    return Container(
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: const Color(0xFF161F30),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: Colors.white12),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            _coordinator.statusBannerMessage,
-            style: const TextStyle(
-              color: Colors.white,
-              fontWeight: FontWeight.bold,
-              fontSize: 13,
+    return Card(
+      color: const Color(0xFF161F30),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              _coordinator.statusBannerMessage,
+              style: const TextStyle(
+                fontWeight: FontWeight.bold,
+                fontSize: 13,
+                color: Colors.cyanAccent,
+              ),
             ),
-          ),
-          const SizedBox(height: 4),
-          Text(
-            'Last Market Data Update (UTC): $lastUpdate',
-            style: const TextStyle(color: Colors.white70, fontSize: 11),
-          ),
-          const SizedBox(height: 4),
-          Text(
-            _coordinator.formatHeartbeatStatus(nowOverrideMs: nowMs),
-            key: const Key('heartbeat_status_text'),
-            style: const TextStyle(color: Colors.white70, fontSize: 11),
-          ),
-          const SizedBox(height: 4),
-          Text(
-            '$activeText | $totalActiveText',
-            key: const Key('active_timer_summary_text'),
-            style: const TextStyle(
-              color: Color(0xFF39D6A0),
-              fontSize: 11,
-              fontWeight: FontWeight.w600,
+            const SizedBox(height: 6),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  _coordinator.formatHeartbeatStatus(),
+                  key: const ValueKey('heartbeat_status_text'),
+                  style: const TextStyle(fontSize: 12, color: Colors.white70),
+                ),
+                Text(
+                  'Intention: ${_coordinator.userIntention.name.toUpperCase()}',
+                  style: const TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: Colors.greenAccent,
+                  ),
+                ),
+              ],
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
 
-  Widget _buildAccountMetricsCard({
-    required double equity,
-    required double cash,
-    required double realized,
-    required double unrealized,
-    required double dailyPnl,
-    required double drawdown,
-  }) {
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: const Color(0xFF161F30),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: Colors.white12),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text(
-            'PAPER ACCOUNT PORTFOLIO (1X SPOT — NO LIVE ORDERS)',
-            style: TextStyle(
-              color: Colors.white70,
-              fontSize: 11,
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-          const SizedBox(height: 8),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              _metricTile('Account Equity', '\$${equity.toStringAsFixed(2)}'),
-              _metricTile('Available Cash', '\$${cash.toStringAsFixed(2)}'),
-              _metricTile('Realized P&L', '\$${realized.toStringAsFixed(2)}'),
-            ],
-          ),
-          const SizedBox(height: 10),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              _metricTile(
-                  'Unrealized P&L', '\$${unrealized.toStringAsFixed(2)}'),
-              _metricTile(
-                  'Daily P&L (Max -\$2)', '\$${dailyPnl.toStringAsFixed(2)}'),
-              _metricTile(
-                  'Drawdown (Max \$10)', '\$${drawdown.toStringAsFixed(2)}'),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
+  Widget _buildControlButtons() {
+    final isRunningOrRecovering =
+        _coordinator.engineState == BotEngineState.running ||
+        _coordinator.userIntention == UserSessionIntention.running;
 
-  Widget _metricTile(String label, String value) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
+    return Row(
       children: [
-        Text(label,
-            style: const TextStyle(color: Colors.white54, fontSize: 11)),
-        const SizedBox(height: 2),
-        Text(
-          value,
-          style: const TextStyle(
-            color: Colors.white,
-            fontSize: 15,
-            fontWeight: FontWeight.bold,
+        if (!isRunningOrRecovering)
+          Expanded(
+            child: ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.green.shade700,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+              ),
+              onPressed: _coordinator.startBot,
+              icon: const Icon(Icons.play_arrow),
+              label: const Text(
+                'START PAPER BOT',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ),
+          ),
+        if (isRunningOrRecovering) ...[
+          Expanded(
+            child: ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.amber.shade800,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+              ),
+              onPressed: _coordinator.pauseBot,
+              icon: const Icon(Icons.pause),
+              label: const Text(
+                'PAUSE',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.red.shade800,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+              ),
+              onPressed: _coordinator.stopBot,
+              icon: const Icon(Icons.stop),
+              label: const Text(
+                'STOP',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+
+  Widget _buildStatusGrid() {
+    return Row(
+      children: [
+        Expanded(
+          child: _metricTile(
+            'ENGINE',
+            _coordinator.engineState.name.toUpperCase(),
+          ),
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: _metricTile(
+            'NETWORK',
+            _coordinator.internetConnected ? 'ONLINE' : 'OFFLINE',
           ),
         ),
       ],
     );
   }
 
-  Widget _buildLiveMarketCard({
-    required double btcClosedPrice,
-    required double ethClosedPrice,
-    required double btcLivePrice,
-    required double ethLivePrice,
-    required StrategyEvaluationResult? btcEval,
-    required StrategyEvaluationResult? ethEval,
-  }) {
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: const Color(0xFF161F30),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: Colors.white12),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text(
-            'COINDCX PUBLIC SPOT FEEDS (CLOSED 15M & 1H CANDLES)',
-            style: TextStyle(
-              color: Colors.white70,
-              fontSize: 11,
-              fontWeight: FontWeight.bold,
+  Widget _buildAccountMetricsCard() {
+    return Card(
+      color: const Color(0xFF141B29),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text(
+                  'PAPER ACCOUNT (\$100 INITIAL)',
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                ),
+                TextButton(
+                  onPressed: _coordinator.manualResetDrawdownAndAccount,
+                  child: const Text('RESET \$100'),
+                ),
+              ],
             ),
-          ),
-          const SizedBox(height: 8),
-          _pairRow(
-            symbol: 'BTCUSDT',
-            label: 'BTC/USDT',
-            closedPrice: btcClosedPrice,
-            livePrice: btcLivePrice,
-            eval: btcEval,
-          ),
-          const Divider(color: Colors.white12),
-          _pairRow(
-            symbol: 'ETHUSDT',
-            label: 'ETH/USDT',
-            closedPrice: ethClosedPrice,
-            livePrice: ethLivePrice,
-            eval: ethEval,
-          ),
-        ],
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: _metricTile(
+                    'Equity (USDT)',
+                    '\$${_coordinator.accountEquityUsdt.toStringAsFixed(2)}',
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: _metricTile(
+                    'Available Cash',
+                    '\$${_coordinator.availableCashUsdt.toStringAsFixed(2)}',
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: _metricTile(
+                    'Drawdown (Max \$10)',
+                    '\$${_coordinator.currentDrawdownUsdt.toStringAsFixed(2)}',
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
       ),
     );
   }
 
-  Widget _pairRow({
-    required String symbol,
-    required String label,
-    required double closedPrice,
-    required double livePrice,
-    required StrategyEvaluationResult? eval,
-  }) {
-    final closedText =
-        closedPrice > 0 ? '\$${closedPrice.toStringAsFixed(2)}' : '--';
-    final liveText =
-        livePrice > 0 ? '\$${livePrice.toStringAsFixed(2)}' : '--';
-    final sigText = eval?.description ?? 'AWAITING MARKET POLL';
-    final htfTrend =
-        eval == null ? '--' : (eval.higherTimeframeBullish ? 'BULLISH' : 'BEARISH');
-    final indText = eval?.ema20_15m != null
-        ? '15m EMA20: ${eval!.ema20_15m!.toStringAsFixed(1)} | EMA50: ${eval.ema50_15m!.toStringAsFixed(1)} | RSI14: ${eval.rsi14_15m!.toStringAsFixed(1)} | ATR14: ${eval.atr14_15m!.toStringAsFixed(2)} | 1h: $htfTrend'
-        : 'Indicators warming up';
-    final whyNoTrade = _coordinator.whyNoTradeForSymbol(symbol);
+  /// Stage 12: Rich live market information card (Last, Bid, Ask, 24h High/Low, Vol, Change).
+  Widget _buildLiveMarketCard() {
+    return Card(
+      color: const Color(0xFF141B29),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'COINDCX LIVE MARKET FEED (WS + REST FALLBACK)',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+            ),
+            const SizedBox(height: 10),
+            _pairRow('B-BTC_USDT', 'BTC/USDT'),
+            const Divider(height: 18),
+            _pairRow('B-ETH_USDT', 'ETH/USDT'),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _pairRow(String symbol, String display) {
+    final ticker = _coordinator.liveTickers[symbol];
+    final price =
+        ticker?.lastPrice ?? _coordinator.liveTickerPrices[symbol];
+    final closed15m = _coordinator.closedCandlePrices[symbol];
+    final whyNoTrade =
+        _coordinator.whyNoTradeForSymbol[symbol] ?? 'Waiting for next evaluation';
+    final change = ticker?.change24hPct ?? 0.0;
+    final changeColor =
+        change >= 0 ? Colors.greenAccent : Colors.redAccent;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -591,200 +465,220 @@ class _DashboardPageState extends State<DashboardPage> {
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
             Text(
-              label,
-              style: const TextStyle(
-                  fontWeight: FontWeight.bold, color: Colors.white),
+              display,
+              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
             ),
             Text(
-              'Live: $liveText | Closed 15m: $closedText',
-              style: const TextStyle(
+              price != null
+                  ? '\$${price.toStringAsFixed(2)} (${change >= 0 ? "+" : ""}${change.toStringAsFixed(2)}%)'
+                  : 'Loading...',
+              style: TextStyle(
                 fontWeight: FontWeight.bold,
-                color: Color(0xFF39D6A0),
-                fontSize: 13,
+                fontSize: 15,
+                color: changeColor,
               ),
             ),
           ],
         ),
-        const SizedBox(height: 3),
-        Text(sigText,
-            style: const TextStyle(color: Colors.amberAccent, fontSize: 11)),
-        Text(indText,
-            style: const TextStyle(color: Colors.white60, fontSize: 11)),
-        const SizedBox(height: 2),
-        Text(
-          whyNoTrade,
-          style: const TextStyle(color: Colors.lightBlueAccent, fontSize: 11),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildControlButtons(bool isBotRunning) {
-    return Wrap(
-      spacing: 8,
-      runSpacing: 8,
-      children: [
-        ElevatedButton.icon(
-          onPressed: isBotRunning ? null : () => _coordinator.manualStartBot(),
-          icon: const Icon(Icons.play_arrow, size: 18),
-          label: const Text('START PAPER BOT'),
-          style: ElevatedButton.styleFrom(
-            backgroundColor: const Color(0xFF39D6A0),
-            foregroundColor: Colors.black,
+        if (ticker != null) ...[
+          const SizedBox(height: 4),
+          Text(
+            'Bid: \$${ticker.bid.toStringAsFixed(2)} | Ask: \$${ticker.ask.toStringAsFixed(2)} | 24h H/L: \$${ticker.high24h.toStringAsFixed(1)} / \$${ticker.low24h.toStringAsFixed(1)} | Vol: ${ticker.volume24h.toStringAsFixed(1)}',
+            style: const TextStyle(fontSize: 11, color: Colors.white70),
           ),
-        ),
-        ElevatedButton.icon(
-          onPressed: isBotRunning ? () => _coordinator.manualPauseBot() : null,
-          icon: const Icon(Icons.pause, size: 18),
-          label: const Text('PAUSE'),
-        ),
-        ElevatedButton.icon(
-          onPressed: () => _coordinator.manualStopBot(),
-          icon: const Icon(Icons.stop, size: 18),
-          label: const Text('STOP'),
-          style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
-        ),
-        OutlinedButton(
-          onPressed: () => _coordinator.requestPassiveQuoteRefresh(),
-          child: const Text('REFRESH QUOTES'),
-        ),
-        OutlinedButton(
-          onPressed: () => _coordinator.openBatteryOptimizationSettings(),
-          child: const Text('BATTERY SETTINGS'),
-        ),
-        OutlinedButton(
-          onPressed: () => _coordinator.manualResetDrawdownAndAccount(),
-          child: const Text('RESET \$100 ACCOUNT'),
+        ],
+        const SizedBox(height: 4),
+        Text(
+          'Closed 15m: ${closed15m != null ? "\$${closed15m.toStringAsFixed(2)}" : "--"} | $whyNoTrade',
+          style: const TextStyle(fontSize: 11, color: Colors.white60),
         ),
       ],
     );
   }
 
   Widget _buildOpenPositionsCard() {
-    final positions = _coordinator.broker.openPositions.values.toList();
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: const Color(0xFF161F30),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: Colors.white12),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            'OPEN SIMULATED POSITIONS (${positions.length}/1)',
-            style: const TextStyle(
-              color: Colors.white70,
-              fontSize: 11,
-              fontWeight: FontWeight.bold,
+    final positions = _coordinator.openPositions;
+    return Card(
+      color: const Color(0xFF141B29),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'OPEN PAPER POSITIONS (${positions.length}/1)',
+              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
             ),
-          ),
-          const SizedBox(height: 8),
-          if (positions.isEmpty)
-            const Text(
-              'No open paper position.',
-              style: TextStyle(color: Colors.white54, fontSize: 12),
-            )
-          else
-            for (final pos in positions)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 6),
-                child: Text(
-                  '${pos.symbol} | Qty: ${pos.quantity.toStringAsFixed(6)} | Entry: \$${pos.entryPrice.toStringAsFixed(2)} | SL: \$${pos.stopLoss.toStringAsFixed(2)} | TP: \$${pos.takeProfit.toStringAsFixed(2)}',
-                  style: const TextStyle(color: Colors.white, fontSize: 12),
-                ),
-              ),
-        ],
+            const SizedBox(height: 8),
+            if (positions.isEmpty)
+              const Text(
+                'No open paper position.',
+                style: TextStyle(fontSize: 12, color: Colors.white60),
+              )
+            else
+              ...positions.map((pos) {
+                final mark =
+                    _coordinator.liveTickerPrices[pos.symbol] ?? pos.entryPrice;
+                final upnl = pos.unrealizedPnlUsdt(mark);
+                return ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: Text(
+                    '${pos.symbol} — Qty: ${pos.quantity.toStringAsFixed(5)} @ \$${pos.entryPrice.toStringAsFixed(2)}',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 13,
+                    ),
+                  ),
+                  subtitle: Text(
+                    'SL: \$${pos.stopLoss.toStringAsFixed(2)} | TP: \$${pos.takeProfit.toStringAsFixed(2)} | Mark: \$${mark.toStringAsFixed(2)}',
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                  trailing: Text(
+                    '${upnl >= 0 ? "+" : ""}\$${upnl.toStringAsFixed(2)}',
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: upnl >= 0 ? Colors.greenAccent : Colors.redAccent,
+                    ),
+                  ),
+                );
+              }),
+          ],
+        ),
       ),
     );
   }
 
   Widget _buildRecentTradesCard() {
-    final trades = _coordinator.broker.closedTrades.take(5).toList();
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: const Color(0xFF161F30),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: Colors.white12),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            'RECENT SIMULATED TRADES (${_coordinator.broker.closedTrades.length})',
-            style: const TextStyle(
-              color: Colors.white70,
-              fontSize: 11,
-              fontWeight: FontWeight.bold,
+    final trades = _coordinator.closedTrades;
+    return Card(
+      color: const Color(0xFF141B29),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'CLOSED PAPER TRADES (${trades.length})',
+              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
             ),
-          ),
-          const SizedBox(height: 8),
-          if (trades.isEmpty)
-            const Text(
-              'No closed paper trades yet.',
-              style: TextStyle(color: Colors.white54, fontSize: 12),
-            )
-          else
-            for (final t in trades)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 6),
-                child: Text(
-                  '${t.symbol} | Entry: \$${t.entryPrice.toStringAsFixed(2)} -> Exit: \$${t.exitPrice.toStringAsFixed(2)} | Net P&L: \$${t.realizedPnlUsdt.toStringAsFixed(2)} (Fees: \$${t.totalFeesUsdt.toStringAsFixed(3)}) | ${t.exitReason}',
-                  style: TextStyle(
-                    color: t.realizedPnlUsdt >= 0
-                        ? const Color(0xFF39D6A0)
-                        : Colors.redAccent,
-                    fontSize: 12,
+            const SizedBox(height: 8),
+            if (trades.isEmpty)
+              const Text(
+                'No closed paper trades yet.',
+                style: TextStyle(fontSize: 12, color: Colors.white60),
+              )
+            else
+              ...trades.take(10).map((t) {
+                final win = t.realizedPnlUsdt >= 0;
+                return ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: Text(
+                    '${t.symbol} (${t.exitReason})',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 12,
+                    ),
                   ),
-                ),
-              ),
-        ],
+                  subtitle: Text(
+                    'Entry: \$${t.entryPrice.toStringAsFixed(2)} -> Exit: \$${t.exitPrice.toStringAsFixed(2)} (Fees: \$${t.totalFeesUsdt.toStringAsFixed(3)})',
+                    style: const TextStyle(fontSize: 11),
+                  ),
+                  trailing: Text(
+                    '${win ? "+" : ""}\$${t.realizedPnlUsdt.toStringAsFixed(2)}',
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: win ? Colors.greenAccent : Colors.redAccent,
+                    ),
+                  ),
+                );
+              }),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTradeAlertsToggleCard() {
+    return Card(
+      color: const Color(0xFF141B29),
+      child: SwitchListTile(
+        title: const Text(
+          'Trade alert notifications',
+          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+        ),
+        subtitle: Text(
+          _coordinator.notificationPermissionGranted
+              ? 'High-priority notifications for simulated entries, exits & safety locks.'
+              : 'Notification permission is blocked on Android 13+. Trade alerts cannot be shown until enabled in settings.',
+          style: const TextStyle(fontSize: 11),
+        ),
+        value: _coordinator.tradeAlertsEnabled,
+        onChanged: (val) => _coordinator.setTradeAlertsEnabled(val),
       ),
     );
   }
 
   Widget _buildBacktestCard() {
-    final report = _coordinator.lastBacktestReport;
+    final report = _coordinator.latestBacktestReport;
+    return Card(
+      color: const Color(0xFF141B29),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'HISTORICAL BACKTEST ENGINE (BTC/USDT)',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+            ),
+            const SizedBox(height: 4),
+            const Text(
+              'Run backtest on historical candles using identical strategy, fees, slippage & risk rules.',
+              style: TextStyle(fontSize: 11, color: Colors.white60),
+            ),
+            const SizedBox(height: 8),
+            ElevatedButton(
+              onPressed: _coordinator.isRunningBacktest
+                  ? null
+                  : () => _coordinator.runLiveHistoricalBacktest(),
+              child: Text(
+                _coordinator.isRunningBacktest
+                    ? 'RUNNING BACKTEST...'
+                    : 'RUN BACKTEST',
+              ),
+            ),
+            if (report != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                'Trades: ${report.totalTrades} | Win Rate: ${report.winRatePct.toStringAsFixed(1)}% | Net PnL: \$${report.netPnlUsdt.toStringAsFixed(2)} | Max DD: \$${report.maxDrawdownUsdt.toStringAsFixed(2)}',
+                style: const TextStyle(fontSize: 12, color: Colors.greenAccent),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _metricTile(String label, String value) {
     return Container(
-      padding: const EdgeInsets.all(14),
+      padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
-        color: const Color(0xFF161F30),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: Colors.white12),
+        color: const Color(0xFF1C2536),
+        borderRadius: BorderRadius.circular(8),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              const Text(
-                'HISTORICAL BACKTEST ENGINE (BTC/USDT)',
-                style: TextStyle(
-                  color: Colors.white70,
-                  fontSize: 11,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-              TextButton(
-                onPressed: () =>
-                    _coordinator.runLiveHistoricalBacktest('BTCUSDT'),
-                child: const Text('RUN BACKTEST'),
-              ),
-            ],
+          Text(
+            label,
+            style: const TextStyle(fontSize: 11, color: Colors.white60),
           ),
-          if (report == null)
-            const Text(
-              'Run backtest on historical candles using identical strategy, fees, slippage & risk rules.',
-              style: TextStyle(color: Colors.white54, fontSize: 12),
-            )
-          else
-            Text(
-              'Trades: ${report.totalTrades} | Win Rate: ${report.winRatePercent.toStringAsFixed(1)}% | Net P&L: \$${report.netPnlUsdt.toStringAsFixed(2)} | Profit Factor: ${report.profitFactor.toStringAsFixed(2)} | Max DD: \$${report.maxDrawdownUsdt.toStringAsFixed(2)} | Avg R: ${report.averageRewardToRisk.toStringAsFixed(2)}R',
-              style: const TextStyle(color: Colors.white, fontSize: 12),
-            ),
+          const SizedBox(height: 4),
+          Text(
+            value,
+            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+          ),
         ],
       ),
     );

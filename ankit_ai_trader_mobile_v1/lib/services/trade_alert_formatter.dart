@@ -1,59 +1,44 @@
 import '../models/trading_models.dart';
 
-class TradeAlertPayload {
-  final String alertId;
-  final String title;
-  final String body;
-
-  const TradeAlertPayload({
-    required this.alertId,
-    required this.title,
-    required this.body,
-  });
-}
-
 class TradeAlertFormatter {
-  static TradeAlertPayload formatEntryAlert({
-    required SimulatedOrder buyOrder,
-    required PaperPosition position,
+  const TradeAlertFormatter();
+
+  static TradeAlertPayload formatEntryAlert(
+    SimulatedOrder order, {
+    required double stopLoss,
+    required double takeProfit,
   }) {
-    final slDist = (position.entryPrice - position.stopLoss).abs();
-    final estimatedRisk =
-        (slDist * position.quantity) + (position.entryFeeUsdt * 2.0);
     return TradeAlertPayload(
-      alertId: 'ENTRY:${buyOrder.id}',
-      title: 'PAPER TRADE ENTRY — ${buyOrder.symbol} (BUY)',
+      alertId: 'ENTRY_${order.id}',
+      title: '[PAPER TRADE] BUY ${order.symbol}',
       body:
-          '[PAPER TRADE] BUY ${buyOrder.symbol} | Entry: \$${position.entryPrice.toStringAsFixed(2)} | Qty: ${position.quantity.toStringAsFixed(6)} | SL: \$${position.stopLoss.toStringAsFixed(2)} | TP: \$${position.takeProfit.toStringAsFixed(2)} | Risked: \$${estimatedRisk.toStringAsFixed(2)}',
+          'Entered ${order.symbol} @ \$${order.executedPrice.toStringAsFixed(2)} | Qty: ${order.quantity.toStringAsFixed(5)} | SL: \$${stopLoss.toStringAsFixed(2)} | TP: \$${takeProfit.toStringAsFixed(2)} (Fees: \$${order.feeUsdt.toStringAsFixed(3)})',
+      timestampMs: order.executedAtMs,
     );
   }
 
-  static TradeAlertPayload formatExitAlert({
-    required SimulatedOrder sellOrder,
-    required ClosedPaperTrade closedTrade,
-    required double newAccountEquityUsdt,
-  }) {
-    final sign = closedTrade.realizedPnlUsdt >= 0 ? '+' : '-';
-    final absPnl = closedTrade.realizedPnlUsdt.abs().toStringAsFixed(2);
+  static TradeAlertPayload formatExitAlert(ClosedPaperTrade trade) {
+    final sign = trade.realizedPnlUsdt >= 0 ? '+' : '';
     return TradeAlertPayload(
-      alertId: 'EXIT:${sellOrder.id}',
-      title: 'PAPER TRADE EXIT — ${closedTrade.symbol}',
+      alertId: 'EXIT_${trade.id}',
+      title: '[PAPER TRADE] EXIT ${trade.symbol} (${trade.exitReason})',
       body:
-          '[PAPER TRADE] EXIT ${closedTrade.symbol} @ \$${closedTrade.exitPrice.toStringAsFixed(2)} | Reason: ${closedTrade.exitReason} | Net P&L: $sign\$$absPnl | Equity: \$${newAccountEquityUsdt.toStringAsFixed(2)}',
+          'Closed ${trade.symbol} @ \$${trade.exitPrice.toStringAsFixed(2)} | PnL: $sign\$${trade.realizedPnlUsdt.toStringAsFixed(2)} (Fees: \$${trade.totalFeesUsdt.toStringAsFixed(3)})',
+      timestampMs: trade.closedAtMs,
     );
   }
 
   static TradeAlertPayload formatSafetyLockAlert({
-    required String lockTypeKey,
-    required String lockTitle,
-    required String reasonDetail,
-    required double currentEquityUsdt,
+    required String lockType,
+    required String message,
+    required int timestampMs,
   }) {
+    final dayBucket = timestampMs ~/ (60 * 60 * 1000);
     return TradeAlertPayload(
-      alertId: 'LOCK:$lockTypeKey',
-      title: 'PAPER TRADE SAFETY LOCK — $lockTitle',
-      body:
-          '[PAPER TRADE] $lockTitle | $reasonDetail | Equity: \$${currentEquityUsdt.toStringAsFixed(2)}',
+      alertId: 'LOCK_${lockType}_$dayBucket',
+      title: '[PAPER BOT SAFETY LOCK] $lockType',
+      body: message,
+      timestampMs: timestampMs,
     );
   }
 }

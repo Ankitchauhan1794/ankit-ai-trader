@@ -1,27 +1,45 @@
 import 'dart:math' as math;
 import '../models/trading_models.dart';
 
+class RiskConfig {
+  final double initialCapitalUsdt;
+  final double maxRiskPerTradeFraction;
+  final double maxDailyLossUsdt;
+  final double maxTotalDrawdownUsdt;
+  final int maxConcurrentOpenPositions;
+  final double stopLossAtrMultiplier;
+  final double takeProfitRewardRiskRatio;
+  final int postStopLossCooldownMs;
+
+  const RiskConfig({
+    this.initialCapitalUsdt = 100.0,
+    this.maxRiskPerTradeFraction = 0.01,
+    this.maxDailyLossUsdt = 2.0,
+    this.maxTotalDrawdownUsdt = 10.0,
+    this.maxConcurrentOpenPositions = 1,
+    this.stopLossAtrMultiplier = 1.5,
+    this.takeProfitRewardRiskRatio = 2.0,
+    this.postStopLossCooldownMs = 30 * 60 * 1000,
+  });
+
+  double get equityFloorUsdt => initialCapitalUsdt - maxTotalDrawdownUsdt;
+}
+
 class PositionSizingDecision {
   final bool approved;
   final double quantity;
-  final double estimatedEntryPrice;
+  final double notionalUsdt;
   final double stopLossPrice;
   final double takeProfitPrice;
-  final double estimatedRiskUsdt;
-  final double estimatedNotionalUsdt;
-  final double estimatedEntryFeeUsdt;
-  final String rejectionReason;
+  final String? rejectionReason;
 
   const PositionSizingDecision({
     required this.approved,
     this.quantity = 0.0,
-    this.estimatedEntryPrice = 0.0,
+    this.notionalUsdt = 0.0,
     this.stopLossPrice = 0.0,
     this.takeProfitPrice = 0.0,
-    this.estimatedRiskUsdt = 0.0,
-    this.estimatedNotionalUsdt = 0.0,
-    this.estimatedEntryFeeUsdt = 0.0,
-    this.rejectionReason = '',
+    this.rejectionReason,
   });
 }
 
@@ -30,8 +48,8 @@ class RiskManager {
 
   const RiskManager({this.config = const RiskConfig()});
 
-  static String utcDayKey(int epochMs) {
-    final dt = DateTime.fromMillisecondsSinceEpoch(epochMs, isUtc: true);
+  static String utcDateString(int timestampMs) {
+    final dt = DateTime.fromMillisecondsSinceEpoch(timestampMs, isUtc: true);
     final y = dt.year.toString().padLeft(4, '0');
     final m = dt.month.toString().padLeft(2, '0');
     final d = dt.day.toString().padLeft(2, '0');
@@ -39,142 +57,135 @@ class RiskManager {
   }
 
   bool isMaxDrawdownReached(double currentEquityUsdt) {
-    final floor = config.initialCapitalUsdt - config.maxTotalDrawdownUsdt;
-    return currentEquityUsdt <= floor + 1e-9;
+    return currentEquityUsdt <= config.equityFloorUsdt + 1e-9;
+  }
+
+  double currentDrawdownUsdt(double currentEquityUsdt) {
+    return math.max(0.0, config.initialCapitalUsdt - currentEquityUsdt);
   }
 
   bool isDailyLossLimitReached({
-    required double currentEquityUsdt,
     required double startOfDayEquityUsdt,
+    required double currentEquityUsdt,
   }) {
-    final dailyLoss = startOfDayEquityUsdt - currentEquityUsdt;
-    return dailyLoss >= config.maxDailyLossUsdt - 1e-9;
+    return (startOfDayEquityUsdt - currentEquityUsdt) >= config.maxDailyLossUsdt - 1e-9;
   }
 
-  PositionSizingDecision evaluateEntryAndSize({
-    required double rawNextOpenPrice,
+  bool isInStopLossCooldown({
+    required int? lastStopLossClosedAtMs,
+    required int nowMs,
+  }) {
+    if (lastStopLossClosedAtMs == null || lastStopLossClosedAtMs <= 0) {
+      return false;
+    }
+    return (nowMs - lastStopLossClosedAtMs) < config.postStopLossCooldownMs;
+  }
+
+  PositionSizingDecision evaluateEntrySizing({
+    required String symbol,
+    required double entryFillPrice,
     required double atr14,
-    required StrategyConfig strategyConfig,
-    required double availableCashUsdt,
     required double currentEquityUsdt,
+    required double availableCashUsdt,
     required double startOfDayEquityUsdt,
-    required double todayRealizedPnlUsdt,
-    required double todayUnrealizedPnlUsdt,
-    required int currentOpenPositionsCount,
-    double minNotionalUsdt = 1.0,
-    double minQuantity = 0.000001,
+    required List<PaperPosition> openPositions,
+    required MarketPairMetadata pairMetadata,
+    required double feeRate,
+    int? lastStopLossClosedAtMs,
+    int? nowMs,
   }) {
     if (isMaxDrawdownReached(currentEquityUsdt)) {
       return const PositionSizingDecision(
         approved: false,
-        rejectionReason: 'MAX DRAWDOWN REACHED (\$90 FLOOR)',
+        rejectionReason:
+            'Account equity reached or fell below \$90.00 floor. Engine stopped; manual review & reset required.',
       );
     }
 
     if (isDailyLossLimitReached(
-      currentEquityUsdt: currentEquityUsdt,
       startOfDayEquityUsdt: startOfDayEquityUsdt,
-    ) ||
-        (todayRealizedPnlUsdt + todayUnrealizedPnlUsdt) <=
-            -config.maxDailyLossUsdt + 1e-9) {
+      currentEquityUsdt: currentEquityUsdt,
+    )) {
       return const PositionSizingDecision(
         approved: false,
-        rejectionReason: 'DAILY LOSS LIMIT REACHED (\$2.00)',
+        rejectionReason: 'DAILY LOSS LIMIT (\$2.00) REACHED',
       );
     }
 
-    if (currentOpenPositionsCount >= config.maxConcurrentOpenPositions) {
-      return const PositionSizingDecision(
+    if (nowMs != null &&
+        isInStopLossCooldown(
+          lastStopLossClosedAtMs: lastStopLossClosedAtMs,
+          nowMs: nowMs,
+        )) {
+      final remMin =
+          ((config.postStopLossCooldownMs - (nowMs - lastStopLossClosedAtMs!)) /
+                  60000)
+              .ceil();
+      return PositionSizingDecision(
         approved: false,
-        rejectionReason: 'MAX CONCURRENT OPEN POSITIONS REACHED',
+        rejectionReason: 'Why no trade: Post stop-loss cooldown (${remMin}m left)',
       );
     }
 
-    if (rawNextOpenPrice <= 0 || atr14 <= 0) {
+    if (openPositions.any((p) => p.symbol == symbol)) {
+      return const PositionSizingDecision(
+        approved: false,
+        rejectionReason: 'Why no trade: Position already open for symbol',
+      );
+    }
+
+    if (openPositions.length >= config.maxConcurrentOpenPositions) {
+      return const PositionSizingDecision(
+        approved: false,
+        rejectionReason: 'Why no trade: Max 1 concurrent open position active',
+      );
+    }
+
+    if (entryFillPrice <= 0 || atr14 <= 0) {
       return const PositionSizingDecision(
         approved: false,
         rejectionReason: 'INVALID ENTRY PRICE OR ATR',
       );
     }
 
-    final entryExecPrice = rawNextOpenPrice * (1.0 + config.slippageRate);
-    final stopDistance = atr14 * strategyConfig.stopLossAtrMultiplier;
-    final stopLossPrice = entryExecPrice - stopDistance;
-    if (stopLossPrice <= 0 || stopLossPrice >= entryExecPrice) {
+    final stopDistance = atr14 * config.stopLossAtrMultiplier;
+    final stopLossPrice = entryFillPrice - stopDistance;
+    if (stopDistance <= 0 || stopLossPrice <= 0) {
       return const PositionSizingDecision(
         approved: false,
         rejectionReason: 'INVALID STOP LOSS DISTANCE',
       );
     }
 
-    final takeProfitDistance =
-        stopDistance * strategyConfig.takeProfitRewardRiskRatio;
-    final takeProfitPrice = entryExecPrice + takeProfitDistance;
+    final takeProfitPrice =
+        entryFillPrice + (stopDistance * config.takeProfitRewardRiskRatio);
 
-    // Effective stop execution price when exiting on SL (includes downward slippage)
-    final slExitExecPrice = stopLossPrice * (1.0 - config.slippageRate);
-    final priceLossPerUnit = math.max(0.0, entryExecPrice - slExitExecPrice);
-    final feePerUnitRoundTrip =
-        (entryExecPrice * config.feeRate) + (slExitExecPrice * config.feeRate);
-    final totalRiskPerUnit = priceLossPerUnit + feePerUnitRoundTrip;
-
-    if (totalRiskPerUnit <= 0) {
-      return const PositionSizingDecision(
-        approved: false,
-        rejectionReason: 'INVALID UNIT RISK',
-      );
+    final riskBudgetUsdt = currentEquityUsdt * config.maxRiskPerTradeFraction;
+    double rawQty = riskBudgetUsdt / stopDistance;
+    double maxAffordableNotional = availableCashUsdt / (1.0 + feeRate);
+    double desiredNotional = rawQty * entryFillPrice;
+    if (desiredNotional > maxAffordableNotional) {
+      desiredNotional = maxAffordableNotional;
+      rawQty = desiredNotional / entryFillPrice;
     }
 
-    final maxAllowedRiskUsdt = math.min(
-      config.initialCapitalUsdt * config.maxRiskPerTradeFraction,
-      currentEquityUsdt * config.maxRiskPerTradeFraction,
-    );
+    final step = pairMetadata.stepSize > 0 ? pairMetadata.stepSize : 0.00001;
+    final roundedQty = (rawQty / step).floorToDouble() * step;
+    final finalNotional = roundedQty * entryFillPrice;
 
-    final qtyByRisk = maxAllowedRiskUsdt / totalRiskPerUnit;
-    final maxAffordableNotional = availableCashUsdt / (1.0 + config.feeRate);
-    final qtyByCash = maxAffordableNotional / entryExecPrice;
-
-    final quantity = math.min(qtyByRisk, qtyByCash);
-    if (quantity <= 0 || quantity < minQuantity) {
+    if (roundedQty <= 0 || finalNotional < pairMetadata.minNotionalUsdt) {
       return const PositionSizingDecision(
         approved: false,
-        rejectionReason: 'QUANTITY BELOW EXCHANGE MINIMUM',
-      );
-    }
-
-    final notionalUsdt = quantity * entryExecPrice;
-    if (notionalUsdt < minNotionalUsdt) {
-      return const PositionSizingDecision(
-        approved: false,
-        rejectionReason: 'BELOW MINIMUM ORDER NOTIONAL',
-      );
-    }
-
-    final entryFeeUsdt = notionalUsdt * config.feeRate;
-    if (notionalUsdt + entryFeeUsdt > availableCashUsdt + 1e-9) {
-      return const PositionSizingDecision(
-        approved: false,
-        rejectionReason: 'INSUFFICIENT AVAILABLE CASH',
-      );
-    }
-
-    final estimatedRiskUsdt = quantity * totalRiskPerUnit;
-    if (estimatedRiskUsdt > maxAllowedRiskUsdt + 1e-6) {
-      return const PositionSizingDecision(
-        approved: false,
-        rejectionReason: 'TRADE RISK EXCEEDS 1% LIMIT',
+        rejectionReason: 'Why no trade: Below minimum order',
       );
     }
 
     return PositionSizingDecision(
       approved: true,
-      quantity: quantity,
-      estimatedEntryPrice: entryExecPrice,
+      quantity: roundedQty,
+      notionalUsdt: finalNotional,
       stopLossPrice: stopLossPrice,
       takeProfitPrice: takeProfitPrice,
-      estimatedRiskUsdt: estimatedRiskUsdt,
-      estimatedNotionalUsdt: notionalUsdt,
-      estimatedEntryFeeUsdt: entryFeeUsdt,
     );
   }
 }

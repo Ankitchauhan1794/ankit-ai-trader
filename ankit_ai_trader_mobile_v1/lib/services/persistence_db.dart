@@ -2,71 +2,92 @@ import 'dart:convert';
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 import '../models/trading_models.dart';
-import 'paper_broker.dart';
-import 'strategy_engine.dart';
 
 class PersistedEngineSnapshot {
   final BotEngineState botState;
-  final MarketDataStatus marketDataStatus;
-  final String statusBannerMessage;
-  final int? lastMarketDataUpdateMs;
+  final UserSessionIntention userIntention;
+  final double availableCashUsdt;
+  final double accountEquityUsdt;
+  final bool maxDrawdownLocked;
+  final String? lockedDailyLossUtcDate;
+  final int? lastStopLossClosedAtMs;
   final int? lastHeartbeatMs;
-  final Map<String, double> latestPrices;
-  final Map<String, double> closedCandlePrices;
-  final Map<String, double> liveTickerPrices;
-  final Map<String, StrategyEvaluationResult> latestEvaluations;
-  final bool tradeAlertsEnabled;
-  final Set<String> notifiedAlertIds;
+  final int? lastMarketDataUpdateMs;
   final int? runningSinceMs;
   final int totalActiveMs;
-  final int lastSessionDurationMs;
-  final int? recoveryStartedAtMs;
+  final String statusBannerMessage;
+  final bool tradeAlertsEnabled;
+  final Map<String, double> liveTickerPrices;
+  final Map<String, LiveMarketTicker> liveTickers;
+  final Map<String, double> closedCandlePrices;
+  final Map<String, String> whyNoTradeForSymbol;
+  final List<PaperPosition> openPositions;
+  final List<SimulatedOrder> orders;
+  final List<ClosedPaperTrade> closedTrades;
+  final Set<String> processedEntrySignalKeys;
   final int recoveryAttemptCount;
+  final int? recoveryStartedAtMs;
   final int? nextRecoveryAllowedAtMs;
   final List<String> recoveryLogs;
 
   const PersistedEngineSnapshot({
     required this.botState,
-    required this.marketDataStatus,
-    required this.statusBannerMessage,
-    this.lastMarketDataUpdateMs,
+    required this.userIntention,
+    required this.availableCashUsdt,
+    required this.accountEquityUsdt,
+    required this.maxDrawdownLocked,
+    this.lockedDailyLossUtcDate,
+    this.lastStopLossClosedAtMs,
     this.lastHeartbeatMs,
-    required this.latestPrices,
-    this.closedCandlePrices = const {},
-    this.liveTickerPrices = const {},
-    required this.latestEvaluations,
-    this.tradeAlertsEnabled = true,
-    this.notifiedAlertIds = const {},
+    this.lastMarketDataUpdateMs,
     this.runningSinceMs,
     this.totalActiveMs = 0,
-    this.lastSessionDurationMs = 0,
-    this.recoveryStartedAtMs,
+    required this.statusBannerMessage,
+    this.tradeAlertsEnabled = true,
+    this.liveTickerPrices = const {},
+    this.liveTickers = const {},
+    this.closedCandlePrices = const {},
+    this.whyNoTradeForSymbol = const {},
+    this.openPositions = const [],
+    this.orders = const [],
+    this.closedTrades = const [],
+    this.processedEntrySignalKeys = const {},
     this.recoveryAttemptCount = 0,
+    this.recoveryStartedAtMs,
     this.nextRecoveryAllowedAtMs,
     this.recoveryLogs = const [],
   });
 }
 
 class PersistenceDatabase {
-  static const int schemaVersion = 2;
+  static const String dbFileName = 'ankit_ai_trader_phase1.db';
   Database? _db;
+  final Map<String, String> _inMemoryKv = {};
+  final List<PaperPosition> _inMemoryOpenPositions = [];
+  final List<SimulatedOrder> _inMemoryOrders = [];
+  final List<ClosedPaperTrade> _inMemoryClosedTrades = [];
+  final Set<String> _inMemoryProcessedKeys = {};
+  final Map<String, Map<String, dynamic>> _inMemoryLocks = {};
+  final bool useInMemoryFallback;
 
-  Future<Database> get database async {
-    if (_db != null) return _db!;
-    final dbPath = await getDatabasesPath();
-    final fullPath = p.join(dbPath, 'ankit_ai_trader_phase1.db');
-    _db = await openDatabase(
-      fullPath,
-      version: schemaVersion,
-      onCreate: _onCreate,
-      onUpgrade: _onUpgrade,
-    );
-    return _db!;
-  }
+  PersistenceDatabase({this.useInMemoryFallback = false});
 
-  Future<void> openWithCustomDatabase(Database customDb) async {
-    _db = customDb;
-    await _onCreate(customDb, schemaVersion);
+  Future<Database?> get database async {
+    if (useInMemoryFallback) return null;
+    if (_db != null) return _db;
+    try {
+      final dbDir = await getDatabasesPath();
+      final fullPath = p.join(dbDir, dbFileName);
+      _db = await openDatabase(
+        fullPath,
+        version: 2,
+        onCreate: _onCreate,
+        onUpgrade: _onUpgrade,
+      );
+      return _db;
+    } catch (_) {
+      return null;
+    }
   }
 
   Future<void> _onCreate(Database db, int version) async {
@@ -76,7 +97,6 @@ class PersistenceDatabase {
         value TEXT NOT NULL
       )
     ''');
-
     await db.execute('''
       CREATE TABLE IF NOT EXISTS open_positions (
         id TEXT PRIMARY KEY,
@@ -90,7 +110,21 @@ class PersistenceDatabase {
         openedAtMs INTEGER NOT NULL
       )
     ''');
-
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS orders (
+        id TEXT PRIMARY KEY,
+        symbol TEXT NOT NULL,
+        side TEXT NOT NULL,
+        requestedPrice REAL NOT NULL,
+        executedPrice REAL NOT NULL,
+        quantity REAL NOT NULL,
+        notionalUsdt REAL NOT NULL,
+        feeUsdt REAL NOT NULL,
+        signalCandleCloseMs INTEGER NOT NULL,
+        executedAtMs INTEGER NOT NULL,
+        reason TEXT NOT NULL
+      )
+    ''');
     await db.execute('''
       CREATE TABLE IF NOT EXISTS closed_trades (
         id TEXT PRIMARY KEY,
@@ -107,23 +141,12 @@ class PersistenceDatabase {
         exitReason TEXT NOT NULL
       )
     ''');
-
     await db.execute('''
-      CREATE TABLE IF NOT EXISTS orders (
-        id TEXT PRIMARY KEY,
-        symbol TEXT NOT NULL,
-        side TEXT NOT NULL,
-        requestedPrice REAL NOT NULL,
-        executedPrice REAL NOT NULL,
-        quantity REAL NOT NULL,
-        notionalUsdt REAL NOT NULL,
-        feeUsdt REAL NOT NULL,
-        signalCandleCloseMs INTEGER NOT NULL,
-        executedAtMs INTEGER NOT NULL,
-        reason TEXT NOT NULL
+      CREATE TABLE IF NOT EXISTS processed_signal_keys (
+        signalKey TEXT PRIMARY KEY,
+        processedAtMs INTEGER NOT NULL
       )
     ''');
-
     await db.execute('''
       CREATE TABLE IF NOT EXISTS equity_snapshots (
         timestampMs INTEGER PRIMARY KEY,
@@ -131,7 +154,6 @@ class PersistenceDatabase {
         availableCashUsdt REAL NOT NULL
       )
     ''');
-
     await db.execute('''
       CREATE TABLE IF NOT EXISTS execution_locks (
         lockName TEXT PRIMARY KEY,
@@ -140,210 +162,98 @@ class PersistenceDatabase {
         expiresAtMs INTEGER NOT NULL
       )
     ''');
-
-    await db.execute('''
-      CREATE TABLE IF NOT EXISTS processed_signal_keys (
-        signalKey TEXT PRIMARY KEY,
-        processedAtMs INTEGER NOT NULL
-      )
-    ''');
   }
 
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
-    if (oldVersion < 2) {
-      await _onCreate(db, newVersion);
-    }
+    await _onCreate(db, newVersion);
   }
 
-  /// Reads whether Trade Alert notifications are enabled from `engine_kv_state`.
-  /// Defaults to `true` (ON) when not yet set.
-  Future<bool> getTradeAlertsEnabled() async {
+  Future<void> putKv(String key, String value) async {
+    _inMemoryKv[key] = value;
     final db = await database;
-    final rows = await db.query(
-      'engine_kv_state',
-      where: 'key = ?',
-      whereArgs: ['tradeAlertsEnabled'],
-    );
-    if (rows.isEmpty) return true;
-    final decoded = jsonDecode(rows.first['value'] as String);
-    if (decoded is bool) return decoded;
-    return true;
-  }
-
-  /// Persists the "Trade alert notifications" ON/OFF toggle in `engine_kv_state`
-  /// so it survives app restarts and process death and takes effect immediately.
-  Future<void> setTradeAlertsEnabled(bool enabled) async {
-    final db = await database;
+    if (db == null) return;
     await db.insert(
       'engine_kv_state',
-      {'key': 'tradeAlertsEnabled', 'value': jsonEncode(enabled)},
+      {'key': key, 'value': value},
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
   }
 
-  /// Reads the set of already-notified alert IDs (order IDs / lock event keys)
-  /// from `engine_kv_state` so service restarts cannot send duplicate alerts.
-  Future<Set<String>> getNotifiedAlertIds() async {
+  Future<String?> getKv(String key) async {
     final db = await database;
+    if (db == null) return _inMemoryKv[key];
     final rows = await db.query(
       'engine_kv_state',
       where: 'key = ?',
-      whereArgs: ['notifiedAlertIds'],
+      whereArgs: [key],
+      limit: 1,
     );
-    if (rows.isEmpty) return <String>{};
-    final decoded = jsonDecode(rows.first['value'] as String);
-    if (decoded is List) {
-      return decoded.map((e) => e.toString()).toSet();
-    }
-    return <String>{};
+    if (rows.isEmpty) return _inMemoryKv[key];
+    return rows.first['value'] as String?;
   }
 
-  /// Marks an alert ID (such as `ENTRY:ORD-BUY-...`, `EXIT:ORD-SELL-...`, or `LOCK:...`)
-  /// as sent in `engine_kv_state`. Returns `true` if newly recorded, or `false` if it was
-  /// already notified previously.
-  Future<bool> markAlertIdNotified(String alertId) async {
-    final db = await database;
-    return db.transaction<bool>((txn) async {
-      final rows = await txn.query(
-        'engine_kv_state',
-        where: 'key = ?',
-        whereArgs: ['notifiedAlertIds'],
-      );
-      final existing = <String>{};
-      if (rows.isNotEmpty) {
-        final decoded = jsonDecode(rows.first['value'] as String);
-        if (decoded is List) {
-          existing.addAll(decoded.map((e) => e.toString()));
-        }
-      }
-      if (existing.contains(alertId)) {
-        return false;
-      }
-      existing.add(alertId);
-      await txn.insert(
-        'engine_kv_state',
-        {
-          'key': 'notifiedAlertIds',
-          'value': jsonEncode(existing.toList()),
-        },
-        conflictAlgorithm: ConflictAlgorithm.replace,
-      );
-      await txn.insert(
-        'engine_kv_state',
-        {
-          'key': 'lastNotifiedOrderId',
-          'value': jsonEncode(alertId),
-        },
-        conflictAlgorithm: ConflictAlgorithm.replace,
-      );
-      return true;
-    });
+  /// Stage 2: Persist user intention separately from runtime botState.
+  Future<void> saveUserIntention(UserSessionIntention intention) async {
+    await putKv('userIntention', intention.name);
   }
 
-  /// Writes the background isolate heartbeat timestamp to SQLite `engine_kv_state`
-  /// so the UI dashboard can verify engine liveness and display heartbeat age.
+  Future<UserSessionIntention> loadUserIntention() async {
+    final raw = await getKv('userIntention');
+    return UserSessionIntention.values.firstWhere(
+      (e) => e.name == raw,
+      orElse: () => UserSessionIntention.stopped,
+    );
+  }
+
+  /// Stage 4: Record engine heartbeat timestamp in SQLite.
   Future<void> recordHeartbeat(int timestampMs) async {
-    final db = await database;
-    await db.insert(
-      'engine_kv_state',
-      {'key': 'lastHeartbeatMs', 'value': jsonEncode(timestampMs)},
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
+    await putKv('lastHeartbeatMs', jsonEncode(timestampMs));
   }
 
-  Future<int?> getLastHeartbeatMs() async {
-    final db = await database;
-    final rows = await db.query(
-      'engine_kv_state',
-      where: 'key = ?',
-      whereArgs: ['lastHeartbeatMs'],
-    );
-    if (rows.isEmpty) return null;
-    final decoded = jsonDecode(rows.first['value'] as String);
-    if (decoded is num) {
-      final val = decoded.toInt();
-      return val > 0 ? val : null;
-    }
-    return null;
-  }
-
-  Future<void> saveRecoveryState({
-    required int? recoveryStartedAtMs,
-    required int recoveryAttemptCount,
-    required int? nextRecoveryAllowedAtMs,
-    required List<String> recoveryLogs,
-  }) async {
-    final db = await database;
-    await db.transaction((txn) async {
-      Future<void> putKv(String k, Object v) async {
-        await txn.insert(
-          'engine_kv_state',
-          {'key': k, 'value': jsonEncode(v)},
-          conflictAlgorithm: ConflictAlgorithm.replace,
-        );
-      }
-
-      await putKv('recoveryStartedAtMs', recoveryStartedAtMs ?? 0);
-      await putKv('recoveryAttemptCount', recoveryAttemptCount);
-      await putKv('nextRecoveryAllowedAtMs', nextRecoveryAllowedAtMs ?? 0);
-      await putKv(
-        'recoveryLogs',
-        recoveryLogs.length > 30
-            ? recoveryLogs.sublist(recoveryLogs.length - 30)
-            : recoveryLogs,
-      );
-    });
-  }
-
-  Future<void> clearRecoveryState() async {
-    await saveRecoveryState(
-      recoveryStartedAtMs: null,
-      recoveryAttemptCount: 0,
-      nextRecoveryAllowedAtMs: null,
-      recoveryLogs: const [],
-    );
-  }
-
-  Future<String?> getLastNotifiedOrderId() async {
-    final db = await database;
-    final rows = await db.query(
-      'engine_kv_state',
-      where: 'key = ?',
-      whereArgs: ['lastNotifiedOrderId'],
-    );
-    if (rows.isEmpty) return null;
-    final decoded = jsonDecode(rows.first['value'] as String);
-    return decoded?.toString();
-  }
-
-  /// Acquires a persistent SQLite execution lease so that only the single authoritative
-  /// engine can execute candle evaluations and trade mutations at any time.
+  /// Stage 7: Single authoritative engine execution lock.
   Future<bool> acquireExecutionLock({
+    required String lockName,
     required String ownerId,
     required int nowMs,
-    int leaseDurationMs = 55000,
+    int ttlMs = 55000,
   }) async {
     final db = await database;
-    return db.transaction<bool>((txn) async {
+    if (db == null) {
+      final existing = _inMemoryLocks[lockName];
+      if (existing != null &&
+          existing['ownerId'] != ownerId &&
+          (existing['expiresAtMs'] as int) > nowMs) {
+        return false;
+      }
+      _inMemoryLocks[lockName] = {
+        'ownerId': ownerId,
+        'acquiredAtMs': nowMs,
+        'expiresAtMs': nowMs + ttlMs,
+      };
+      return true;
+    }
+
+    return await db.transaction((txn) async {
       final rows = await txn.query(
         'execution_locks',
         where: 'lockName = ?',
-        whereArgs: ['AUTHORITATIVE_ENGINE_LOCK'],
+        whereArgs: [lockName],
+        limit: 1,
       );
       if (rows.isNotEmpty) {
-        final currentOwner = rows.first['ownerId'] as String;
+        final curOwner = rows.first['ownerId'] as String;
         final expiresAt = (rows.first['expiresAtMs'] as num).toInt();
-        if (currentOwner != ownerId && expiresAt > nowMs) {
+        if (curOwner != ownerId && expiresAt > nowMs) {
           return false;
         }
       }
       await txn.insert(
         'execution_locks',
         {
-          'lockName': 'AUTHORITATIVE_ENGINE_LOCK',
+          'lockName': lockName,
           'ownerId': ownerId,
           'acquiredAtMs': nowMs,
-          'expiresAtMs': nowMs + leaseDurationMs,
+          'expiresAtMs': nowMs + ttlMs,
         },
         conflictAlgorithm: ConflictAlgorithm.replace,
       );
@@ -351,171 +261,156 @@ class PersistenceDatabase {
     });
   }
 
-  Future<void> releaseExecutionLock(String ownerId) async {
+  Future<void> releaseExecutionLock({
+    required String lockName,
+    required String ownerId,
+  }) async {
     final db = await database;
+    if (db == null) {
+      if (_inMemoryLocks[lockName]?['ownerId'] == ownerId) {
+        _inMemoryLocks.remove(lockName);
+      }
+      return;
+    }
     await db.delete(
       'execution_locks',
       where: 'lockName = ? AND ownerId = ?',
-      whereArgs: ['AUTHORITATIVE_ENGINE_LOCK', ownerId],
+      whereArgs: [lockName, ownerId],
     );
   }
 
-  Future<void> saveFullState({
-    required PaperBroker broker,
-    required BotEngineState botState,
-    required Map<String, double> latestPrices,
-    Map<String, double>? closedCandlePrices,
-    Map<String, double>? liveTickerPrices,
-    MarketDataStatus marketDataStatus = MarketDataStatus.connected,
-    String statusBannerMessage = '',
-    int? lastMarketDataUpdateMs,
-    int? lastHeartbeatMs,
-    Map<String, StrategyEvaluationResult>? latestEvaluations,
-    int? nowOverrideMs,
+  Future<void> saveRecoveryState({
+    required int attemptCount,
+    required int recoveryStartedAtMs,
+    required int nextRecoveryAllowedAtMs,
+    required String logMessage,
   }) async {
+    await putKv('recoveryAttemptCount', jsonEncode(attemptCount));
+    await putKv('recoveryStartedAtMs', jsonEncode(recoveryStartedAtMs));
+    await putKv('nextRecoveryAllowedAtMs', jsonEncode(nextRecoveryAllowedAtMs));
+
+    final rawLogs = await getKv('recoveryLogs');
+    final logs = <String>[];
+    if (rawLogs != null) {
+      try {
+        final decoded = jsonDecode(rawLogs);
+        if (decoded is List) {
+          logs.addAll(decoded.map((e) => e.toString()));
+        }
+      } catch (_) {}
+    }
+    logs.insert(0, logMessage);
+    if (logs.length > 25) {
+      logs.removeRange(25, logs.length);
+    }
+    await putKv('recoveryLogs', jsonEncode(logs));
+  }
+
+  Future<void> clearRecoveryState() async {
+    await putKv('recoveryAttemptCount', jsonEncode(0));
+    await putKv('recoveryStartedAtMs', jsonEncode(null));
+    await putKv('nextRecoveryAllowedAtMs', jsonEncode(null));
+  }
+
+  Future<bool> getTradeAlertsEnabled() async {
+    final raw = await getKv('tradeAlertsEnabled');
+    if (raw == null) return true;
+    return raw == 'true';
+  }
+
+  Future<void> setTradeAlertsEnabled(bool enabled) async {
+    await putKv('tradeAlertsEnabled', enabled ? 'true' : 'false');
+  }
+
+  Future<Set<String>> getNotifiedAlertIds() async {
+    final raw = await getKv('notifiedAlertIds');
+    if (raw == null) return {};
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is List) {
+        return decoded.map((e) => e.toString()).toSet();
+      }
+    } catch (_) {}
+    return {};
+  }
+
+  Future<void> markAlertIdNotified(String alertId) async {
+    final current = await getNotifiedAlertIds();
+    current.add(alertId);
+    final list = current.toList();
+    if (list.length > 200) {
+      list.removeRange(0, list.length - 200);
+    }
+    await putKv('notifiedAlertIds', jsonEncode(list));
+  }
+
+  Future<void> saveFullState({
+    required BotEngineState botState,
+    UserSessionIntention? userIntention,
+    required double availableCashUsdt,
+    required double accountEquityUsdt,
+    required bool maxDrawdownLocked,
+    String? lockedDailyLossUtcDate,
+    int? lastStopLossClosedAtMs,
+    int? lastHeartbeatMs,
+    int? lastMarketDataUpdateMs,
+    int? runningSinceMs,
+    int totalActiveMs = 0,
+    required String statusBannerMessage,
+    Map<String, double> liveTickerPrices = const {},
+    Map<String, LiveMarketTicker> liveTickers = const {},
+    Map<String, double> closedCandlePrices = const {},
+    Map<String, String> whyNoTradeForSymbol = const {},
+    required List<PaperPosition> openPositions,
+    required List<SimulatedOrder> orders,
+    required List<ClosedPaperTrade> closedTrades,
+    required Set<String> processedEntrySignalKeys,
+  }) async {
+    await putKv('botState', botState.name);
+    if (userIntention != null) {
+      await putKv('userIntention', userIntention.name);
+    }
+    await putKv('availableCashUsdt', jsonEncode(availableCashUsdt));
+    await putKv('accountEquityUsdt', jsonEncode(accountEquityUsdt));
+    await putKv('maxDrawdownLocked', jsonEncode(maxDrawdownLocked));
+    await putKv('lockedDailyLossUtcDate', jsonEncode(lockedDailyLossUtcDate));
+    await putKv('lastStopLossClosedAtMs', jsonEncode(lastStopLossClosedAtMs));
+    if (lastHeartbeatMs != null) {
+      await putKv('lastHeartbeatMs', jsonEncode(lastHeartbeatMs));
+    }
+    if (lastMarketDataUpdateMs != null) {
+      await putKv('lastMarketDataUpdateMs', jsonEncode(lastMarketDataUpdateMs));
+    }
+    await putKv('runningSinceMs', jsonEncode(runningSinceMs));
+    await putKv('totalActiveMs', jsonEncode(totalActiveMs));
+    await putKv('statusBannerMessage', statusBannerMessage);
+    await putKv('liveTickerPrices', jsonEncode(liveTickerPrices));
+    await putKv(
+      'liveTickers',
+      jsonEncode({for (final e in liveTickers.entries) e.key: e.value.toMap()}),
+    );
+    await putKv('closedCandlePrices', jsonEncode(closedCandlePrices));
+    await putKv('whyNoTradeForSymbol', jsonEncode(whyNoTradeForSymbol));
+
+    _inMemoryOpenPositions
+      ..clear()
+      ..addAll(openPositions);
+    _inMemoryOrders
+      ..clear()
+      ..addAll(orders);
+    _inMemoryClosedTrades
+      ..clear()
+      ..addAll(closedTrades);
+    _inMemoryProcessedKeys
+      ..clear()
+      ..addAll(processedEntrySignalKeys);
+
     final db = await database;
-    final nowMs =
-        nowOverrideMs ?? DateTime.now().toUtc().millisecondsSinceEpoch;
-    broker.ensureUtcDayBaseline(nowMs, latestPrices);
+    if (db == null) return;
 
     await db.transaction((txn) async {
-      Future<void> putKv(String k, Object v) async {
-        await txn.insert(
-          'engine_kv_state',
-          {'key': k, 'value': jsonEncode(v)},
-          conflictAlgorithm: ConflictAlgorithm.replace,
-        );
-      }
-
-      await putKv('availableCashUsdt', broker.availableCashUsdt);
-      await putKv('realizedPnlUsdt', broker.realizedPnlUsdt);
-      await putKv('unrealizedPnlUsdt', broker.unrealizedPnl(latestPrices));
-      await putKv('accountEquityUsdt', broker.accountEquity(latestPrices));
-      await putKv('currentUtcDateKey', broker.currentUtcDateKey);
-      await putKv('startOfDayEquityUsdt', broker.startOfDayEquityUsdt);
-      await putKv('dailyStartEquityByUtcDate', broker.dailyStartEquityByUtcDate);
-      await putKv('maxDrawdownLocked', broker.maxDrawdownLocked);
-      await putKv(
-          'pendingEmergencyLiquidation', broker.pendingEmergencyLiquidation);
-      await putKv('lockedDailyLossUtcDate', broker.lockedDailyLossUtcDate ?? '');
-      await putKv('botState', botState.name);
-      await putKv('marketDataStatus', marketDataStatus.name);
-      if (statusBannerMessage.isNotEmpty) {
-        await putKv('statusBannerMessage', statusBannerMessage);
-      }
-      if (lastMarketDataUpdateMs != null) {
-        await putKv('lastMarketDataUpdateMs', lastMarketDataUpdateMs);
-      }
-      if (lastHeartbeatMs != null) {
-        await putKv('lastHeartbeatMs', lastHeartbeatMs);
-      }
-      // Item 2: Active timer tracking in engine_kv_state (runningSinceMs, totalActiveMs, lastSessionDurationMs)
-      final timerRows = await txn.query(
-        'engine_kv_state',
-        where: 'key IN (?, ?, ?, ?)',
-        whereArgs: [
-          'runningSinceMs',
-          'totalActiveMs',
-          'lastSessionDurationMs',
-          'latestEvaluations',
-        ],
-      );
-      final timerKv = <String, dynamic>{
-        for (final r in timerRows)
-          r['key'] as String: jsonDecode(r['value'] as String),
-      };
-      final rawRunningSince = (timerKv['runningSinceMs'] as num?)?.toInt() ?? 0;
-      int? runningSinceMs = rawRunningSince > 0 ? rawRunningSince : null;
-      int totalActiveMs = (timerKv['totalActiveMs'] as num?)?.toInt() ?? 0;
-      int lastSessionDurationMs =
-          (timerKv['lastSessionDurationMs'] as num?)?.toInt() ?? 0;
-
-      if (botState == BotEngineState.running) {
-        runningSinceMs ??= nowMs;
-      } else {
-        if (runningSinceMs != null) {
-          final elapsed = nowMs > runningSinceMs ? (nowMs - runningSinceMs) : 0;
-          totalActiveMs += elapsed;
-          lastSessionDurationMs = elapsed;
-          runningSinceMs = null;
-        }
-      }
-      await putKv('runningSinceMs', runningSinceMs ?? 0);
-      await putKv('totalActiveMs', totalActiveMs);
-      await putKv('lastSessionDurationMs', lastSessionDurationMs);
-
-      await putKv('latestPrices', latestPrices);
-      if (closedCandlePrices != null) {
-        await putKv('closedCandlePrices', closedCandlePrices);
-      }
-      if (liveTickerPrices != null) {
-        await putKv('liveTickerPrices', liveTickerPrices);
-      }
-      if (latestEvaluations != null) {
-        final prevEvals = <String, StrategyEvaluationResult>{};
-        if (timerKv['latestEvaluations'] is Map) {
-          (timerKv['latestEvaluations'] as Map).forEach((k, v) {
-            if (v is Map) {
-              prevEvals[k.toString()] = StrategyEvaluationResult.fromMap(
-                Map<String, dynamic>.from(v),
-              );
-            }
-          });
-        }
-        final evalMap = <String, dynamic>{};
-        latestEvaluations.forEach((k, v) {
-          final prev = prevEvals[k];
-          if (v.ema20_15m == null &&
-              prev != null &&
-              prev.ema20_15m != null &&
-              v.description != 'INSUFFICIENT CANDLE HISTORY FOR EMA 50' &&
-              v.description != 'INDICATORS WARMING UP') {
-            evalMap[k] = StrategyEvaluationResult(
-              signalType: v.signalType,
-              description: v.description,
-              evaluatedCandleCloseMs: v.evaluatedCandleCloseMs,
-              ema20_15m: prev.ema20_15m,
-              ema50_15m: prev.ema50_15m,
-              rsi14_15m: prev.rsi14_15m,
-              atr14_15m: prev.atr14_15m,
-              ema20_1h: prev.ema20_1h,
-              ema50_1h: prev.ema50_1h,
-              higherTimeframeBullish: prev.higherTimeframeBullish,
-            ).toMap();
-          } else {
-            evalMap[k] = v.toMap();
-          }
-        });
-        await putKv('latestEvaluations', evalMap);
-      }
-      await putKv('strategyConfig', broker.strategyConfig.toMap());
-      await putKv('riskConfig', broker.riskConfig.toMap());
-      await putKv('dailyRealizedPnl', broker.dailyRealizedPnlByUtcDate);
-      await putKv(
-        'lastProcessedCandleCloseMs',
-        broker.lastProcessedCandleCloseMs,
-      );
-      await putKv(
-        'processedEntrySignalKeys',
-        broker.processedEntrySignalKeys.toList(),
-      );
-
-      final serializedPending = <String, Map<String, dynamic>>{};
-      broker.pendingSignalsBySymbol.forEach((sym, sig) {
-        serializedPending[sym] = sig.toMap();
-      });
-      await putKv('pendingSignalsBySymbol', serializedPending);
-
-      for (final sigKey in broker.processedEntrySignalKeys) {
-        await txn.insert(
-          'processed_signal_keys',
-          {'signalKey': sigKey, 'processedAtMs': nowMs},
-          conflictAlgorithm: ConflictAlgorithm.ignore,
-        );
-      }
-
       await txn.delete('open_positions');
-      for (final pos in broker.openPositions.values) {
+      for (final pos in openPositions) {
         await txn.insert(
           'open_positions',
           pos.toMap(),
@@ -523,277 +418,203 @@ class PersistenceDatabase {
         );
       }
 
-      for (final trade in broker.closedTrades) {
-        await txn.insert(
-          'closed_trades',
-          trade.toMap(),
-          conflictAlgorithm: ConflictAlgorithm.replace,
-        );
-      }
-
-      for (final order in broker.orderHistory) {
+      for (final ord in orders.take(100)) {
         await txn.insert(
           'orders',
-          order.toMap(),
+          ord.toMap(),
           conflictAlgorithm: ConflictAlgorithm.replace,
         );
       }
 
-      await txn.insert(
-        'equity_snapshots',
-        {
-          'timestampMs': nowMs,
-          'equityUsdt': broker.accountEquity(latestPrices),
-          'availableCashUsdt': broker.availableCashUsdt,
-        },
-        conflictAlgorithm: ConflictAlgorithm.replace,
-      );
+      for (final trd in closedTrades.take(100)) {
+        await txn.insert(
+          'closed_trades',
+          trd.toMap(),
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+      }
+
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      for (final key in processedEntrySignalKeys) {
+        await txn.insert(
+          'processed_signal_keys',
+          {'signalKey': key, 'processedAtMs': nowMs},
+          conflictAlgorithm: ConflictAlgorithm.ignore,
+        );
+      }
     });
   }
 
-  /// Restores state into `broker` and returns the full `PersistedEngineSnapshot`.
-  /// CRITICAL: Never silently resets an existing account if a corrupt JSON or SQLite error occurs;
-  /// any restoration error is thrown to the caller so the engine pauses safely without wiping state.
-  Future<PersistedEngineSnapshot> restoreFullSnapshot(PaperBroker broker) async {
+  Future<PersistedEngineSnapshot> loadFullState() async {
     final db = await database;
-    final kvRows = await db.query('engine_kv_state');
-    if (kvRows.isEmpty) {
-      return const PersistedEngineSnapshot(
-        botState: BotEngineState.stopped,
-        marketDataStatus: MarketDataStatus.disconnected,
-        statusBannerMessage: 'ENGINE STOPPED — PRESS START TO RUN PAPER BOT',
-        latestPrices: {'BTCUSDT': 0.0, 'ETHUSDT': 0.0},
-        latestEvaluations: {},
-        tradeAlertsEnabled: true,
-        notifiedAlertIds: {},
-      );
-    }
+    final kv = <String, String>{..._inMemoryKv};
+    List<PaperPosition> openPos = List.from(_inMemoryOpenPositions);
+    List<SimulatedOrder> ordList = List.from(_inMemoryOrders);
+    List<ClosedPaperTrade> trdList = List.from(_inMemoryClosedTrades);
+    Set<String> sigKeys = Set.from(_inMemoryProcessedKeys);
 
-    final kv = <String, dynamic>{
-      for (final r in kvRows)
-        r['key'] as String: jsonDecode(r['value'] as String),
-    };
-
-    if (kv['strategyConfig'] is Map) {
-      broker.strategyConfig = StrategyConfig.fromMap(
-        Map<String, dynamic>.from(kv['strategyConfig'] as Map),
-      );
-    }
-    if (kv['riskConfig'] is Map) {
-      broker.riskConfig = RiskConfig.fromMap(
-        Map<String, dynamic>.from(kv['riskConfig'] as Map),
-      );
-    }
-
-    broker.availableCashUsdt =
-        (kv['availableCashUsdt'] as num?)?.toDouble() ??
-            broker.riskConfig.initialCapitalUsdt;
-    broker.realizedPnlUsdt =
-        (kv['realizedPnlUsdt'] as num?)?.toDouble() ?? 0.0;
-    broker.currentUtcDateKey = (kv['currentUtcDateKey'] as String?) ?? '';
-    broker.startOfDayEquityUsdt =
-        (kv['startOfDayEquityUsdt'] as num?)?.toDouble() ??
-            broker.riskConfig.initialCapitalUsdt;
-
-    broker.dailyStartEquityByUtcDate.clear();
-    if (kv['dailyStartEquityByUtcDate'] is Map) {
-      (kv['dailyStartEquityByUtcDate'] as Map).forEach((k, v) {
-        broker.dailyStartEquityByUtcDate[k.toString()] = (v as num).toDouble();
-      });
-    }
-
-    broker.maxDrawdownLocked = (kv['maxDrawdownLocked'] as bool?) ?? false;
-    broker.pendingEmergencyLiquidation =
-        (kv['pendingEmergencyLiquidation'] as bool?) ?? false;
-    final lockedDay = (kv['lockedDailyLossUtcDate'] as String?) ?? '';
-    broker.lockedDailyLossUtcDate = lockedDay.isEmpty ? null : lockedDay;
-
-    broker.dailyRealizedPnlByUtcDate.clear();
-    if (kv['dailyRealizedPnl'] is Map) {
-      (kv['dailyRealizedPnl'] as Map).forEach((k, v) {
-        broker.dailyRealizedPnlByUtcDate[k.toString()] = (v as num).toDouble();
-      });
-    }
-
-    broker.lastProcessedCandleCloseMs.clear();
-    if (kv['lastProcessedCandleCloseMs'] is Map) {
-      (kv['lastProcessedCandleCloseMs'] as Map).forEach((k, v) {
-        broker.lastProcessedCandleCloseMs[k.toString()] = (v as num).toInt();
-      });
-    }
-
-    broker.processedEntrySignalKeys.clear();
-    if (kv['processedEntrySignalKeys'] is List) {
-      for (final item in (kv['processedEntrySignalKeys'] as List)) {
-        broker.processedEntrySignalKeys.add(item.toString());
+    if (db != null) {
+      final kvRows = await db.query('engine_kv_state');
+      for (final r in kvRows) {
+        kv[r['key'] as String] = r['value'] as String;
       }
-    }
-    final sigKeyRows = await db.query('processed_signal_keys');
-    for (final row in sigKeyRows) {
-      broker.processedEntrySignalKeys.add(row['signalKey'] as String);
+      final posRows =
+          await db.query('open_positions', orderBy: 'openedAtMs DESC');
+      openPos = posRows.map((r) => PaperPosition.fromMap(r)).toList();
+
+      final ordRows =
+          await db.query('orders', orderBy: 'executedAtMs DESC', limit: 100);
+      ordList = ordRows.map((r) => SimulatedOrder.fromMap(r)).toList();
+
+      final trdRows = await db.query('closed_trades',
+          orderBy: 'closedAtMs DESC', limit: 100);
+      trdList = trdRows.map((r) => ClosedPaperTrade.fromMap(r)).toList();
+
+      final keyRows = await db.query('processed_signal_keys');
+      sigKeys = keyRows.map((r) => r['signalKey'] as String).toSet();
     }
 
-    broker.pendingSignalsBySymbol.clear();
-    if (kv['pendingSignalsBySymbol'] is Map) {
-      (kv['pendingSignalsBySymbol'] as Map).forEach((k, v) {
-        if (v is Map) {
-          broker.pendingSignalsBySymbol[k.toString()] =
-              PendingEntrySignal.fromMap(Map<String, dynamic>.from(v));
-        }
-      });
-    }
-
-    broker.openPositions.clear();
-    final openRows = await db.query('open_positions');
-    for (final row in openRows) {
-      final pos = PaperPosition.fromMap(row);
-      broker.openPositions[pos.symbol] = pos;
-    }
-
-    broker.closedTrades.clear();
-    final tradeRows =
-        await db.query('closed_trades', orderBy: 'closedAtMs DESC');
-    for (final row in tradeRows) {
-      broker.closedTrades.add(ClosedPaperTrade.fromMap(row));
-    }
-
-    broker.orderHistory.clear();
-    final orderRows = await db.query('orders', orderBy: 'executedAtMs DESC');
-    for (final row in orderRows) {
-      broker.orderHistory.add(SimulatedOrder.fromMap(row));
-    }
-
-    final stateName = (kv['botState'] as String?) ?? BotEngineState.stopped.name;
+    final stateName = kv['botState'] ?? BotEngineState.stopped.name;
     final botState = BotEngineState.values.firstWhere(
       (e) => e.name == stateName,
       orElse: () => BotEngineState.stopped,
     );
 
-    final mktName = (kv['marketDataStatus'] as String?) ??
-        MarketDataStatus.disconnected.name;
-    final mktStatus = MarketDataStatus.values.firstWhere(
-      (e) => e.name == mktName,
-      orElse: () => MarketDataStatus.disconnected,
+    final intentionName = kv['userIntention'] ??
+        (botState == BotEngineState.running
+            ? UserSessionIntention.running.name
+            : (botState == BotEngineState.stopped ||
+                    botState == BotEngineState.stoppedMaxDrawdownReached
+                ? UserSessionIntention.stopped.name
+                : UserSessionIntention.running.name));
+    final userIntention = UserSessionIntention.values.firstWhere(
+      (e) => e.name == intentionName,
+      orElse: () => UserSessionIntention.stopped,
     );
 
-    final banner = (kv['statusBannerMessage'] as String?) ??
-        'ENGINE STOPPED — PRESS START TO RUN PAPER BOT';
-    final lastUpdateMs = (kv['lastMarketDataUpdateMs'] as num?)?.toInt();
-
-    final restoredPrices = <String, double>{
-      'BTCUSDT': 0.0,
-      'ETHUSDT': 0.0,
-    };
-    if (kv['latestPrices'] is Map) {
-      (kv['latestPrices'] as Map).forEach((k, v) {
-        restoredPrices[k.toString()] = (v as num).toDouble();
-      });
-    }
-
-    final restoredEvals = <String, StrategyEvaluationResult>{};
-    if (kv['latestEvaluations'] is Map) {
-      (kv['latestEvaluations'] as Map).forEach((k, v) {
-        if (v is Map) {
-          restoredEvals[k.toString()] = StrategyEvaluationResult.fromMap(
-            Map<String, dynamic>.from(v),
-          );
-        }
-      });
-    }
-
-    final restoredClosedPrices = <String, double>{
-      'BTCUSDT': restoredPrices['BTCUSDT'] ?? 0.0,
-      'ETHUSDT': restoredPrices['ETHUSDT'] ?? 0.0,
-    };
-    if (kv['closedCandlePrices'] is Map) {
-      (kv['closedCandlePrices'] as Map).forEach((k, v) {
-        if (v is num) {
-          restoredClosedPrices[k.toString()] = v.toDouble();
-        }
-      });
-    }
-
-    final restoredLiveTickers = <String, double>{};
-    if (kv['liveTickerPrices'] is Map) {
-      (kv['liveTickerPrices'] as Map).forEach((k, v) {
-        if (v is num) {
-          restoredLiveTickers[k.toString()] = v.toDouble();
-        }
-      });
-    }
-
-    final rawRunningSince = (kv['runningSinceMs'] as num?)?.toInt() ?? 0;
-    final runningSinceMs = rawRunningSince > 0 ? rawRunningSince : null;
-    final totalActiveMs = (kv['totalActiveMs'] as num?)?.toInt() ?? 0;
-    final lastSessionDurationMs =
-        (kv['lastSessionDurationMs'] as num?)?.toInt() ?? 0;
-
-    final rawHb = (kv['lastHeartbeatMs'] as num?)?.toInt() ?? 0;
-    final lastHeartbeatMs = rawHb > 0 ? rawHb : null;
-
-    final rawRecStart = (kv['recoveryStartedAtMs'] as num?)?.toInt() ?? 0;
-    final recoveryStartedAtMs = rawRecStart > 0 ? rawRecStart : null;
-    final recoveryAttemptCount =
-        (kv['recoveryAttemptCount'] as num?)?.toInt() ?? 0;
-    final rawNextRec = (kv['nextRecoveryAllowedAtMs'] as num?)?.toInt() ?? 0;
-    final nextRecoveryAllowedAtMs = rawNextRec > 0 ? rawNextRec : null;
-    final recoveryLogs = <String>[];
-    if (kv['recoveryLogs'] is List) {
-      for (final item in (kv['recoveryLogs'] as List)) {
-        recoveryLogs.add(item.toString());
+    double parseDouble(String key, double fallback) {
+      final raw = kv[key];
+      if (raw == null) return fallback;
+      try {
+        return (jsonDecode(raw) as num).toDouble();
+      } catch (_) {
+        return double.tryParse(raw) ?? fallback;
       }
     }
 
-    final alertsEnabled = (kv['tradeAlertsEnabled'] as bool?) ?? true;
-    final notifiedIds = <String>{};
-    if (kv['notifiedAlertIds'] is List) {
-      for (final item in (kv['notifiedAlertIds'] as List)) {
-        notifiedIds.add(item.toString());
+    int? parseIntOrNull(String key) {
+      final raw = kv[key];
+      if (raw == null || raw == 'null') return null;
+      try {
+        return (jsonDecode(raw) as num?)?.toInt();
+      } catch (_) {
+        return int.tryParse(raw);
+      }
+    }
+
+    bool parseBool(String key, bool fallback) {
+      final raw = kv[key];
+      if (raw == null) return fallback;
+      return raw == 'true';
+    }
+
+    Map<String, double> parsePriceMap(String key) {
+      final raw = kv[key];
+      if (raw == null) return {};
+      try {
+        final decoded = jsonDecode(raw);
+        if (decoded is Map) {
+          return {
+            for (final e in decoded.entries)
+              e.key.toString(): (e.value as num).toDouble(),
+          };
+        }
+      } catch (_) {}
+      return {};
+    }
+
+    Map<String, LiveMarketTicker> parseTickerMap(String key) {
+      final raw = kv[key];
+      if (raw == null) return {};
+      try {
+        final decoded = jsonDecode(raw);
+        if (decoded is Map) {
+          return {
+            for (final e in decoded.entries)
+              if (e.value is Map)
+                e.key.toString(): LiveMarketTicker.fromMap(
+                  Map<String, dynamic>.from(e.value as Map),
+                ),
+          };
+        }
+      } catch (_) {}
+      return {};
+    }
+
+    Map<String, String> parseStringMap(String key) {
+      final raw = kv[key];
+      if (raw == null) return {};
+      try {
+        final decoded = jsonDecode(raw);
+        if (decoded is Map) {
+          return {
+            for (final e in decoded.entries)
+              e.key.toString(): e.value.toString(),
+          };
+        }
+      } catch (_) {}
+      return {};
+    }
+
+    List<String> parseStringList(String key) {
+      final raw = kv[key];
+      if (raw == null) return [];
+      try {
+        final decoded = jsonDecode(raw);
+        if (decoded is List) {
+          return decoded.map((e) => e.toString()).toList();
+        }
+      } catch (_) {}
+      return [];
+    }
+
+    String? parseStringOrNull(String key) {
+      final raw = kv[key];
+      if (raw == null || raw == 'null') return null;
+      try {
+        return jsonDecode(raw)?.toString();
+      } catch (_) {
+        return raw;
       }
     }
 
     return PersistedEngineSnapshot(
       botState: botState,
-      marketDataStatus: mktStatus,
-      statusBannerMessage: banner,
-      lastMarketDataUpdateMs: lastUpdateMs,
-      lastHeartbeatMs: lastHeartbeatMs,
-      latestPrices: restoredPrices,
-      closedCandlePrices: restoredClosedPrices,
-      liveTickerPrices: restoredLiveTickers,
-      latestEvaluations: restoredEvals,
-      tradeAlertsEnabled: alertsEnabled,
-      notifiedAlertIds: notifiedIds,
-      runningSinceMs: runningSinceMs,
-      totalActiveMs: totalActiveMs,
-      lastSessionDurationMs: lastSessionDurationMs,
-      recoveryStartedAtMs: recoveryStartedAtMs,
-      recoveryAttemptCount: recoveryAttemptCount,
-      nextRecoveryAllowedAtMs: nextRecoveryAllowedAtMs,
-      recoveryLogs: recoveryLogs,
+      userIntention: userIntention,
+      availableCashUsdt: parseDouble('availableCashUsdt', 100.0),
+      accountEquityUsdt: parseDouble('accountEquityUsdt', 100.0),
+      maxDrawdownLocked: parseBool('maxDrawdownLocked', false),
+      lockedDailyLossUtcDate: parseStringOrNull('lockedDailyLossUtcDate'),
+      lastStopLossClosedAtMs: parseIntOrNull('lastStopLossClosedAtMs'),
+      lastHeartbeatMs: parseIntOrNull('lastHeartbeatMs'),
+      lastMarketDataUpdateMs: parseIntOrNull('lastMarketDataUpdateMs'),
+      runningSinceMs: parseIntOrNull('runningSinceMs'),
+      totalActiveMs: parseIntOrNull('totalActiveMs') ?? 0,
+      statusBannerMessage:
+          kv['statusBannerMessage'] ?? 'PAPER BOT STOPPED — PRESS START',
+      tradeAlertsEnabled: parseBool('tradeAlertsEnabled', true),
+      liveTickerPrices: parsePriceMap('liveTickerPrices'),
+      liveTickers: parseTickerMap('liveTickers'),
+      closedCandlePrices: parsePriceMap('closedCandlePrices'),
+      whyNoTradeForSymbol: parseStringMap('whyNoTradeForSymbol'),
+      openPositions: openPos,
+      orders: ordList,
+      closedTrades: trdList,
+      processedEntrySignalKeys: sigKeys,
+      recoveryAttemptCount: parseIntOrNull('recoveryAttemptCount') ?? 0,
+      recoveryStartedAtMs: parseIntOrNull('recoveryStartedAtMs'),
+      nextRecoveryAllowedAtMs: parseIntOrNull('nextRecoveryAllowedAtMs'),
+      recoveryLogs: parseStringList('recoveryLogs'),
     );
-  }
-
-  Future<BotEngineState> restoreIntoBroker(PaperBroker broker) async {
-    final snap = await restoreFullSnapshot(broker);
-    return snap.botState;
-  }
-
-  Future<void> clearAllTables() async {
-    final db = await database;
-    final alertsEnabled = await getTradeAlertsEnabled();
-    await db.delete('engine_kv_state');
-    await db.delete('open_positions');
-    await db.delete('closed_trades');
-    await db.delete('orders');
-    await db.delete('equity_snapshots');
-    await db.delete('execution_locks');
-    await db.delete('processed_signal_keys');
-    await setTradeAlertsEnabled(alertsEnabled);
-  }
-
-  Future<void> close() async {
-    await _db?.close();
-    _db = null;
   }
 }

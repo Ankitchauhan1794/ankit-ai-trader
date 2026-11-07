@@ -17,17 +17,22 @@ class WatchdogWorker(context: Context, params: WorkerParameters) : Worker(contex
         val lastHeartbeat = prefs.getLong("last_heartbeat", 0L)
         val now = System.currentTimeMillis()
 
-        if (engineState == "RUNNING" && (now - lastHeartbeat > 10 * 60 * 1000L)) {
+        if (engineState == "RUNNING" &&
+            (!TradingForegroundService.isRunning ||
+                !TradingForegroundService.isDartEngineInitialized ||
+                (now - lastHeartbeat > 5 * 60 * 1000L))
+        ) {
             try {
-                val serviceIntent = Intent(applicationContext, TradingForegroundService::class.java)
+                val serviceIntent = Intent(applicationContext, TradingForegroundService::class.java).apply {
+                    action = TradingForegroundService.ACTION_START
+                }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     applicationContext.startForegroundService(serviceIntent)
                 } else {
                     applicationContext.startService(serviceIntent)
                 }
             } catch (e: Exception) {
-                // ForegroundServiceStartNotAllowedException or general exception fallback notification
-                showFallbackNotification("Ankit AI Trader stopped — tap to restart")
+                showFallbackNotification("Ankit AI Trader stopped – tap to restart")
             }
         }
         return Result.success()
@@ -37,11 +42,20 @@ class WatchdogWorker(context: Context, params: WorkerParameters) : Worker(contex
         val channelId = "watchdog_channel"
         val manager = applicationContext.getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(channelId, "Watchdog Alerts", NotificationManager.IMPORTANCE_HIGH)
+            val channel = NotificationChannel(
+                channelId,
+                "Watchdog Alerts",
+                NotificationManager.IMPORTANCE_HIGH
+            )
             manager?.createNotificationChannel(channel)
         }
         val intent = Intent(applicationContext, MainActivity::class.java)
-        val pendingIntent = PendingIntent.getActivity(applicationContext, 0, intent, PendingIntent.FLAG_IMMUTABLE)
+        val pendingIntent = PendingIntent.getActivity(
+            applicationContext,
+            0,
+            intent,
+            PendingIntent.FLAG_IMMUTABLE
+        )
 
         val notification = NotificationCompat.Builder(applicationContext, channelId)
             .setContentTitle("Ankit AI Trader Watchdog")

@@ -1,4 +1,45 @@
-// Added WorkManager dependency
+plugins {
+    id "com.android.application"
+    id "kotlin-android"
+    id "dev.flutter.flutter-gradle-plugin"
+}
+
+android {
+    namespace = "com.ankit.aitrader"
+    compileSdk = 35
+    ndkVersion = flutter.ndkVersion
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = JavaVersion.VERSION_17
+    }
+
+    defaultConfig {
+        applicationId = "com.ankit.aitrader"
+        minSdk = 23
+        targetSdk = 35
+        versionCode = 15
+        versionName = "1.5.0-phase1-final"
+    }
+
+    buildTypes {
+        release {
+            signingConfig = signingConfigs.debug
+            minifyEnabled = false
+            shrinkResources = false
+        }
+    }
+}
+
+flutter {
+    source = "../.."
+}
+
 dependencies {
-    implementation 'androidx.work:work-runtime-ktx:2.9.0'
+    implementation "androidx.core:core-ktx:1.13.1"
+    implementation "androidx.work:work-runtime-ktx:2.9.1"
 }
