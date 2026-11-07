@@ -5,7 +5,6 @@ import 'package:ankit_ai_trader/services/coindcx_market_service.dart';
 import 'package:ankit_ai_trader/services/paper_broker.dart';
 import 'package:ankit_ai_trader/services/persistence_db.dart';
 import 'package:ankit_ai_trader/services/risk_manager.dart';
-import 'package:ankit_ai_trader/services/strategy_engine.dart';
 import 'package:ankit_ai_trader/services/trading_coordinator.dart';
 
 class _FakeCommandBridge implements EngineCommandBridge {
@@ -55,7 +54,7 @@ void main() {
       availableCashUsdt: 100.0,
       accountEquityUsdt: 100.0,
       maxDrawdownLocked: false,
-      lastHeartbeatMs: 1000, // Stale heartbeat
+      lastHeartbeatMs: 1000,
       statusBannerMessage: 'RUNNING',
       openPositions: const [],
       orders: const [],
@@ -67,7 +66,7 @@ void main() {
     final coordinator = TradingCoordinator(
       persistence: db,
       commandBridge: bridge,
-      nowMsProvider: () => 900000, // 15 minutes later
+      nowMsProvider: () => 900000,
     );
 
     await coordinator.refreshStateFromDatabase(isInitialLoad: true);
@@ -76,6 +75,9 @@ void main() {
     expect(coordinator.engineState, BotEngineState.running);
     expect(bridge.ensureServiceStartCalls, 1);
     expect(bridge.dispatchedCommands, contains('START'));
+
+    coordinator.dispose();
+    await db.close();
   });
 
   test('Stage 10: CoinDCX REST ticker parser extracts lastPrice, bid, ask, 24h high/low, volume and change', () {
@@ -120,6 +122,8 @@ void main() {
     expect(btc.low24h, closeTo(89800.00, 1e-6));
     expect(btc.volume24h, closeTo(1540.25, 1e-6));
     expect(btc.change24hPct, closeTo(2.45, 1e-6));
+
+    service.dispose();
   });
 
   test('Stages 17–19: PaperBroker enforces conservative SL-first intrabar exits, fees, slippage, and max drawdown lock', () {
@@ -144,7 +148,6 @@ void main() {
     );
 
     final newOrders = <SimulatedOrder>[];
-    // Candle touches BOTH stopLoss (89000) and takeProfit (92000)
     final bothTouchedCandle = const Candle(
       openTimeMs: 2000,
       closeTimeMs: 3000,

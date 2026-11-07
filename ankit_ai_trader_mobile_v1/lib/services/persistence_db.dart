@@ -617,4 +617,12 @@ class PersistenceDatabase {
       recoveryLogs: parseStringList('recoveryLogs'),
     );
   }
+
+  Future<void> close() async {
+    final db = _db;
+    _db = null;
+    if (db != null && db.isOpen) {
+      await db.close();
+    }
+  }
 }
