@@ -19,6 +19,13 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore original Gradle & pubspec files from feature/self-healing-background
+        run: |
+          git checkout origin/feature/self-healing-background -- pubspec.yaml pubspec.lock analysis_options.yaml android/build.gradle android/settings.gradle android/gradle.properties android/app/build.gradle android/app/src/main/res 2>/dev/null || true
+          rm -f android/app/src/main/kotlin/com/ankit/aitrader/WatchdogWorker.kt
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -26,15 +33,12 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Set up Flutter
+      - name: Set up Flutter 3.27.4
         uses: subosito/flutter-action@v2
         with:
+          flutter-version: '3.27.4'
           channel: 'stable'
           cache: true
-
-      - name: Ensure Android launcher icons & wrapper
-        run: |
-          flutter create . --project-name ankit_ai_trader --org com.ankit --platforms android
 
       - name: Install dependencies
         run: flutter pub get

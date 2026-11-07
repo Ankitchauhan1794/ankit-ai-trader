@@ -14,7 +14,6 @@ import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
-import androidx.core.app.ActivityCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -161,8 +160,7 @@ class MainActivity : FlutterActivity() {
                         if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
                             PackageManager.PERMISSION_GRANTED
                         ) {
-                            ActivityCompat.requestPermissions(
-                                this,
+                            requestPermissions(
                                 arrayOf(android.Manifest.permission.POST_NOTIFICATIONS),
                                 REQ_POST_NOTIFICATIONS
                             )

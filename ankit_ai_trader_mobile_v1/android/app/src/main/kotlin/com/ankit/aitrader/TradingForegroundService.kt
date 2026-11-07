@@ -20,14 +20,10 @@ import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
-import androidx.work.ExistingPeriodicWorkPolicy
-import androidx.work.PeriodicWorkRequestBuilder
-import androidx.work.WorkManager
 import io.flutter.FlutterInjector
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.engine.dart.DartExecutor
 import io.flutter.plugin.common.MethodChannel
-import java.util.concurrent.TimeUnit
 
 class TradingForegroundService : Service() {
 
@@ -163,7 +159,6 @@ class TradingForegroundService : Service() {
                 if (channel != null && isDartEngineInitialized) {
                     var responded = false
                     val tickTimestamp = System.currentTimeMillis()
-                    // Guard against hung Dart isolate (15s timeout)
                     handler.postDelayed({
                         if (!responded && isRunning) {
                             consecutiveTickFailures++
@@ -244,7 +239,6 @@ class TradingForegroundService : Service() {
             isRunning = true
             lastNativeHeartbeatEpochMs = System.currentTimeMillis()
             recordHeartbeatToPrefs(applicationContext, lastNativeHeartbeatEpochMs)
-            scheduleWatchdogWorker()
             registerServiceNetworkCallback()
             ensureHeadlessFlutterEngine()
             handler.removeCallbacks(heartbeatRunnable)
@@ -453,19 +447,6 @@ class TradingForegroundService : Service() {
         val caps = cm.getNetworkCapabilities(active) ?: return false
         return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
             caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-    }
-
-    private fun scheduleWatchdogWorker() {
-        try {
-            val workRequest = PeriodicWorkRequestBuilder<WatchdogWorker>(15, TimeUnit.MINUTES).build()
-            WorkManager.getInstance(applicationContext).enqueueUniquePeriodicWork(
-                "ankit_ai_trader_watchdog",
-                ExistingPeriodicWorkPolicy.KEEP,
-                workRequest
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "scheduleWatchdogWorker failed", e)
-        }
     }
 
     private fun canPostNotifications(): Boolean {
