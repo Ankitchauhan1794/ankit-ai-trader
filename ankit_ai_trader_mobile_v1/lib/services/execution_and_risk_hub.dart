@@ -35,7 +35,7 @@ class OrderBookSnapshot {
   final Map<double, double> asks;
   final int timestampMs;
 
-  const OrderBookSnapshot({
+  OrderBookSnapshot({
     required this.symbol,
     required this.bids,
     required this.asks,
@@ -495,7 +495,7 @@ class DeterministicExecutionEngine {
       return rejected;
     }
 
-    final roundedQty = ((quantity / stepSize).floorToDouble()) * stepSize;
+    final roundedQty = (((quantity / stepSize) + 1e-9).floorToDouble()) * stepSize;
     if (roundedQty < minQuantity || bidPrice <= 0 || askPrice <= 0 || askPrice < bidPrice) {
       final rejected = ManagedExecutionOrder(
         clientOrderId: clientOrderId,
@@ -517,7 +517,7 @@ class DeterministicExecutionEngine {
     }
 
     final ratio = liquidityFillRatio.clamp(0.0, 1.0);
-    final filledQty = ((roundedQty * ratio) / stepSize).floorToDouble() * stepSize;
+    final filledQty = ((((roundedQty * ratio) / stepSize) + 1e-9).floorToDouble()) * stepSize;
     final refPrice = side == 'BUY' ? askPrice : bidPrice;
     final fillPrice = side == 'BUY'
         ? refPrice * (1.0 + slippageRate)

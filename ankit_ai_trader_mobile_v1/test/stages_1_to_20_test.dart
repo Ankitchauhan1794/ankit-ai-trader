@@ -477,7 +477,7 @@ void main() {
     );
 
     await tester.pumpWidget(AnkitTraderApp(coordinator: coordinator));
-    await tester.pump();
+    await tester.pumpAndSettle();
 
     expect(find.text('Home'), findsOneWidget);
     expect(find.text('Markets'), findsOneWidget);
@@ -501,7 +501,7 @@ void main() {
       riskSupervisor: supervisor,
     );
 
-    const book = OrderBookSnapshot(
+    final book = OrderBookSnapshot(
       symbol: 'B-BTC_USDT',
       bids: {89990.0: 1.5, 89980.0: 2.0},
       asks: {90010.0: 1.2, 90020.0: 3.0},
@@ -676,7 +676,7 @@ void main() {
     expect(regime.confidence, greaterThan(0.5));
 
     final ranked = CoinDcxMarketScanner.rankPairs(
-      tickers: const {
+      tickers: {
         'B-BTC_USDT': LiveMarketTicker(
           symbol: 'B-BTC_USDT',
           lastPrice: 95000.0,
@@ -725,7 +725,7 @@ void main() {
     expect(sanitized, contains('[REDACTED_CREDENTIAL]'));
     expect(sanitized, contains('[BLOCKED_INJECTION]'));
 
-    const incompletePaper = ExtendedPaperReadinessStatus(
+    final incompletePaper = ExtendedPaperReadinessStatus(
       daysCompleted: 14,
       closedPaperTrades: 12,
       distinctRegimesObserved: 2,

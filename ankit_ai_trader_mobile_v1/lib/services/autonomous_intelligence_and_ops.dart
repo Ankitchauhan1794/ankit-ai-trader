@@ -563,7 +563,7 @@ class ChampionChallengerDecision {
 
 class SandboxedStrategyBuilderAndOptimizer {
   static List<StrategyCandidateHypothesis> generateSandboxedHypotheses() {
-    return const [
+    return [
       StrategyCandidateHypothesis(
         configId: 'challenger_ema_12_26_atr_1.8',
         version: '1.1.0-sandbox',

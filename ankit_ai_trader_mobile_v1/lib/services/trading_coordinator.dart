@@ -143,6 +143,14 @@ class TradingCoordinator extends ChangeNotifier {
   List<TradePostmortemReport> recentPostmortems = [];
   bool isRunningBacktest = false;
   bool _isTickerPollInFlight = false;
+  bool _disposed = false;
+
+  @override
+  void notifyListeners() {
+    if (!_disposed) {
+      super.notifyListeners();
+    }
+  }
 
   Timer? _uiStateRefreshTimer;
   Timer? _liveTickerPollTimer;
@@ -241,13 +249,21 @@ class TradingCoordinator extends ChangeNotifier {
   }
 
   Future<void> initialize({bool enablePlatformChannels = true}) async {
+    if (_disposed) return;
     if (enablePlatformChannels) {
       await _initPlatformChannels();
     }
+    if (_disposed) return;
     await executionEngine.reconcileStartupOrders(nowMs: _nowMs());
+    if (_disposed) return;
     await refreshStateFromDatabase(isInitialLoad: true);
-    await _pollLiveTickersForDashboard();
-    _startUiStateRefreshTimer();
+    if (_disposed) return;
+    if (enablePlatformChannels) {
+      await _pollLiveTickersForDashboard();
+      if (!_disposed) {
+        _startUiStateRefreshTimer();
+      }
+    }
   }
 
   Future<void> _initPlatformChannels() async {
@@ -616,6 +632,7 @@ class TradingCoordinator extends ChangeNotifier {
 
   @override
   void dispose() {
+    _disposed = true;
     _uiStateRefreshTimer?.cancel();
     _liveTickerPollTimer?.cancel();
     _networkSub?.cancel();
