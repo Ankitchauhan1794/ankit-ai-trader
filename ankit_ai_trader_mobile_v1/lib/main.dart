@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'models/trading_models.dart';
 import 'screens/dashboard_screen.dart';
 import 'services/authoritative_engine.dart';
+import 'services/autonomous_intelligence_and_ops.dart';
 import 'services/coindcx_market_service.dart';
 import 'services/persistence_db.dart';
 import 'services/trading_coordinator.dart';
@@ -334,17 +335,19 @@ class _DashboardPageState extends State<DashboardPage>
     );
   }
 
-  /// STAGE 22 — MARKETS TAB (Stages 12, 13, 14):
+  /// STAGE 22 & 33 — MARKETS TAB:
   Widget _buildMarketsTab() {
     return ListView(
       padding: const EdgeInsets.all(14),
       children: [
         _buildLiveMarketCard(),
+        const SizedBox(height: 14),
+        _buildMarketScannerCard(),
       ],
     );
   }
 
-  /// STAGE 22 — TRADES TAB:
+  /// STAGE 22 & 38 — TRADES TAB:
   Widget _buildTradesTab() {
     return ListView(
       padding: const EdgeInsets.all(14),
@@ -356,8 +359,14 @@ class _DashboardPageState extends State<DashboardPage>
     );
   }
 
-  /// STAGE 22 — AI LAB TAB:
+  /// STAGE 22, 29–37 — AI LAB TAB:
   Widget _buildAiLabTab() {
+    final activeStrat = _coordinator.strategyRegistry.activeStrategy;
+    final expStrats = _coordinator.strategyRegistry.experimentalStrategies;
+    final costEst = _coordinator.agentOrchestrator.estimateCouncilRunCost();
+    final hypotheses =
+        SandboxedStrategyBuilderAndOptimizer.generateSandboxedHypotheses();
+
     return ListView(
       padding: const EdgeInsets.all(14),
       children: [
@@ -366,17 +375,20 @@ class _DashboardPageState extends State<DashboardPage>
             padding: const EdgeInsets.all(14),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
-              children: const [
+              children: [
                 Text(
-                  'MULTI-TIMEFRAME STRATEGY RULES',
-                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                  'STAGE 29 — STRATEGY REGISTRY (CHAMPION: ${activeStrat.id})',
+                  style: const TextStyle(
+                      fontWeight: FontWeight.bold, fontSize: 13),
                 ),
-                SizedBox(height: 8),
+                const SizedBox(height: 6),
                 Text(
-                  '• Trend Filter: 1h EMA 20 > 1h EMA 50 (Strict Closed Candles)\n'
-                  '• Entry Trigger: 15m EMA 20 crosses above 15m EMA 50 with RSI(14) in 50–65\n'
-                  '• Risk / Exit: SL = 1.5 × ATR(14), TP = 3.0 × ATR(14), 1% (\$1) Risk/Trade, 30m Cooldown',
-                  style: TextStyle(fontSize: 12, color: Colors.white70, height: 1.4),
+                  '${activeStrat.name} (v${activeStrat.version})\n'
+                  '• ${activeStrat.rulesSummary}\n'
+                  '• Risk / Exit: SL = 1.5 × ATR(14), TP = 3.0 × ATR(14), 1% (\$1) Risk/Trade, 30m Cooldown\n'
+                  '• Sandbox Challengers (${expStrats.length}): ${expStrats.map((s) => s.id).join(", ")}',
+                  style: const TextStyle(
+                      fontSize: 12, color: Colors.white70, height: 1.4),
                 ),
               ],
             ),
@@ -384,17 +396,53 @@ class _DashboardPageState extends State<DashboardPage>
         ),
         const SizedBox(height: 14),
         _buildBacktestCard(),
+        const SizedBox(height: 14),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'STAGES 34–37 — RESEARCH AGENTS & SANDBOX BUILDER',
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  costEst.notice,
+                  style: const TextStyle(fontSize: 11, color: Colors.white70),
+                ),
+                const SizedBox(height: 6),
+                const Text(
+                  '• Desks: Scanner, Technical, News/Macro, Sentiment, Bull, Bear, Quant, Chief Analyst\n'
+                  '• Stage 27 Gate: Independent Risk Supervisor holds absolute deterministic veto\n'
+                  '• Stage 36 Builder: Generates declarative sandbox configs only (never live code)',
+                  style: TextStyle(
+                      fontSize: 11, color: Colors.white60, height: 1.35),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  'Active Sandbox Hypotheses: ${hypotheses.map((h) => h.configId).join(", ")}',
+                  style: const TextStyle(fontSize: 11, color: Colors.white54),
+                ),
+              ],
+            ),
+          ),
+        ),
       ],
     );
   }
 
-  /// STAGE 22 — REPORTS TAB (Stage 5 Diagnostics + Event Journal):
+  /// STAGE 22 — REPORTS TAB (Stage 5 Diagnostics + Stages 24, 38, 39, 45, 46):
   Widget _buildReportsTab() {
     final hbLevel = _coordinator.heartbeatHealthLevel;
     final hbColor = hbLevel == 'OK'
         ? _greenProfit
         : (hbLevel == 'DELAYED' ? _orangeWarn : _redLoss);
     final events = _coordinator.recentEvents;
+    final alloc = _coordinator.currentPortfolioAllocation;
+    final paperStatus = _coordinator.extendedPaperStatus;
+    final liveGate = _coordinator.controlledLiveGateStatus;
 
     return ListView(
       padding: const EdgeInsets.all(14),
@@ -471,6 +519,29 @@ class _DashboardPageState extends State<DashboardPage>
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                const Text(
+                  'STAGES 39, 45 & 46 — PORTFOLIO & LIVE AUTHORIZATION GATE',
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '• Portfolio Rule: ${alloc.summary}\n'
+                  '• Stage 45 (90-Day Paper): ${paperStatus.statusSummary}\n'
+                  '• Stage 46 (Controlled Live): ${liveGate.gateReason}',
+                  style: const TextStyle(
+                      fontSize: 11, color: Colors.white70, height: 1.4),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 14),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
                 Text(
                   'DIAGNOSTIC EVENT JOURNAL (LAST ${events.length}/50 • PRUNED TO 500)',
                   style: const TextStyle(
@@ -505,7 +576,7 @@ class _DashboardPageState extends State<DashboardPage>
     );
   }
 
-  /// STAGE 22 — SETTINGS TAB (Stage 9 Auto-Resume, Stage 10 OnePlus Battery, Account Reset):
+  /// STAGE 22 — SETTINGS TAB (Stage 9 Auto-Resume, Stage 10 OnePlus Battery, Stage 43 Security, Account Reset):
   Widget _buildSettingsTab() {
     return ListView(
       padding: const EdgeInsets.all(14),
@@ -537,6 +608,19 @@ class _DashboardPageState extends State<DashboardPage>
         _buildTradeAlertsToggleCard(),
         const SizedBox(height: 12),
         Card(
+          child: const ListTile(
+            title: Text(
+              'Stage 43 & 46 — Security & Controlled Live Lock',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+            ),
+            subtitle: Text(
+              'Trade-only permissions enforced; withdrawals disabled; API credentials never sent to any LLM; Stage 46 Controlled Live is HARD-LOCKED (Paper-Only Mode active).',
+              style: TextStyle(fontSize: 11),
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        Card(
           child: ListTile(
             title: const Text(
               'Reset Paper Account (\$100.00 USDT)',
@@ -553,6 +637,41 @@ class _DashboardPageState extends State<DashboardPage>
           ),
         ),
       ],
+    );
+  }
+
+  Widget _buildMarketScannerCard() {
+    final ranks = _coordinator.scannerRankings;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'STAGE 33 — COINDCX SPOT LIQUIDITY & SPREAD SCANNER',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+            ),
+            const SizedBox(height: 8),
+            if (ranks.isEmpty)
+              const Text(
+                'Scanner awaiting live ticker snapshot...',
+                style: TextStyle(fontSize: 12, color: Colors.white60),
+              )
+            else
+              ...ranks.map((r) => Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: Text(
+                      '${r.symbol}: ${r.filterReason}',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: r.isEligible ? _greenProfit : _orangeWarn,
+                      ),
+                    ),
+                  )),
+          ],
+        ),
+      ),
     );
   }
 
@@ -756,11 +875,6 @@ class _DashboardPageState extends State<DashboardPage>
     );
   }
 
-  /// Stage 4 Control Buttons:
-  /// - RUNNING + service alive -> show PAUSE and STOP (no START button)
-  /// - RUNNING + restore failed -> show RESTART and STOP
-  /// - PAUSED -> show RESUME and STOP
-  /// - STOPPED -> show START PAPER BOT
   Widget _buildControlButtons() {
     final intention = _coordinator.userIntention;
 
@@ -1118,6 +1232,7 @@ class _DashboardPageState extends State<DashboardPage>
 
   Widget _buildBacktestCard() {
     final report = _coordinator.latestBacktestReport;
+    final regime = _coordinator.latestRegimeAssessment;
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(14),
@@ -1125,7 +1240,7 @@ class _DashboardPageState extends State<DashboardPage>
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-              'HISTORICAL BACKTEST ENGINE (BTC/USDT)',
+              'STAGE 30–32 — BACKTEST, ROBUSTNESS & REGIME ENGINE',
               style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
             ),
             const SizedBox(height: 4),
@@ -1144,6 +1259,13 @@ class _DashboardPageState extends State<DashboardPage>
                     : 'RUN BACKTEST',
               ),
             ),
+            if (regime != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                'Detected Regime: ${regime.regimeLabel} (Confidence ${(regime.confidence * 100).toStringAsFixed(0)}%)',
+                style: const TextStyle(fontSize: 11, color: Colors.white70),
+              ),
+            ],
             if (report != null) ...[
               const SizedBox(height: 10),
               Text(
