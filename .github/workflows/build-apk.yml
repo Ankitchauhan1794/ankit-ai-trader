@@ -19,13 +19,12 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Restore original Gradle & pubspec files from feature/self-healing-background
+      - name: Ensure Gradle 8.10.2 wrapper & clean unused WatchdogWorker
         run: |
-          git checkout origin/feature/self-healing-background -- pubspec.yaml pubspec.lock analysis_options.yaml android/build.gradle android/settings.gradle android/gradle.properties android/app/build.gradle android/app/src/main/res 2>/dev/null || true
           rm -f android/app/src/main/kotlin/com/ankit/aitrader/WatchdogWorker.kt
+          mkdir -p android/gradle/wrapper
+          sed -i 's|gradle-[0-9.]*-all.zip|gradle-8.10.2-all.zip|g; s|gradle-[0-9.]*-bin.zip|gradle-8.10.2-all.zip|g' android/gradle/wrapper/gradle-wrapper.properties || true
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
