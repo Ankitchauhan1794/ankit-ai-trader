@@ -375,7 +375,7 @@ class _DashboardPageState extends State<DashboardPage>
                 Text(
                   '• Trend Filter: 1h EMA 20 > 1h EMA 50 (Strict Closed Candles)\n'
                   '• Entry Trigger: 15m EMA 20 crosses above 15m EMA 50 with RSI(14) in 50–65\n'
-                  '• Risk / Exit: SL = 1.5 × ATR(14), TP = 3.0 × ATR(14), 1% ($1) Risk/Trade, 30m Cooldown',
+                  '• Risk / Exit: SL = 1.5 × ATR(14), TP = 3.0 × ATR(14), 1% (\$1) Risk/Trade, 30m Cooldown',
                   style: TextStyle(fontSize: 12, color: Colors.white70, height: 1.4),
                 ),
               ],

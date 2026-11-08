@@ -234,7 +234,7 @@ void main() {
     await db.close();
   });
 
-  test('Test 7 (Stage 8): RESET preserves notifiedAlertIds while resetting cash to $100', () async {
+  test('Test 7 (Stage 8): RESET preserves notifiedAlertIds while resetting cash to \$100', () async {
     final db = PersistenceDatabase(useInMemoryFallback: true);
     await db.markAlertIdNotified('ENTRY_ORD_1');
     final engine = AuthoritativeTradingEngine(
@@ -411,7 +411,7 @@ void main() {
     expect(broker.lastStopLossClosedAtMs, 3000);
   });
 
-  test('Test 12 (Stage 18 & 19): RiskManager sets SL=1.5xATR, TP=3.0xATR, enforces $1 risk cap, $2 daily loss, $90 drawdown floor, and 30m cooldown', () {
+  test('Test 12 (Stage 18 & 19): RiskManager sets SL=1.5xATR, TP=3.0xATR, enforces \$1 risk cap, \$2 daily loss, \$90 drawdown floor, and 30m cooldown', () {
     const rm = RiskManager();
     expect(rm.isMaxDrawdownReached(90.0), isTrue);
     expect(rm.isMaxDrawdownReached(90.01), isFalse);
