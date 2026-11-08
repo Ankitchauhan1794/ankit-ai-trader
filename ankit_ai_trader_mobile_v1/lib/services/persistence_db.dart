@@ -8,14 +8,20 @@ class PersistedEngineSnapshot {
   final UserSessionIntention userIntention;
   final double availableCashUsdt;
   final double accountEquityUsdt;
+  final double startOfDayEquityUsdt;
   final bool maxDrawdownLocked;
   final String? lockedDailyLossUtcDate;
   final int? lastStopLossClosedAtMs;
   final int? lastHeartbeatMs;
   final int? lastMarketDataUpdateMs;
+  final int? lastCandleUpdateMs;
   final int? runningSinceMs;
   final int totalActiveMs;
+  final int serviceRestartCount;
+  final int orderSeq;
+  final bool autoResumeEnabled;
   final String statusBannerMessage;
+  final String? lastError;
   final bool tradeAlertsEnabled;
   final Map<String, double> liveTickerPrices;
   final Map<String, LiveMarketTicker> liveTickers;
@@ -24,6 +30,8 @@ class PersistedEngineSnapshot {
   final List<PaperPosition> openPositions;
   final List<SimulatedOrder> orders;
   final List<ClosedPaperTrade> closedTrades;
+  final List<EquityPoint> equityCurve;
+  final List<DiagnosticEvent> recentEvents;
   final Set<String> processedEntrySignalKeys;
   final int recoveryAttemptCount;
   final int? recoveryStartedAtMs;
@@ -35,14 +43,20 @@ class PersistedEngineSnapshot {
     required this.userIntention,
     required this.availableCashUsdt,
     required this.accountEquityUsdt,
+    this.startOfDayEquityUsdt = 100.0,
     required this.maxDrawdownLocked,
     this.lockedDailyLossUtcDate,
     this.lastStopLossClosedAtMs,
     this.lastHeartbeatMs,
     this.lastMarketDataUpdateMs,
+    this.lastCandleUpdateMs,
     this.runningSinceMs,
     this.totalActiveMs = 0,
+    this.serviceRestartCount = 0,
+    this.orderSeq = 0,
+    this.autoResumeEnabled = false,
     required this.statusBannerMessage,
+    this.lastError,
     this.tradeAlertsEnabled = true,
     this.liveTickerPrices = const {},
     this.liveTickers = const {},
@@ -51,6 +65,8 @@ class PersistedEngineSnapshot {
     this.openPositions = const [],
     this.orders = const [],
     this.closedTrades = const [],
+    this.equityCurve = const [],
+    this.recentEvents = const [],
     this.processedEntrySignalKeys = const {},
     this.recoveryAttemptCount = 0,
     this.recoveryStartedAtMs,
@@ -66,6 +82,8 @@ class PersistenceDatabase {
   final List<PaperPosition> _inMemoryOpenPositions = [];
   final List<SimulatedOrder> _inMemoryOrders = [];
   final List<ClosedPaperTrade> _inMemoryClosedTrades = [];
+  final List<EquityPoint> _inMemoryEquityCurve = [];
+  final List<DiagnosticEvent> _inMemoryEvents = [];
   final Set<String> _inMemoryProcessedKeys = {};
   final Map<String, Map<String, dynamic>> _inMemoryLocks = {};
   final bool useInMemoryFallback;
@@ -80,7 +98,7 @@ class PersistenceDatabase {
       final fullPath = p.join(dbDir, dbFileName);
       _db = await openDatabase(
         fullPath,
-        version: 2,
+        version: 3,
         onCreate: _onCreate,
         onUpgrade: _onUpgrade,
       );
@@ -162,6 +180,14 @@ class PersistenceDatabase {
         expiresAtMs INTEGER NOT NULL
       )
     ''');
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS diagnostic_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestampMs INTEGER NOT NULL,
+        eventType TEXT NOT NULL,
+        reason TEXT NOT NULL
+      )
+    ''');
   }
 
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
@@ -192,9 +218,13 @@ class PersistenceDatabase {
     return rows.first['value'] as String?;
   }
 
-  /// Stage 2: Persist user intention separately from runtime botState.
+  /// Stage 3: Persist user session intention separately from runtime botState.
   Future<void> saveUserIntention(UserSessionIntention intention) async {
     await putKv('userIntention', intention.name);
+    await logDiagnosticEvent(
+      'USER_INTENTION',
+      'User set session intention to ${intention.name.toUpperCase()}',
+    );
   }
 
   Future<UserSessionIntention> loadUserIntention() async {
@@ -205,12 +235,77 @@ class PersistenceDatabase {
     );
   }
 
-  /// Stage 4: Record engine heartbeat timestamp in SQLite.
+  /// Stage 5: Record diagnostic event in SQLite and prune to ~500 rows.
+  Future<void> logDiagnosticEvent(
+    String eventType,
+    String reason, {
+    int? timestampMs,
+  }) async {
+    final ts = timestampMs ?? DateTime.now().millisecondsSinceEpoch;
+    final nextId = _inMemoryEvents.isEmpty ? 1 : _inMemoryEvents.first.id + 1;
+    _inMemoryEvents.insert(
+      0,
+      DiagnosticEvent(
+        id: nextId,
+        timestampMs: ts,
+        eventType: eventType,
+        reason: reason,
+      ),
+    );
+    if (_inMemoryEvents.length > 500) {
+      _inMemoryEvents.removeRange(500, _inMemoryEvents.length);
+    }
+
+    final db = await database;
+    if (db == null) return;
+    await db.insert('diagnostic_events', {
+      'timestampMs': ts,
+      'eventType': eventType,
+      'reason': reason,
+    });
+    await db.execute('''
+      DELETE FROM diagnostic_events
+      WHERE id NOT IN (
+        SELECT id FROM diagnostic_events
+        ORDER BY timestampMs DESC, id DESC
+        LIMIT 500
+      )
+    ''');
+  }
+
+  Future<List<DiagnosticEvent>> getRecentDiagnosticEvents({int limit = 50}) async {
+    final db = await database;
+    if (db == null) {
+      return _inMemoryEvents.take(limit).toList();
+    }
+    final rows = await db.query(
+      'diagnostic_events',
+      orderBy: 'timestampMs DESC, id DESC',
+      limit: limit,
+    );
+    return rows.map((r) => DiagnosticEvent.fromMap(r)).toList();
+  }
+
+  /// Stage 4 & 5: Record engine heartbeat timestamp in SQLite.
   Future<void> recordHeartbeat(int timestampMs) async {
     await putKv('lastHeartbeatMs', jsonEncode(timestampMs));
   }
 
-  /// Stage 7: Single authoritative engine execution lock.
+  /// Stage 9: Persist autoResumeEnabled setting (default false).
+  Future<bool> getAutoResumeEnabled() async {
+    final raw = await getKv('autoResumeEnabled');
+    return raw == 'true';
+  }
+
+  Future<void> setAutoResumeEnabled(bool enabled) async {
+    await putKv('autoResumeEnabled', enabled ? 'true' : 'false');
+    await logDiagnosticEvent(
+      'SETTING_CHANGE',
+      'Auto-resume on network recovery set to ${enabled ? "ON" : "OFF"}',
+    );
+  }
+
+  /// Stage 7 & 8: Single authoritative engine execution lock.
   Future<bool> acquireExecutionLock({
     required String lockName,
     required String ownerId,
@@ -288,6 +383,8 @@ class PersistenceDatabase {
     await putKv('recoveryAttemptCount', jsonEncode(attemptCount));
     await putKv('recoveryStartedAtMs', jsonEncode(recoveryStartedAtMs));
     await putKv('nextRecoveryAllowedAtMs', jsonEncode(nextRecoveryAllowedAtMs));
+    await putKv('lastError', logMessage);
+    await logDiagnosticEvent('RECOVERY', logMessage, timestampMs: DateTime.now().millisecondsSinceEpoch);
 
     final rawLogs = await getKv('recoveryLogs');
     final logs = <String>[];
@@ -354,8 +451,10 @@ class PersistenceDatabase {
     int? lastStopLossClosedAtMs,
     int? lastHeartbeatMs,
     int? lastMarketDataUpdateMs,
+    int? lastCandleUpdateMs,
     int? runningSinceMs,
     int totalActiveMs = 0,
+    int? orderSeq,
     required String statusBannerMessage,
     Map<String, double> liveTickerPrices = const {},
     Map<String, LiveMarketTicker> liveTickers = const {},
@@ -381,6 +480,12 @@ class PersistenceDatabase {
     if (lastMarketDataUpdateMs != null) {
       await putKv('lastMarketDataUpdateMs', jsonEncode(lastMarketDataUpdateMs));
     }
+    if (lastCandleUpdateMs != null) {
+      await putKv('lastCandleUpdateMs', jsonEncode(lastCandleUpdateMs));
+    }
+    if (orderSeq != null) {
+      await putKv('orderSeq', jsonEncode(orderSeq));
+    }
     await putKv('runningSinceMs', jsonEncode(runningSinceMs));
     await putKv('totalActiveMs', jsonEncode(totalActiveMs));
     await putKv('statusBannerMessage', statusBannerMessage);
@@ -391,6 +496,14 @@ class PersistenceDatabase {
     );
     await putKv('closedCandlePrices', jsonEncode(closedCandlePrices));
     await putKv('whyNoTradeForSymbol', jsonEncode(whyNoTradeForSymbol));
+
+    final nowMs = lastHeartbeatMs ?? DateTime.now().millisecondsSinceEpoch;
+    _inMemoryEquityCurve.add(
+      EquityPoint(timestampMs: nowMs, equityUsdt: accountEquityUsdt),
+    );
+    if (_inMemoryEquityCurve.length > 120) {
+      _inMemoryEquityCurve.removeRange(0, _inMemoryEquityCurve.length - 120);
+    }
 
     _inMemoryOpenPositions
       ..clear()
@@ -434,7 +547,16 @@ class PersistenceDatabase {
         );
       }
 
-      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      await txn.insert(
+        'equity_snapshots',
+        {
+          'timestampMs': nowMs,
+          'equityUsdt': accountEquityUsdt,
+          'availableCashUsdt': availableCashUsdt,
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+
       for (final key in processedEntrySignalKeys) {
         await txn.insert(
           'processed_signal_keys',
@@ -451,6 +573,8 @@ class PersistenceDatabase {
     List<PaperPosition> openPos = List.from(_inMemoryOpenPositions);
     List<SimulatedOrder> ordList = List.from(_inMemoryOrders);
     List<ClosedPaperTrade> trdList = List.from(_inMemoryClosedTrades);
+    List<EquityPoint> eqCurve = List.from(_inMemoryEquityCurve);
+    List<DiagnosticEvent> events = List.from(_inMemoryEvents);
     Set<String> sigKeys = Set.from(_inMemoryProcessedKeys);
 
     if (db != null) {
@@ -469,6 +593,19 @@ class PersistenceDatabase {
       final trdRows = await db.query('closed_trades',
           orderBy: 'closedAtMs DESC', limit: 100);
       trdList = trdRows.map((r) => ClosedPaperTrade.fromMap(r)).toList();
+
+      final eqRows = await db.query('equity_snapshots',
+          orderBy: 'timestampMs DESC', limit: 120);
+      eqCurve = eqRows.reversed
+          .map((r) => EquityPoint(
+                timestampMs: (r['timestampMs'] as num).toInt(),
+                equityUsdt: (r['equityUsdt'] as num).toDouble(),
+              ))
+          .toList();
+
+      final evRows = await db.query('diagnostic_events',
+          orderBy: 'timestampMs DESC, id DESC', limit: 50);
+      events = evRows.map((r) => DiagnosticEvent.fromMap(r)).toList();
 
       final keyRows = await db.query('processed_signal_keys');
       sigKeys = keyRows.map((r) => r['signalKey'] as String).toSet();
@@ -593,15 +730,21 @@ class PersistenceDatabase {
       userIntention: userIntention,
       availableCashUsdt: parseDouble('availableCashUsdt', 100.0),
       accountEquityUsdt: parseDouble('accountEquityUsdt', 100.0),
+      startOfDayEquityUsdt: parseDouble('startOfDayEquityUsdt', 100.0),
       maxDrawdownLocked: parseBool('maxDrawdownLocked', false),
       lockedDailyLossUtcDate: parseStringOrNull('lockedDailyLossUtcDate'),
       lastStopLossClosedAtMs: parseIntOrNull('lastStopLossClosedAtMs'),
       lastHeartbeatMs: parseIntOrNull('lastHeartbeatMs'),
       lastMarketDataUpdateMs: parseIntOrNull('lastMarketDataUpdateMs'),
+      lastCandleUpdateMs: parseIntOrNull('lastCandleUpdateMs'),
       runningSinceMs: parseIntOrNull('runningSinceMs'),
       totalActiveMs: parseIntOrNull('totalActiveMs') ?? 0,
+      serviceRestartCount: parseIntOrNull('serviceRestartCount') ?? 0,
+      orderSeq: parseIntOrNull('orderSeq') ?? ordList.length,
+      autoResumeEnabled: parseBool('autoResumeEnabled', false),
       statusBannerMessage:
           kv['statusBannerMessage'] ?? 'PAPER BOT STOPPED — PRESS START',
+      lastError: parseStringOrNull('lastError'),
       tradeAlertsEnabled: parseBool('tradeAlertsEnabled', true),
       liveTickerPrices: parsePriceMap('liveTickerPrices'),
       liveTickers: parseTickerMap('liveTickers'),
@@ -610,6 +753,8 @@ class PersistenceDatabase {
       openPositions: openPos,
       orders: ordList,
       closedTrades: trdList,
+      equityCurve: eqCurve,
+      recentEvents: events,
       processedEntrySignalKeys: sigKeys,
       recoveryAttemptCount: parseIntOrNull('recoveryAttemptCount') ?? 0,
       recoveryStartedAtMs: parseIntOrNull('recoveryStartedAtMs'),

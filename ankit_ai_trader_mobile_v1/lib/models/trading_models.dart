@@ -395,3 +395,40 @@ class BacktestReport {
     required this.maxDrawdownUsdt,
   });
 }
+class DiagnosticEvent {
+  final int id;
+  final int timestampMs;
+  final String eventType;
+  final String reason;
+
+  const DiagnosticEvent({
+    required this.id,
+    required this.timestampMs,
+    required this.eventType,
+    required this.reason,
+  });
+
+  Map<String, dynamic> toMap() => {
+        'id': id,
+        'timestampMs': timestampMs,
+        'eventType': eventType,
+        'reason': reason,
+      };
+
+  factory DiagnosticEvent.fromMap(Map<String, dynamic> map) => DiagnosticEvent(
+        id: (map['id'] as num?)?.toInt() ?? 0,
+        timestampMs: (map['timestampMs'] as num?)?.toInt() ?? 0,
+        eventType: (map['eventType'] as String?) ?? 'INFO',
+        reason: (map['reason'] as String?) ?? '',
+      );
+}
+
+class EquityPoint {
+  final int timestampMs;
+  final double equityUsdt;
+
+  const EquityPoint({
+    required this.timestampMs,
+    required this.equityUsdt,
+  });
+}

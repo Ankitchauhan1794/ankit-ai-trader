@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'models/trading_models.dart';
@@ -29,12 +30,18 @@ Future<void> backgroundServiceMain() async {
     },
     onTradeAlert: (alert) async {
       try {
-        await channel.invokeMethod('postTradeAlertNotification', {
-          'alertId': alert.alertId,
-          'title': alert.title,
-          'body': alert.body,
-        });
-      } catch (_) {}
+        final posted = await channel.invokeMethod<bool>(
+          'postTradeAlertNotification',
+          {
+            'alertId': alert.alertId,
+            'title': alert.title,
+            'body': alert.body,
+          },
+        );
+        return posted ?? false;
+      } catch (_) {
+        return false;
+      }
     },
     onSyncUserIntention: (intention) async {
       try {
@@ -67,7 +74,6 @@ Future<void> backgroundServiceMain() async {
   try {
     await persistence.database;
     await channel.invokeMethod('acknowledgeEngineInitialized');
-    // Stage 6: Automatically resume trading session if userIntention == running
     await engine.restoreSessionIfRunningIntended();
   } catch (e) {
     try {
@@ -94,10 +100,15 @@ class AnkitTraderApp extends StatelessWidget {
       title: 'Ankit AI Trader',
       debugShowCheckedModeBanner: false,
       theme: ThemeData.dark(useMaterial3: true).copyWith(
-        scaffoldBackgroundColor: const Color(0xFF0B0F19),
+        scaffoldBackgroundColor: const Color(0xFF090D16),
         colorScheme: ColorScheme.fromSeed(
           seedColor: const Color(0xFF00E676),
           brightness: Brightness.dark,
+        ),
+        cardTheme: const CardTheme(
+          color: Color(0xFF121826),
+          elevation: 0,
+          margin: EdgeInsets.zero,
         ),
       ),
       home: DashboardPage(coordinator: coordinator),
@@ -116,8 +127,13 @@ class DashboardPage extends StatefulWidget {
 
 class _DashboardPageState extends State<DashboardPage>
     with WidgetsBindingObserver {
+  static const Color _greenProfit = Color(0xFF00E676);
+  static const Color _redLoss = Color(0xFFFF5252);
+  static const Color _orangeWarn = Color(0xFFFF9100);
+
   late final TradingCoordinator _coordinator;
   late final bool _ownsCoordinator;
+  int _selectedTabIndex = 0;
 
   @override
   void initState() {
@@ -154,11 +170,21 @@ class _DashboardPageState extends State<DashboardPage>
 
   @override
   Widget build(BuildContext context) {
+    final pages = <Widget>[
+      _buildHomeTab(),
+      _buildMarketsTab(),
+      _buildTradesTab(),
+      _buildAiLabTab(),
+      _buildReportsTab(),
+      _buildSettingsTab(),
+    ];
+
     return Scaffold(
       appBar: AppBar(
+        backgroundColor: const Color(0xFF0D1320),
         title: const Text(
-          'Ankit AI Trader — PAPER BOT',
-          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+          'Ankit AI Trader',
+          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 17),
         ),
         actions: [
           Padding(
@@ -172,33 +198,483 @@ class _DashboardPageState extends State<DashboardPage>
       body: RefreshIndicator(
         onRefresh: () =>
             _coordinator.refreshStateFromDatabase(isInitialLoad: false),
-        child: ListView(
-          padding: const EdgeInsets.all(12),
-          children: [
-            _buildBannerCard(),
-            const SizedBox(height: 8),
-            OnePlusBatteryOptimizationCard(
-              ignoringBatteryOptimizations:
-                  _coordinator.ignoringBatteryOptimizations,
-              onOpenSettings: _coordinator.openBatteryOptimizationSettings,
+        child: pages[_selectedTabIndex],
+      ),
+      bottomNavigationBar: NavigationBar(
+        backgroundColor: const Color(0xFF0D1320),
+        selectedIndex: _selectedTabIndex,
+        onDestinationSelected: (idx) => setState(() => _selectedTabIndex = idx),
+        destinations: const [
+          NavigationDestination(
+            icon: Icon(Icons.dashboard_outlined),
+            selectedIcon: Icon(Icons.dashboard),
+            label: 'Home',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.candlestick_chart_outlined),
+            selectedIcon: Icon(Icons.candlestick_chart),
+            label: 'Markets',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.swap_horiz_outlined),
+            selectedIcon: Icon(Icons.swap_horiz),
+            label: 'Trades',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.psychology_outlined),
+            selectedIcon: Icon(Icons.psychology),
+            label: 'AI Lab',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.analytics_outlined),
+            selectedIcon: Icon(Icons.analytics),
+            label: 'Reports',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.settings_outlined),
+            selectedIcon: Icon(Icons.settings),
+            label: 'Settings',
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// STAGE 22 — HOME TAB:
+  /// Bot status, equity, available balance, daily/overall P&L, drawdown,
+  /// equity curve, open positions, system health, Pause/Stop. No technical logs on Home.
+  Widget _buildHomeTab() {
+    final dailyPnl = _coordinator.dailyPnlUsdt;
+    final overallPnl = _coordinator.overallPnlUsdt;
+    final dd = _coordinator.currentDrawdownUsdt;
+
+    return ListView(
+      padding: const EdgeInsets.all(14),
+      children: [
+        _buildBannerCard(),
+        const SizedBox(height: 12),
+        _buildControlButtons(),
+        const SizedBox(height: 14),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'PORTFOLIO OVERVIEW',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white54,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(
+                      child: _metricTile(
+                        'Equity',
+                        '\$${_coordinator.accountEquityUsdt.toStringAsFixed(2)}',
+                        valueColor: Colors.white,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: _metricTile(
+                        'Available',
+                        '\$${_coordinator.availableCashUsdt.toStringAsFixed(2)}',
+                        valueColor: Colors.white70,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: _metricTile(
+                        'Daily P&L',
+                        '${dailyPnl >= 0 ? "+" : ""}\$${dailyPnl.toStringAsFixed(2)}',
+                        valueColor: dailyPnl >= 0 ? _greenProfit : _redLoss,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: _metricTile(
+                        'Overall P&L',
+                        '${overallPnl >= 0 ? "+" : ""}\$${overallPnl.toStringAsFixed(2)}',
+                        valueColor: overallPnl >= 0 ? _greenProfit : _redLoss,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: _metricTile(
+                        'Drawdown (Max \$10)',
+                        '\$${dd.toStringAsFixed(2)}',
+                        valueColor: dd >= 5.0
+                            ? _redLoss
+                            : (dd > 0 ? _orangeWarn : _greenProfit),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
             ),
-            const SizedBox(height: 8),
-            _buildControlButtons(),
-            const SizedBox(height: 12),
-            _buildStatusGrid(),
-            const SizedBox(height: 12),
-            _buildAccountMetricsCard(),
-            const SizedBox(height: 12),
-            _buildLiveMarketCard(),
-            const SizedBox(height: 12),
-            _buildOpenPositionsCard(),
-            const SizedBox(height: 12),
-            _buildRecentTradesCard(),
-            const SizedBox(height: 12),
-            _buildTradeAlertsToggleCard(),
-            const SizedBox(height: 12),
-            _buildBacktestCard(),
-            const SizedBox(height: 24),
+          ),
+        ),
+        const SizedBox(height: 14),
+        _buildEquityCurveCard(),
+        const SizedBox(height: 14),
+        _buildOpenPositionsCard(),
+        const SizedBox(height: 14),
+        _buildSystemHealthSummaryCard(),
+        const SizedBox(height: 20),
+      ],
+    );
+  }
+
+  /// STAGE 22 — MARKETS TAB (Stages 12, 13, 14):
+  Widget _buildMarketsTab() {
+    return ListView(
+      padding: const EdgeInsets.all(14),
+      children: [
+        _buildLiveMarketCard(),
+      ],
+    );
+  }
+
+  /// STAGE 22 — TRADES TAB:
+  Widget _buildTradesTab() {
+    return ListView(
+      padding: const EdgeInsets.all(14),
+      children: [
+        _buildOpenPositionsCard(),
+        const SizedBox(height: 14),
+        _buildRecentTradesCard(),
+      ],
+    );
+  }
+
+  /// STAGE 22 — AI LAB TAB:
+  Widget _buildAiLabTab() {
+    return ListView(
+      padding: const EdgeInsets.all(14),
+      children: [
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: const [
+                Text(
+                  'MULTI-TIMEFRAME STRATEGY RULES',
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                ),
+                SizedBox(height: 8),
+                Text(
+                  '• Trend Filter: 1h EMA 20 > 1h EMA 50 (Strict Closed Candles)\n'
+                  '• Entry Trigger: 15m EMA 20 crosses above 15m EMA 50 with RSI(14) in 50–65\n'
+                  '• Risk / Exit: SL = 1.5 × ATR(14), TP = 3.0 × ATR(14), 1% ($1) Risk/Trade, 30m Cooldown',
+                  style: TextStyle(fontSize: 12, color: Colors.white70, height: 1.4),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 14),
+        _buildBacktestCard(),
+      ],
+    );
+  }
+
+  /// STAGE 22 — REPORTS TAB (Stage 5 Diagnostics + Event Journal):
+  Widget _buildReportsTab() {
+    final hbLevel = _coordinator.heartbeatHealthLevel;
+    final hbColor = hbLevel == 'OK'
+        ? _greenProfit
+        : (hbLevel == 'DELAYED' ? _orangeWarn : _redLoss);
+    final events = _coordinator.recentEvents;
+
+    return ListView(
+      padding: const EdgeInsets.all(14),
+      children: [
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'STAGE 5 — ENGINE & SERVICE DIAGNOSTICS',
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                ),
+                const SizedBox(height: 10),
+                _diagRow(
+                  'Native Service Alive',
+                  _coordinator.serviceRunning ? 'YES' : 'NO',
+                  _coordinator.serviceRunning ? _greenProfit : _redLoss,
+                ),
+                _diagRow(
+                  'Dart Heartbeat',
+                  _coordinator.formatHeartbeatStatus(),
+                  hbColor,
+                ),
+                _diagRow(
+                  'Last Ticker Update',
+                  _coordinator.lastMarketDataUpdateMs != null
+                      ? TradingCoordinator.formatUtcHhMmSs(
+                          _coordinator.lastMarketDataUpdateMs!)
+                      : 'Never',
+                  Colors.white70,
+                ),
+                _diagRow(
+                  'Last Candle Update',
+                  _coordinator.lastCandleUpdateMs != null
+                      ? TradingCoordinator.formatUtcHhMmSs(
+                          _coordinator.lastCandleUpdateMs!)
+                      : 'Never',
+                  Colors.white70,
+                ),
+                _diagRow(
+                  'Session Intention',
+                  _coordinator.userIntention.name.toUpperCase(),
+                  _coordinator.userIntention == UserSessionIntention.running
+                      ? _greenProfit
+                      : Colors.white70,
+                ),
+                _diagRow(
+                  'Runtime State',
+                  _coordinator.engineState.name,
+                  _coordinator.engineState == BotEngineState.running
+                      ? _greenProfit
+                      : _orangeWarn,
+                ),
+                _diagRow(
+                  'Service Restart Count',
+                  '${_coordinator.serviceRestartCount}',
+                  Colors.white70,
+                ),
+                _diagRow(
+                  'Last Error',
+                  _coordinator.lastError ?? 'None',
+                  _coordinator.lastError == null ? _greenProfit : _orangeWarn,
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 14),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'DIAGNOSTIC EVENT JOURNAL (LAST ${events.length}/50 • PRUNED TO 500)',
+                  style: const TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 13,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                if (events.isEmpty)
+                  const Text(
+                    'No diagnostic events recorded yet.',
+                    style: TextStyle(fontSize: 12, color: Colors.white60),
+                  )
+                else
+                  ...events.take(50).map(
+                        (e) => Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 4),
+                          child: Text(
+                            '[${TradingCoordinator.formatUtcHhMmSs(e.timestampMs)}] ${e.eventType}: ${e.reason}',
+                            style: const TextStyle(
+                              fontSize: 11,
+                              color: Colors.white70,
+                            ),
+                          ),
+                        ),
+                      ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// STAGE 22 — SETTINGS TAB (Stage 9 Auto-Resume, Stage 10 OnePlus Battery, Account Reset):
+  Widget _buildSettingsTab() {
+    return ListView(
+      padding: const EdgeInsets.all(14),
+      children: [
+        OnePlusBatteryOptimizationCard(
+          ignoringBatteryOptimizations:
+              _coordinator.ignoringBatteryOptimizations,
+          notificationPermissionGranted:
+              _coordinator.notificationPermissionGranted,
+          onOpenSettings: _coordinator.openBatteryOptimizationSettings,
+          onOpenNotifications: _coordinator.openNotificationSettings,
+        ),
+        const SizedBox(height: 12),
+        Card(
+          child: SwitchListTile(
+            title: const Text(
+              'Auto-Resume After Network Recovery',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+            ),
+            subtitle: const Text(
+              'Default OFF. When ON, resumes automatically after fresh validated data from network/stale-data pauses only.',
+              style: TextStyle(fontSize: 11),
+            ),
+            value: _coordinator.autoResumeEnabled,
+            onChanged: (val) => _coordinator.setAutoResumeEnabled(val),
+          ),
+        ),
+        const SizedBox(height: 12),
+        _buildTradeAlertsToggleCard(),
+        const SizedBox(height: 12),
+        Card(
+          child: ListTile(
+            title: const Text(
+              'Reset Paper Account (\$100.00 USDT)',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+            ),
+            subtitle: const Text(
+              'Clears open positions, trade history, and drawdown locks while preserving alert deduplication.',
+              style: TextStyle(fontSize: 11),
+            ),
+            trailing: OutlinedButton(
+              onPressed: _coordinator.manualResetDrawdownAndAccount,
+              child: const Text('RESET \$100'),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _diagRow(String label, String value, Color valueColor) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(
+            label,
+            style: const TextStyle(fontSize: 12, color: Colors.white60),
+          ),
+          const SizedBox(width: 8),
+          Flexible(
+            child: Text(
+              value,
+              textAlign: TextAlign.right,
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.bold,
+                color: valueColor,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildEquityCurveCard() {
+    final points = _coordinator.equityCurve;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'EQUITY CURVE',
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.bold,
+                color: Colors.white54,
+              ),
+            ),
+            const SizedBox(height: 10),
+            SizedBox(
+              height: 90,
+              width: double.infinity,
+              child: CustomPaint(
+                painter: _EquityCurvePainter(
+                  points: points.isEmpty
+                      ? [
+                          EquityPoint(
+                            timestampMs: 0,
+                            equityUsdt: _coordinator.accountEquityUsdt,
+                          )
+                        ]
+                      : points,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSystemHealthSummaryCard() {
+    final hbLevel = _coordinator.heartbeatHealthLevel;
+    final hbColor = hbLevel == 'OK'
+        ? _greenProfit
+        : (hbLevel == 'DELAYED' ? _orangeWarn : _redLoss);
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'SYSTEM HEALTH',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white54,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  _coordinator.formatHeartbeatStatus(),
+                  key: const ValueKey('heartbeat_status_text'),
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: hbColor,
+                  ),
+                ),
+              ],
+            ),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color: _coordinator.internetConnected
+                    ? _greenProfit.withOpacity(0.18)
+                    : _redLoss.withOpacity(0.18),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                _coordinator.internetConnected ? 'NET ONLINE' : 'NET OFFLINE',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                  color:
+                      _coordinator.internetConnected ? _greenProfit : _redLoss,
+                ),
+              ),
+            ),
           ],
         ),
       ),
@@ -210,31 +686,25 @@ class _DashboardPageState extends State<DashboardPage>
     String label;
     switch (state) {
       case BotEngineState.running:
-        bg = Colors.green.shade700;
+        bg = _greenProfit.withOpacity(0.2);
         label = 'RUNNING';
         break;
       case BotEngineState.pausedNetworkLoss:
-        bg = Colors.orange.shade800;
-        label = 'AUTO-RECOVERY (NET)';
-        break;
       case BotEngineState.pausedStaleData:
-        bg = Colors.orange.shade800;
-        label = 'AUTO-RECOVERY (DATA)';
+        bg = _orangeWarn.withOpacity(0.2);
+        label = 'RECOVERING';
         break;
       case BotEngineState.pausedAfterRecoveryManualStartRequired:
-        bg = Colors.amber.shade800;
+        bg = _orangeWarn.withOpacity(0.2);
         label = 'PAUSED';
         break;
       case BotEngineState.lockedDailyLossLimit:
-        bg = Colors.red.shade800;
-        label = 'DAILY LOSS LOCK';
-        break;
       case BotEngineState.stoppedMaxDrawdownReached:
-        bg = Colors.red.shade900;
-        label = 'MAX DRAWDOWN STOP';
+        bg = _redLoss.withOpacity(0.25);
+        label = 'SAFETY LOCK';
         break;
       case BotEngineState.stopped:
-        bg = Colors.blueGrey.shade700;
+        bg = Colors.blueGrey.withOpacity(0.3);
         label = 'STOPPED';
         break;
     }
@@ -253,38 +723,32 @@ class _DashboardPageState extends State<DashboardPage>
 
   Widget _buildBannerCard() {
     return Card(
-      color: const Color(0xFF161F30),
+      color: const Color(0xFF151E30),
       child: Padding(
         padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            Text(
-              _coordinator.statusBannerMessage,
-              style: const TextStyle(
-                fontWeight: FontWeight.bold,
-                fontSize: 13,
-                color: Colors.cyanAccent,
+            Expanded(
+              child: Text(
+                _coordinator.statusBannerMessage,
+                style: const TextStyle(
+                  fontWeight: FontWeight.bold,
+                  fontSize: 12,
+                  color: Colors.white,
+                ),
               ),
             ),
-            const SizedBox(height: 6),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text(
-                  _coordinator.formatHeartbeatStatus(),
-                  key: const ValueKey('heartbeat_status_text'),
-                  style: const TextStyle(fontSize: 12, color: Colors.white70),
-                ),
-                Text(
-                  'Intention: ${_coordinator.userIntention.name.toUpperCase()}',
-                  style: const TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
-                    color: Colors.greenAccent,
-                  ),
-                ),
-              ],
+            const SizedBox(width: 8),
+            Text(
+              _coordinator.userIntention.name.toUpperCase(),
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.bold,
+                color: _coordinator.userIntention == UserSessionIntention.running
+                    ? _greenProfit
+                    : Colors.white54,
+              ),
             ),
           ],
         ),
@@ -292,35 +756,100 @@ class _DashboardPageState extends State<DashboardPage>
     );
   }
 
+  /// Stage 4 Control Buttons:
+  /// - RUNNING + service alive -> show PAUSE and STOP (no START button)
+  /// - RUNNING + restore failed -> show RESTART and STOP
+  /// - PAUSED -> show RESUME and STOP
+  /// - STOPPED -> show START PAPER BOT
   Widget _buildControlButtons() {
-    final isRunningOrRecovering =
-        _coordinator.engineState == BotEngineState.running ||
-        _coordinator.userIntention == UserSessionIntention.running;
+    final intention = _coordinator.userIntention;
 
-    return Row(
-      children: [
-        if (!isRunningOrRecovering)
+    if (intention == UserSessionIntention.running &&
+        _coordinator.restoreFailedRequiresRestart) {
+      return Row(
+        children: [
           Expanded(
             child: ElevatedButton.icon(
               style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.green.shade700,
+                backgroundColor: _orangeWarn,
+                foregroundColor: Colors.black,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+              ),
+              onPressed: _coordinator.startBot,
+              icon: const Icon(Icons.refresh),
+              label: const Text(
+                'RESTART',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: _redLoss,
                 foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+              ),
+              onPressed: _coordinator.stopBot,
+              icon: const Icon(Icons.stop),
+              label: const Text(
+                'STOP',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ),
+          ),
+        ],
+      );
+    }
+
+    if (intention == UserSessionIntention.paused) {
+      return Row(
+        children: [
+          Expanded(
+            child: ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: _greenProfit,
+                foregroundColor: Colors.black,
                 padding: const EdgeInsets.symmetric(vertical: 14),
               ),
               onPressed: _coordinator.startBot,
               icon: const Icon(Icons.play_arrow),
               label: const Text(
-                'START PAPER BOT',
+                'RESUME',
                 style: TextStyle(fontWeight: FontWeight.bold),
               ),
             ),
           ),
-        if (isRunningOrRecovering) ...[
+          const SizedBox(width: 10),
           Expanded(
             child: ElevatedButton.icon(
               style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.amber.shade800,
+                backgroundColor: _redLoss,
                 foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+              ),
+              onPressed: _coordinator.stopBot,
+              icon: const Icon(Icons.stop),
+              label: const Text(
+                'STOP',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ),
+          ),
+        ],
+      );
+    }
+
+    if (intention == UserSessionIntention.running ||
+        _coordinator.engineState == BotEngineState.running) {
+      return Row(
+        children: [
+          Expanded(
+            child: ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: _orangeWarn,
+                foregroundColor: Colors.black,
                 padding: const EdgeInsets.symmetric(vertical: 14),
               ),
               onPressed: _coordinator.pauseBot,
@@ -335,7 +864,7 @@ class _DashboardPageState extends State<DashboardPage>
           Expanded(
             child: ElevatedButton.icon(
               style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.red.shade800,
+                backgroundColor: _redLoss,
                 foregroundColor: Colors.white,
                 padding: const EdgeInsets.symmetric(vertical: 14),
               ),
@@ -348,35 +877,36 @@ class _DashboardPageState extends State<DashboardPage>
             ),
           ),
         ],
-      ],
-    );
-  }
+      );
+    }
 
-  Widget _buildStatusGrid() {
     return Row(
       children: [
         Expanded(
-          child: _metricTile(
-            'ENGINE',
-            _coordinator.engineState.name.toUpperCase(),
-          ),
-        ),
-        const SizedBox(width: 8),
-        Expanded(
-          child: _metricTile(
-            'NETWORK',
-            _coordinator.internetConnected ? 'ONLINE' : 'OFFLINE',
+          child: ElevatedButton.icon(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: _greenProfit,
+              foregroundColor: Colors.black,
+              padding: const EdgeInsets.symmetric(vertical: 14),
+            ),
+            onPressed: _coordinator.startBot,
+            icon: const Icon(Icons.play_arrow),
+            label: const Text(
+              'START PAPER BOT',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
           ),
         ),
       ],
     );
   }
 
-  Widget _buildAccountMetricsCard() {
+  Widget _buildLiveMarketCard() {
+    final feedHealthy =
+        _coordinator.marketDataStatus == MarketDataStatus.healthy;
     return Card(
-      color: const Color(0xFF141B29),
       child: Padding(
-        padding: const EdgeInsets.all(12),
+        padding: const EdgeInsets.all(14),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -384,63 +914,23 @@ class _DashboardPageState extends State<DashboardPage>
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 const Text(
-                  'PAPER ACCOUNT (\$100 INITIAL)',
+                  'COINDCX SPOT MARKETS (4s POLL)',
                   style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
                 ),
-                TextButton(
-                  onPressed: _coordinator.manualResetDrawdownAndAccount,
-                  child: const Text('RESET \$100'),
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                Expanded(
-                  child: _metricTile(
-                    'Equity (USDT)',
-                    '\$${_coordinator.accountEquityUsdt.toStringAsFixed(2)}',
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: _metricTile(
-                    'Available Cash',
-                    '\$${_coordinator.availableCashUsdt.toStringAsFixed(2)}',
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: _metricTile(
-                    'Drawdown (Max \$10)',
-                    '\$${_coordinator.currentDrawdownUsdt.toStringAsFixed(2)}',
+                Text(
+                  feedHealthy ? 'FEED: FRESH' : 'FEED: STALE',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.bold,
+                    color: feedHealthy ? _greenProfit : _orangeWarn,
                   ),
                 ),
               ],
             ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  /// Stage 12: Rich live market information card (Last, Bid, Ask, 24h High/Low, Vol, Change).
-  Widget _buildLiveMarketCard() {
-    return Card(
-      color: const Color(0xFF141B29),
-      child: Padding(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'COINDCX LIVE MARKET FEED (WS + REST FALLBACK)',
-              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
-            ),
-            const SizedBox(height: 10),
-            _pairRow('B-BTC_USDT', 'BTC/USDT'),
-            const Divider(height: 18),
-            _pairRow('B-ETH_USDT', 'ETH/USDT'),
+            const SizedBox(height: 12),
+            _pairRow('B-BTC_USDT', 'BTC / USDT'),
+            const Divider(height: 22),
+            _pairRow('B-ETH_USDT', 'ETH / USDT'),
           ],
         ),
       ),
@@ -449,14 +939,12 @@ class _DashboardPageState extends State<DashboardPage>
 
   Widget _pairRow(String symbol, String display) {
     final ticker = _coordinator.liveTickers[symbol];
-    final price =
-        ticker?.lastPrice ?? _coordinator.liveTickerPrices[symbol];
+    final price = ticker?.lastPrice ?? _coordinator.liveTickerPrices[symbol];
     final closed15m = _coordinator.closedCandlePrices[symbol];
     final whyNoTrade =
-        _coordinator.whyNoTradeForSymbol[symbol] ?? 'Waiting for next evaluation';
+        _coordinator.whyNoTradeForSymbol[symbol] ?? 'Ready for next 15m close';
     final change = ticker?.change24hPct ?? 0.0;
-    final changeColor =
-        change >= 0 ? Colors.greenAccent : Colors.redAccent;
+    final changeColor = change >= 0 ? _greenProfit : _redLoss;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -486,6 +974,11 @@ class _DashboardPageState extends State<DashboardPage>
             'Bid: \$${ticker.bid.toStringAsFixed(2)} | Ask: \$${ticker.ask.toStringAsFixed(2)} | 24h H/L: \$${ticker.high24h.toStringAsFixed(1)} / \$${ticker.low24h.toStringAsFixed(1)} | Vol: ${ticker.volume24h.toStringAsFixed(1)}',
             style: const TextStyle(fontSize: 11, color: Colors.white70),
           ),
+          const SizedBox(height: 2),
+          Text(
+            'Ticker Time: ${TradingCoordinator.formatUtcHhMmSs(ticker.timestampMs)} | Candle Time: ${_coordinator.lastCandleUpdateMs != null ? TradingCoordinator.formatUtcHhMmSs(_coordinator.lastCandleUpdateMs!) : "--"}',
+            style: const TextStyle(fontSize: 10, color: Colors.white54),
+          ),
         ],
         const SizedBox(height: 4),
         Text(
@@ -499,15 +992,18 @@ class _DashboardPageState extends State<DashboardPage>
   Widget _buildOpenPositionsCard() {
     final positions = _coordinator.openPositions;
     return Card(
-      color: const Color(0xFF141B29),
       child: Padding(
-        padding: const EdgeInsets.all(12),
+        padding: const EdgeInsets.all(14),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              'OPEN PAPER POSITIONS (${positions.length}/1)',
-              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+              'OPEN POSITIONS (${positions.length}/1)',
+              style: const TextStyle(
+                fontWeight: FontWeight.bold,
+                fontSize: 11,
+                color: Colors.white54,
+              ),
             ),
             const SizedBox(height: 8),
             if (positions.isEmpty)
@@ -523,21 +1019,21 @@ class _DashboardPageState extends State<DashboardPage>
                 return ListTile(
                   contentPadding: EdgeInsets.zero,
                   title: Text(
-                    '${pos.symbol} — Qty: ${pos.quantity.toStringAsFixed(5)} @ \$${pos.entryPrice.toStringAsFixed(2)}',
+                    '${pos.symbol} • Qty ${pos.quantity.toStringAsFixed(5)} @ \$${pos.entryPrice.toStringAsFixed(2)}',
                     style: const TextStyle(
                       fontWeight: FontWeight.bold,
                       fontSize: 13,
                     ),
                   ),
                   subtitle: Text(
-                    'SL: \$${pos.stopLoss.toStringAsFixed(2)} | TP: \$${pos.takeProfit.toStringAsFixed(2)} | Mark: \$${mark.toStringAsFixed(2)}',
-                    style: const TextStyle(fontSize: 12),
+                    'SL: \$${pos.stopLoss.toStringAsFixed(2)} | TP: \$${pos.takeProfit.toStringAsFixed(2)} | Live: \$${mark.toStringAsFixed(2)}',
+                    style: const TextStyle(fontSize: 11),
                   ),
                   trailing: Text(
                     '${upnl >= 0 ? "+" : ""}\$${upnl.toStringAsFixed(2)}',
                     style: TextStyle(
                       fontWeight: FontWeight.bold,
-                      color: upnl >= 0 ? Colors.greenAccent : Colors.redAccent,
+                      color: upnl >= 0 ? _greenProfit : _redLoss,
                     ),
                   ),
                 );
@@ -551,15 +1047,18 @@ class _DashboardPageState extends State<DashboardPage>
   Widget _buildRecentTradesCard() {
     final trades = _coordinator.closedTrades;
     return Card(
-      color: const Color(0xFF141B29),
       child: Padding(
-        padding: const EdgeInsets.all(12),
+        padding: const EdgeInsets.all(14),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              'CLOSED PAPER TRADES (${trades.length})',
-              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+              'CLOSED TRADES (${trades.length})',
+              style: const TextStyle(
+                fontWeight: FontWeight.bold,
+                fontSize: 11,
+                color: Colors.white54,
+              ),
             ),
             const SizedBox(height: 8),
             if (trades.isEmpty)
@@ -568,7 +1067,7 @@ class _DashboardPageState extends State<DashboardPage>
                 style: TextStyle(fontSize: 12, color: Colors.white60),
               )
             else
-              ...trades.take(10).map((t) {
+              ...trades.take(20).map((t) {
                 final win = t.realizedPnlUsdt >= 0;
                 return ListTile(
                   contentPadding: EdgeInsets.zero,
@@ -580,14 +1079,14 @@ class _DashboardPageState extends State<DashboardPage>
                     ),
                   ),
                   subtitle: Text(
-                    'Entry: \$${t.entryPrice.toStringAsFixed(2)} -> Exit: \$${t.exitPrice.toStringAsFixed(2)} (Fees: \$${t.totalFeesUsdt.toStringAsFixed(3)})',
+                    'Entry \$${t.entryPrice.toStringAsFixed(2)} → Exit \$${t.exitPrice.toStringAsFixed(2)} (Fees \$${t.totalFeesUsdt.toStringAsFixed(3)})',
                     style: const TextStyle(fontSize: 11),
                   ),
                   trailing: Text(
                     '${win ? "+" : ""}\$${t.realizedPnlUsdt.toStringAsFixed(2)}',
                     style: TextStyle(
                       fontWeight: FontWeight.bold,
-                      color: win ? Colors.greenAccent : Colors.redAccent,
+                      color: win ? _greenProfit : _redLoss,
                     ),
                   ),
                 );
@@ -600,10 +1099,9 @@ class _DashboardPageState extends State<DashboardPage>
 
   Widget _buildTradeAlertsToggleCard() {
     return Card(
-      color: const Color(0xFF141B29),
       child: SwitchListTile(
         title: const Text(
-          'Trade alert notifications',
+          'Trade Alert Notifications',
           style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
         ),
         subtitle: Text(
@@ -621,9 +1119,8 @@ class _DashboardPageState extends State<DashboardPage>
   Widget _buildBacktestCard() {
     final report = _coordinator.latestBacktestReport;
     return Card(
-      color: const Color(0xFF141B29),
       child: Padding(
-        padding: const EdgeInsets.all(12),
+        padding: const EdgeInsets.all(14),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -636,7 +1133,7 @@ class _DashboardPageState extends State<DashboardPage>
               'Run backtest on historical candles using identical strategy, fees, slippage & risk rules.',
               style: TextStyle(fontSize: 11, color: Colors.white60),
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: 10),
             ElevatedButton(
               onPressed: _coordinator.isRunningBacktest
                   ? null
@@ -648,10 +1145,14 @@ class _DashboardPageState extends State<DashboardPage>
               ),
             ),
             if (report != null) ...[
-              const SizedBox(height: 8),
+              const SizedBox(height: 10),
               Text(
                 'Trades: ${report.totalTrades} | Win Rate: ${report.winRatePct.toStringAsFixed(1)}% | Net PnL: \$${report.netPnlUsdt.toStringAsFixed(2)} | Max DD: \$${report.maxDrawdownUsdt.toStringAsFixed(2)}',
-                style: const TextStyle(fontSize: 12, color: Colors.greenAccent),
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                  color: report.netPnlUsdt >= 0 ? _greenProfit : _redLoss,
+                ),
               ),
             ],
           ],
@@ -660,11 +1161,15 @@ class _DashboardPageState extends State<DashboardPage>
     );
   }
 
-  Widget _metricTile(String label, String value) {
+  Widget _metricTile(
+    String label,
+    String value, {
+    Color valueColor = Colors.white,
+  }) {
     return Container(
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
-        color: const Color(0xFF1C2536),
+        color: const Color(0xFF182032),
         borderRadius: BorderRadius.circular(8),
       ),
       child: Column(
@@ -672,15 +1177,70 @@ class _DashboardPageState extends State<DashboardPage>
         children: [
           Text(
             label,
-            style: const TextStyle(fontSize: 11, color: Colors.white60),
+            style: const TextStyle(fontSize: 11, color: Colors.white54),
           ),
           const SizedBox(height: 4),
           Text(
             value,
-            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+            style: TextStyle(
+              fontWeight: FontWeight.bold,
+              fontSize: 14,
+              color: valueColor,
+            ),
           ),
         ],
       ),
     );
   }
+}
+
+class _EquityCurvePainter extends CustomPainter {
+  final List<EquityPoint> points;
+
+  const _EquityCurvePainter({required this.points});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (points.isEmpty) return;
+    final values = points.map((p) => p.equityUsdt).toList();
+    final minVal = values.reduce(math.min);
+    final maxVal = values.reduce(math.max);
+    final range = (maxVal - minVal).abs() < 0.01 ? 1.0 : (maxVal - minVal);
+
+    final isProfit = values.last >= 100.0;
+    final lineColor =
+        isProfit ? const Color(0xFF00E676) : const Color(0xFFFF5252);
+
+    final paint = Paint()
+      ..color = lineColor
+      ..strokeWidth = 2.2
+      ..style = PaintingStyle.stroke;
+
+    final path = Path();
+    for (int i = 0; i < values.length; i++) {
+      final x = values.length == 1
+          ? size.width / 2
+          : (i / (values.length - 1)) * size.width;
+      final normY = (values[i] - minVal) / range;
+      final y = size.height - (normY * (size.height - 12)) - 6;
+      if (i == 0) {
+        path.moveTo(x, y);
+      } else {
+        path.lineTo(x, y);
+      }
+    }
+    if (values.length == 1) {
+      canvas.drawLine(
+        Offset(0, size.height / 2),
+        Offset(size.width, size.height / 2),
+        paint,
+      );
+    } else {
+      canvas.drawPath(path, paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _EquityCurvePainter oldDelegate) =>
+      oldDelegate.points != points;
 }

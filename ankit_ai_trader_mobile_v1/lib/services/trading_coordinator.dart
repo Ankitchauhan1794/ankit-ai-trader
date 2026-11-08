@@ -46,8 +46,7 @@ class MethodChannelEngineBridge implements EngineCommandBridge {
   @override
   Future<bool> isServiceAndEngineReady() async {
     try {
-      final ok =
-          await _serviceChannel.invokeMethod<bool>('isServiceRunning');
+      final ok = await _serviceChannel.invokeMethod<bool>('isServiceRunning');
       return ok ?? false;
     } catch (_) {
       return false;
@@ -94,17 +93,25 @@ class TradingCoordinator extends ChangeNotifier {
 
   double availableCashUsdt = 100.0;
   double accountEquityUsdt = 100.0;
+  double startOfDayEquityUsdt = 100.0;
   bool maxDrawdownLocked = false;
   String? lockedDailyLossUtcDate;
   int? lastHeartbeatMs;
   int? lastNativeHeartbeatEpochMs;
   int? lastMarketDataUpdateMs;
+  int? lastCandleUpdateMs;
+  int serviceRestartCount = 0;
+  int orderSeq = 0;
   bool serviceRunning = false;
   bool dartEngineInitialized = false;
   bool ignoringBatteryOptimizations = true;
   bool notificationPermissionGranted = true;
   bool tradeAlertsEnabled = true;
+  bool autoResumeEnabled = false;
   bool internetConnected = true;
+  bool restoreFailedRequiresRestart = false;
+  String? restoreFailureReason;
+  String? lastError;
 
   String statusBannerMessage = 'PAPER BOT STOPPED — PRESS START';
   Map<String, double> liveTickerPrices = {};
@@ -114,9 +121,12 @@ class TradingCoordinator extends ChangeNotifier {
   List<PaperPosition> openPositions = [];
   List<SimulatedOrder> orders = [];
   List<ClosedPaperTrade> closedTrades = [];
+  List<EquityPoint> equityCurve = [];
+  List<DiagnosticEvent> recentEvents = [];
   List<String> recoveryLogs = [];
   BacktestReport? latestBacktestReport;
   bool isRunningBacktest = false;
+  bool _isTickerPollInFlight = false;
 
   Timer? _uiStateRefreshTimer;
   Timer? _liveTickerPollTimer;
@@ -139,8 +149,26 @@ class TradingCoordinator extends ChangeNotifier {
       engineState == BotEngineState.pausedStaleData ||
       engineState == BotEngineState.pausedAfterRecoveryManualStartRequired;
 
+  double get overallPnlUsdt => accountEquityUsdt - 100.0;
+  double get dailyPnlUsdt => accountEquityUsdt - startOfDayEquityUsdt;
   double get currentDrawdownUsdt =>
       (100.0 - accountEquityUsdt).clamp(0.0, 100.0);
+
+  /// Stage 5: Heartbeat status level ('OK' <90s, 'DELAYED' 90s-5m, 'DEAD' >5m)
+  String get heartbeatHealthLevel {
+    final hb = lastHeartbeatMs;
+    if (hb == null || hb <= 0) return 'DEAD';
+    final ageMs = _nowMs() - hb;
+    if (ageMs < 90 * 1000) return 'OK';
+    if (ageMs <= 5 * 60 * 1000) return 'DELAYED';
+    return 'DEAD';
+  }
+
+  int get heartbeatAgeSeconds {
+    final hb = lastHeartbeatMs;
+    if (hb == null || hb <= 0) return -1;
+    return ((_nowMs() - hb) / 1000).round().clamp(0, 999999);
+  }
 
   static String formatUtcHhMmSs(int epochMs) {
     final dt = DateTime.fromMillisecondsSinceEpoch(epochMs, isUtc: true);
@@ -152,10 +180,13 @@ class TradingCoordinator extends ChangeNotifier {
 
   String formatHeartbeatStatus([int? hbMs, int? nowMs]) {
     final target = hbMs ?? lastHeartbeatMs;
-    if (target == null || target <= 0) return 'Heartbeat: Never';
+    if (target == null || target <= 0) return 'Heartbeat: Never (DEAD)';
     final now = nowMs ?? _nowMs();
     final ageSec = ((now - target) / 1000).round().clamp(0, 999999);
-    return 'Heartbeat: ${formatUtcHhMmSs(target)} (${ageSec}s ago)';
+    final status = ageSec < 90
+        ? 'OK'
+        : (ageSec <= 300 ? 'DELAYED' : 'DEAD');
+    return 'Heartbeat: ${formatUtcHhMmSs(target)} (${ageSec}s ago • $status)';
   }
 
   Future<void> initialize({bool enablePlatformChannels = true}) async {
@@ -164,18 +195,6 @@ class TradingCoordinator extends ChangeNotifier {
     }
     await refreshStateFromDatabase(isInitialLoad: true);
     await _pollLiveTickersForDashboard();
-    await marketService.connectWebSocketFeed();
-    _wsTickerSub?.cancel();
-    _wsTickerSub = marketService.tickerStream.listen((tickers) {
-      if (tickers.isEmpty) return;
-      liveTickers = Map.from(tickers);
-      liveTickerPrices = {
-        for (final e in tickers.entries) e.key: e.value.lastPrice,
-      };
-      lastMarketDataUpdateMs = _nowMs();
-      marketDataStatus = MarketDataStatus.healthy;
-      notifyListeners();
-    });
     _startUiStateRefreshTimer();
   }
 
@@ -205,34 +224,41 @@ class TradingCoordinator extends ChangeNotifier {
     } catch (_) {}
   }
 
+  /// Stage 13: Poll live tickers every 4s (within 3-5s window) with non-overlapping guard.
   void _startUiStateRefreshTimer() {
     _uiStateRefreshTimer?.cancel();
     _uiStateRefreshTimer = Timer.periodic(const Duration(seconds: 4), (_) {
       refreshStateFromDatabase(isInitialLoad: false);
     });
     _liveTickerPollTimer?.cancel();
-    _liveTickerPollTimer = Timer.periodic(const Duration(seconds: 10), (_) {
+    _liveTickerPollTimer = Timer.periodic(const Duration(seconds: 4), (_) {
       _pollLiveTickersForDashboard();
     });
   }
 
   Future<void> _pollLiveTickersForDashboard() async {
+    if (_isTickerPollInFlight) return;
+    _isTickerPollInFlight = true;
     try {
-      final fetched = await marketService.fetchLiveTickers(nowMs: _nowMs());
+      final now = _nowMs();
+      final fetched = await marketService.fetchLiveTickers(nowMs: now);
       if (fetched.isNotEmpty) {
         liveTickers = Map.from(fetched);
         liveTickerPrices = {
           for (final e in fetched.entries) e.key: e.value.lastPrice,
         };
-        lastMarketDataUpdateMs = _nowMs();
+        lastMarketDataUpdateMs = now;
         marketDataStatus = MarketDataStatus.healthy;
         notifyListeners();
       }
     } catch (_) {
-      if (liveTickers.isEmpty) {
-        marketDataStatus = MarketDataStatus.disconnected;
-        notifyListeners();
+      final lastUpd = lastMarketDataUpdateMs;
+      if (lastUpd == null || (_nowMs() - lastUpd) > 30000) {
+        marketDataStatus = MarketDataStatus.stale;
       }
+      notifyListeners();
+    } finally {
+      _isTickerPollInFlight = false;
     }
   }
 
@@ -248,15 +274,27 @@ class TradingCoordinator extends ChangeNotifier {
         if (nativeHb is int && nativeHb > 0) {
           lastNativeHeartbeatEpochMs = nativeHb;
         }
+        final err = status['lastError'] ?? status['lastHeartbeatTickError'];
+        if (err is String && err.isNotEmpty) {
+          lastError = err;
+        }
         return serviceRunning && dartEngineInitialized;
       }
-      return await commandBridge.isServiceAndEngineReady();
+      final ready = await commandBridge.isServiceAndEngineReady();
+      serviceRunning = ready;
+      dartEngineInitialized = ready;
+      return ready;
     } catch (_) {
+      serviceRunning = false;
+      dartEngineInitialized = false;
       return false;
     }
   }
 
-  /// Stage 3 & 4: Restore previous session when dashboard opens without overwriting running intention!
+  /// Stage 4: Restore session on dashboard open.
+  /// - RUNNING + service/heartbeat alive -> reconnect, show RECONNECTED — heartbeat HH:MM:SS, no START button.
+  /// - RUNNING + service dead -> restore once, show reason + RESTART button if it fails.
+  /// - PAUSED -> show RESUME. STOPPED -> show START. Never auto-start a STOPPED bot.
   Future<void> refreshStateFromDatabase({bool isInitialLoad = false}) async {
     try {
       final snap = await persistence.loadFullState();
@@ -268,39 +306,57 @@ class TradingCoordinator extends ChangeNotifier {
 
       userIntention = snap.userIntention;
 
-      // Stage 3 Fix: If the user intended the bot to be RUNNING (and no hard risk lock was hit),
-      // automatically self-heal and restart the background service if either !serviceReady OR !hasRecentHeartbeat.
       if (snap.userIntention == UserSessionIntention.running &&
           snap.botState != BotEngineState.stoppedMaxDrawdownReached &&
           snap.botState != BotEngineState.lockedDailyLossLimit) {
-        if (!serviceReady || !hasRecentHeartbeat) {
+        if (serviceReady && hasRecentHeartbeat) {
+          restoreFailedRequiresRestart = false;
+          restoreFailureReason = null;
           _applySnapshotToFields(snap);
           engineState = BotEngineState.running;
-          statusBannerMessage =
-              'RESTORING RUNNING SESSION — SELF-HEALING BACKGROUND ENGINE...';
-          notifyListeners();
-
-          final okService = await commandBridge.ensureServiceStartedAndReady();
-          if (okService) {
-            await commandBridge.dispatchCommand('START');
-            final updated = await persistence.loadFullState();
-            _applySnapshotToFields(updated);
-            engineState = BotEngineState.running;
-            final displayHb = updated.lastHeartbeatMs ?? nowMs;
+          if (isInitialLoad) {
             statusBannerMessage =
-                'RECONNECTED – heartbeat ${formatUtcHhMmSs(displayHb)}';
-          } else {
-            engineState = BotEngineState.pausedNetworkLoss;
-            statusBannerMessage =
-                'SESSION INTENTION: RUNNING — WAITING FOR SERVICE / NETWORK AUTO-RECOVERY';
+                'RECONNECTED — heartbeat ${formatUtcHhMmSs(hbMs)}';
           }
           notifyListeners();
           return;
         } else if (isInitialLoad) {
+          // Restore once on dashboard open when intention == RUNNING but service/heartbeat is dead
           _applySnapshotToFields(snap);
-          engineState = BotEngineState.running;
-          statusBannerMessage =
-              'RECONNECTED – heartbeat ${formatUtcHhMmSs(hbMs)}';
+          statusBannerMessage = 'Restoring running session...';
+          notifyListeners();
+
+          final okStart = await commandBridge.ensureServiceStartedAndReady();
+          final okCmd = okStart && await commandBridge.dispatchCommand('START');
+          if (okCmd) {
+            restoreFailedRequiresRestart = false;
+            restoreFailureReason = null;
+            serviceRestartCount = snap.serviceRestartCount + 1;
+            await persistence.putKv(
+              'serviceRestartCount',
+              serviceRestartCount.toString(),
+            );
+            await persistence.logDiagnosticEvent(
+              'SESSION_RESTORE',
+              'Restored background service on dashboard open (restart #$serviceRestartCount)',
+            );
+            final refreshed = await persistence.loadFullState();
+            _applySnapshotToFields(refreshed);
+            engineState = BotEngineState.running;
+            final displayHb = refreshed.lastHeartbeatMs ?? nowMs;
+            statusBannerMessage =
+                'RECONNECTED — heartbeat ${formatUtcHhMmSs(displayHb)}';
+          } else {
+            restoreFailedRequiresRestart = true;
+            restoreFailureReason =
+                lastError ?? 'Background service did not respond to single-shot restore';
+            statusBannerMessage =
+                'RESTORE FAILED: $restoreFailureReason — Tap RESTART';
+            await persistence.logDiagnosticEvent(
+              'RESTORE_FAILED',
+              restoreFailureReason!,
+            );
+          }
           notifyListeners();
           return;
         }
@@ -309,7 +365,6 @@ class TradingCoordinator extends ChangeNotifier {
       _applySnapshotToFields(snap);
       notifyListeners();
     } catch (_) {
-      // Stage 3 Fix: Do not overwrite engineState to pausedStaleData on transient SQLite read error
       notifyListeners();
     }
   }
@@ -319,16 +374,23 @@ class TradingCoordinator extends ChangeNotifier {
     userIntention = snap.userIntention;
     availableCashUsdt = snap.availableCashUsdt;
     accountEquityUsdt = snap.accountEquityUsdt;
+    startOfDayEquityUsdt = snap.startOfDayEquityUsdt;
     maxDrawdownLocked = snap.maxDrawdownLocked;
     lockedDailyLossUtcDate = snap.lockedDailyLossUtcDate;
     lastHeartbeatMs = snap.lastHeartbeatMs;
-    lastMarketDataUpdateMs = snap.lastMarketDataUpdateMs;
+    lastMarketDataUpdateMs =
+        snap.lastMarketDataUpdateMs ?? lastMarketDataUpdateMs;
+    lastCandleUpdateMs = snap.lastCandleUpdateMs;
+    serviceRestartCount = snap.serviceRestartCount;
+    orderSeq = snap.orderSeq;
+    autoResumeEnabled = snap.autoResumeEnabled;
+    lastError = snap.lastError ?? lastError;
     statusBannerMessage = snap.statusBannerMessage;
     tradeAlertsEnabled = snap.tradeAlertsEnabled;
-    if (snap.liveTickers.isNotEmpty) {
+    if (snap.liveTickers.isNotEmpty && liveTickers.isEmpty) {
       liveTickers = Map.from(snap.liveTickers);
     }
-    if (snap.liveTickerPrices.isNotEmpty) {
+    if (snap.liveTickerPrices.isNotEmpty && liveTickerPrices.isEmpty) {
       liveTickerPrices = Map.from(snap.liveTickerPrices);
     }
     closedCandlePrices = Map.from(snap.closedCandlePrices);
@@ -336,6 +398,8 @@ class TradingCoordinator extends ChangeNotifier {
     openPositions = List.from(snap.openPositions);
     orders = List.from(snap.orders);
     closedTrades = List.from(snap.closedTrades);
+    equityCurve = List.from(snap.equityCurve);
+    recentEvents = List.from(snap.recentEvents);
     recoveryLogs = List.from(snap.recoveryLogs);
   }
 
@@ -345,6 +409,8 @@ class TradingCoordinator extends ChangeNotifier {
       notifyListeners();
       return;
     }
+    restoreFailedRequiresRestart = false;
+    restoreFailureReason = null;
     await persistence.saveUserIntention(UserSessionIntention.running);
     userIntention = UserSessionIntention.running;
     engineState = BotEngineState.running;
@@ -354,6 +420,8 @@ class TradingCoordinator extends ChangeNotifier {
 
     final serviceReady = await commandBridge.ensureServiceStartedAndReady();
     if (!serviceReady) {
+      restoreFailedRequiresRestart = true;
+      restoreFailureReason = 'Foreground service failed to initialize';
       statusBannerMessage =
           'CANNOT START: FOREGROUND SERVICE FAILED TO INITIALIZE';
       notifyListeners();
@@ -370,6 +438,7 @@ class TradingCoordinator extends ChangeNotifier {
   }
 
   Future<void> pauseBot() async {
+    restoreFailedRequiresRestart = false;
     await persistence.saveUserIntention(UserSessionIntention.paused);
     userIntention = UserSessionIntention.paused;
     await commandBridge.dispatchCommand('PAUSE');
@@ -377,6 +446,7 @@ class TradingCoordinator extends ChangeNotifier {
   }
 
   Future<void> stopBot() async {
+    restoreFailedRequiresRestart = false;
     await persistence.saveUserIntention(UserSessionIntention.stopped);
     userIntention = UserSessionIntention.stopped;
     await commandBridge.dispatchCommand('STOP');
@@ -385,6 +455,7 @@ class TradingCoordinator extends ChangeNotifier {
   }
 
   Future<void> manualResetDrawdownAndAccount() async {
+    restoreFailedRequiresRestart = false;
     await persistence.saveUserIntention(UserSessionIntention.stopped);
     userIntention = UserSessionIntention.stopped;
     final ready = await commandBridge.isServiceAndEngineReady();
@@ -412,6 +483,12 @@ class TradingCoordinator extends ChangeNotifier {
   Future<void> setTradeAlertsEnabled(bool enabled) async {
     tradeAlertsEnabled = enabled;
     await persistence.setTradeAlertsEnabled(enabled);
+    notifyListeners();
+  }
+
+  Future<void> setAutoResumeEnabled(bool enabled) async {
+    autoResumeEnabled = enabled;
+    await persistence.setAutoResumeEnabled(enabled);
     notifyListeners();
   }
 

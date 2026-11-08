@@ -3,7 +3,6 @@ import '../models/trading_models.dart';
 import 'coindcx_market_service.dart';
 import 'paper_broker.dart';
 import 'persistence_db.dart';
-import 'risk_manager.dart';
 import 'strategy_engine.dart';
 import 'trade_alert_formatter.dart';
 
@@ -17,7 +16,7 @@ class AuthoritativeTradingEngine {
   final StrategyEngine strategyEngine;
   final int Function() nowMsProvider;
   final Future<void> Function(String title, String text)? onNotificationUpdate;
-  final Future<void> Function(TradeAlertPayload alert)? onTradeAlert;
+  final Future<bool> Function(TradeAlertPayload alert)? onTradeAlert;
   final Future<void> Function(int delayMs, String reason)? onSchedulerRetry;
   final Future<void> Function(UserSessionIntention intention)?
       onSyncUserIntention;
@@ -25,7 +24,6 @@ class AuthoritativeTradingEngine {
   final String _ownerId;
   bool _isCycleExecuting = false;
   Timer? _retryTimer;
-  StreamSubscription<Map<String, LiveMarketTicker>>? _wsSubscription;
 
   AuthoritativeTradingEngine({
     required this.marketService,
@@ -40,33 +38,19 @@ class AuthoritativeTradingEngine {
   })  : broker = broker ?? PaperBroker(),
         nowMsProvider =
             nowMsProvider ?? (() => DateTime.now().millisecondsSinceEpoch),
-        _ownerId = 'auth_engine_${DateTime.now().microsecondsSinceEpoch}' {
-    _wsSubscription = marketService.tickerStream.listen((tickers) async {
-      if (tickers.isEmpty) return;
-      final prices = {
-        for (final e in tickers.entries) e.key: e.value.lastPrice,
-      };
-      await persistence.putKv(
-        'liveTickerPrices',
-        _encodeNumMap(prices),
-      );
-    });
-  }
+        _ownerId = 'auth_engine_${DateTime.now().microsecondsSinceEpoch}';
 
-  String _encodeNumMap(Map<String, double> m) {
-    final entries =
-        m.entries.map((e) => '"${e.key}":${e.value}').join(',');
-    return '{$entries}';
-  }
-
-  /// Stage 6: Restore session automatically when background service starts if userIntention == running.
+  /// Stage 6: Process-death recreation restarts trading ONLY if intention == RUNNING.
   Future<void> restoreSessionIfRunningIntended() async {
-    await marketService.connectWebSocketFeed();
     final snap = await persistence.loadFullState();
     _hydrateBrokerFromSnapshot(snap);
     if (snap.userIntention == UserSessionIntention.running &&
         snap.botState != BotEngineState.stoppedMaxDrawdownReached &&
         snap.botState != BotEngineState.lockedDailyLossLimit) {
+      await persistence.logDiagnosticEvent(
+        'PROCESS_RESTORE',
+        'Headless engine initialized; restoring RUNNING session',
+      );
       await executeAuthoritativeCycle(
         allowTradingExecution: true,
         transitionToRunningOnSuccess: true,
@@ -103,9 +87,9 @@ class AuthoritativeTradingEngine {
       case 'START':
         if (broker.maxDrawdownLocked ||
             broker.riskManager.isMaxDrawdownReached(snap.accountEquityUsdt)) {
+          // Stage 3: Safety lock changes botState ONLY, never userIntention
           await persistence.saveFullState(
             botState: BotEngineState.stoppedMaxDrawdownReached,
-            userIntention: UserSessionIntention.stopped,
             availableCashUsdt: broker.availableCashUsdt,
             accountEquityUsdt: snap.accountEquityUsdt,
             maxDrawdownLocked: true,
@@ -123,13 +107,11 @@ class AuthoritativeTradingEngine {
             closedTrades: broker.closedTrades,
             processedEntrySignalKeys: broker.processedEntrySignalKeys,
           );
-          await onSyncUserIntention?.call(UserSessionIntention.stopped);
           return false;
         }
         await persistence.saveUserIntention(UserSessionIntention.running);
         await onSyncUserIntention?.call(UserSessionIntention.running);
         await _resetRecoveryTracking();
-        await marketService.connectWebSocketFeed();
         return await executeAuthoritativeCycle(
           allowTradingExecution: true,
           transitionToRunningOnSuccess: true,
@@ -149,7 +131,7 @@ class AuthoritativeTradingEngine {
           lastHeartbeatMs: nowMs,
           runningSinceMs: null,
           totalActiveMs: snap.totalActiveMs,
-          statusBannerMessage: 'BOT PAUSED MANUALLY – PRESS START TO RESUME',
+          statusBannerMessage: 'BOT PAUSED MANUALLY – PRESS RESUME TO CONTINUE',
           liveTickerPrices: snap.liveTickerPrices,
           liveTickers: snap.liveTickers,
           closedCandlePrices: snap.closedCandlePrices,
@@ -199,6 +181,8 @@ class AuthoritativeTradingEngine {
       case 'RESET':
         _retryTimer?.cancel();
         await _resetRecoveryTracking();
+        // Stage 8: Preserve notifiedAlertIds across RESET
+        final preservedAlerts = await persistence.getNotifiedAlertIds();
         broker.manualResetPaperAccount();
         await persistence.saveFullState(
           botState: BotEngineState.stopped,
@@ -221,6 +205,9 @@ class AuthoritativeTradingEngine {
           closedTrades: const [],
           processedEntrySignalKeys: const {},
         );
+        for (final id in preservedAlerts) {
+          await persistence.markAlertIdNotified(id);
+        }
         await onSyncUserIntention?.call(UserSessionIntention.stopped);
         return true;
 
@@ -235,7 +222,7 @@ class AuthoritativeTradingEngine {
     }
   }
 
-  /// Stage 7 & 8: Single authoritative trading cycle with SQLite execution lock & unbounded auto-recovery.
+  /// Stage 8: Single authoritative engine execution covered by SQLite lease lock.
   Future<bool> executeAuthoritativeCycle({
     required bool allowTradingExecution,
     bool transitionToRunningOnSuccess = false,
@@ -257,20 +244,20 @@ class AuthoritativeTradingEngine {
       final snap = await persistence.loadFullState();
       _hydrateBrokerFromSnapshot(snap);
 
-      final userWantsRunning =
-          transitionToRunningOnSuccess ||
-          snap.userIntention == UserSessionIntention.running ||
-          snap.botState == BotEngineState.running;
+      // Stage 3 & 6: Never auto-run if userIntention is STOPPED or PAUSED
+      final userWantsRunning = transitionToRunningOnSuccess ||
+          snap.userIntention == UserSessionIntention.running;
 
       if (!userWantsRunning && allowTradingExecution) {
         return true;
       }
 
-      if (snap.botState == BotEngineState.stoppedMaxDrawdownReached) {
+      if (snap.botState == BotEngineState.stoppedMaxDrawdownReached ||
+          snap.botState == BotEngineState.lockedDailyLossLimit) {
         return false;
       }
 
-      // 1. Fetch live ticker prices (Stages 10, 11, 13)
+      // Stage 12 & 14: Fetch live tickers for current price, equity, uPnL & live SL/TP
       Map<String, LiveMarketTicker> liveTickers = {};
       try {
         liveTickers = await marketService.fetchLiveTickers(nowMs: nowMs);
@@ -296,6 +283,7 @@ class AuthoritativeTradingEngine {
       final closedPrices = Map<String, double>.from(snap.closedCandlePrices);
       final whyNoTrade = Map<String, String>.from(snap.whyNoTradeForSymbol);
       final canTrade = allowTradingExecution && userWantsRunning;
+      int latestCandleMs = snap.lastCandleUpdateMs ?? 0;
 
       for (final symbol in watchedSymbols) {
         List<Candle> candles15m;
@@ -331,6 +319,10 @@ class AuthoritativeTradingEngine {
         }
 
         closedPrices[symbol] = candles15m.last.close;
+        if (candles15m.last.closeTimeMs > latestCandleMs) {
+          latestCandleMs = candles15m.last.closeTimeMs;
+        }
+
         final pairMeta = MarketPairMetadata(
           symbol: symbol,
           baseCurrency: symbol.contains('BTC') ? 'BTC' : 'ETH',
@@ -356,13 +348,14 @@ class AuthoritativeTradingEngine {
 
         if (outcome.triggeredSafetyState != null) {
           final eq = broker.accountEquityUsdt(livePrices);
-          final targetIntention = outcome.triggeredSafetyState ==
-                  BotEngineState.stoppedMaxDrawdownReached
-              ? UserSessionIntention.stopped
-              : snap.userIntention;
+          await persistence.logDiagnosticEvent(
+            'SAFETY_LOCK',
+            outcome.safetyMessage ?? outcome.triggeredSafetyState!.name,
+            timestampMs: nowMs,
+          );
+          // Stage 3: Never mutate userIntention on safety lock!
           await persistence.saveFullState(
             botState: outcome.triggeredSafetyState!,
-            userIntention: targetIntention,
             availableCashUsdt: broker.availableCashUsdt,
             accountEquityUsdt: eq,
             maxDrawdownLocked: broker.maxDrawdownLocked,
@@ -370,6 +363,8 @@ class AuthoritativeTradingEngine {
             lastStopLossClosedAtMs: broker.lastStopLossClosedAtMs,
             lastHeartbeatMs: nowMs,
             lastMarketDataUpdateMs: nowMs,
+            lastCandleUpdateMs: latestCandleMs,
+            orderSeq: snap.orderSeq + outcome.newOrders.length,
             statusBannerMessage:
                 outcome.safetyMessage ?? 'SAFETY LOCK TRIGGERED',
             liveTickerPrices: livePrices,
@@ -385,21 +380,16 @@ class AuthoritativeTradingEngine {
         }
       }
 
-      // Stage 8: Fresh data validated -> automatically resume running if userIntention == running!
       await _resetRecoveryTracking();
       final eq = broker.accountEquityUsdt(livePrices);
-      final targetState = userWantsRunning
-          ? BotEngineState.running
-          : snap.botState;
+      final targetState =
+          userWantsRunning ? BotEngineState.running : snap.botState;
       final banner = userWantsRunning
           ? 'PAPER BOT RUNNING — Heartbeat ${_formatHhMmSs(nowMs)}'
           : snap.statusBannerMessage;
 
       await persistence.saveFullState(
         botState: targetState,
-        userIntention: userWantsRunning
-            ? UserSessionIntention.running
-            : snap.userIntention,
         availableCashUsdt: broker.availableCashUsdt,
         accountEquityUsdt: eq,
         maxDrawdownLocked: broker.maxDrawdownLocked,
@@ -407,8 +397,11 @@ class AuthoritativeTradingEngine {
         lastStopLossClosedAtMs: broker.lastStopLossClosedAtMs,
         lastHeartbeatMs: nowMs,
         lastMarketDataUpdateMs: nowMs,
-        runningSinceMs: snap.runningSinceMs ?? (userWantsRunning ? nowMs : null),
+        lastCandleUpdateMs: latestCandleMs,
+        runningSinceMs:
+            snap.runningSinceMs ?? (userWantsRunning ? nowMs : null),
         totalActiveMs: snap.totalActiveMs,
+        orderSeq: snap.orderSeq + 1,
         statusBannerMessage: banner,
         liveTickerPrices: livePrices,
         liveTickers: liveTickers,
@@ -457,7 +450,6 @@ class AuthoritativeTradingEngine {
     throw lastErr ?? Exception('Failed to fetch candles for $pair');
   }
 
-  /// Stage 8: Unbounded auto-recovery with exponential backoff (never permanently halts when userIntention == running).
   Future<void> _handleBoundedRecoveryOrPause({
     required PersistedEngineSnapshot snap,
     required int nowMs,
@@ -465,9 +457,8 @@ class AuthoritativeTradingEngine {
     required String reason,
   }) async {
     final attempt = snap.recoveryAttemptCount + 1;
-    final delaySec = attempt <= 1
-        ? 5
-        : (attempt == 2 ? 15 : (attempt == 3 ? 30 : 60));
+    final delaySec =
+        attempt <= 1 ? 5 : (attempt == 2 ? 15 : (attempt == 3 ? 30 : 60));
     final delayMs = delaySec * 1000;
     final startedAt = snap.recoveryStartedAtMs ?? nowMs;
     final nextAllowed = nowMs + delayMs;
@@ -481,9 +472,9 @@ class AuthoritativeTradingEngine {
       logMessage: logLine,
     );
 
+    // Stage 3: Never mutate userIntention on transient errors/network loss/stale data!
     await persistence.saveFullState(
       botState: pauseState,
-      userIntention: snap.userIntention,
       availableCashUsdt: broker.availableCashUsdt,
       accountEquityUsdt: snap.accountEquityUsdt,
       maxDrawdownLocked: broker.maxDrawdownLocked,
@@ -491,7 +482,7 @@ class AuthoritativeTradingEngine {
       lastStopLossClosedAtMs: broker.lastStopLossClosedAtMs,
       lastHeartbeatMs: nowMs,
       statusBannerMessage:
-          'AUTO-RECOVERING (#$attempt, retry in ${delaySec}s): $reason',
+          'PAUSED (${pauseState.name}): $reason',
       liveTickerPrices: snap.liveTickerPrices,
       liveTickers: snap.liveTickers,
       closedCandlePrices: snap.closedCandlePrices,
@@ -502,13 +493,15 @@ class AuthoritativeTradingEngine {
       processedEntrySignalKeys: broker.processedEntrySignalKeys,
     );
 
-    _retryTimer?.cancel();
-    _retryTimer = Timer(Duration(milliseconds: delayMs), () {
-      executeAuthoritativeCycle(
-        allowTradingExecution: true,
-        transitionToRunningOnSuccess: true,
-      );
-    });
+    if (snap.autoResumeEnabled) {
+      _retryTimer?.cancel();
+      _retryTimer = Timer(Duration(milliseconds: delayMs), () {
+        executeAuthoritativeCycle(
+          allowTradingExecution: true,
+          transitionToRunningOnSuccess: true,
+        );
+      });
+    }
     await onSchedulerRetry?.call(delayMs, reason);
   }
 
@@ -517,34 +510,50 @@ class AuthoritativeTradingEngine {
     await persistence.clearRecoveryState();
   }
 
-  /// Stage 8: Network transition handler that immediately validates & resumes when internet returns.
+  /// Stage 9: Network transition handler respecting autoResumeEnabled (default OFF).
+  /// When ON, resumes ONLY after fresh validated data and ONLY from network/stale-data pauses.
+  /// NEVER resumes from user PAUSE/STOP, daily-loss lock, or drawdown lock.
   Future<void> handleNetworkTransition(bool connected) async {
     final nowMs = nowMsProvider();
     final snap = await persistence.loadFullState();
     if (!connected) {
-      if (snap.userIntention == UserSessionIntention.running ||
+      if (snap.userIntention == UserSessionIntention.running &&
           snap.botState == BotEngineState.running) {
         await _handleBoundedRecoveryOrPause(
           snap: snap,
           nowMs: nowMs,
           pauseState: BotEngineState.pausedNetworkLoss,
-          reason: 'Internet disconnected. Bot paused for safety; will auto-resume when internet returns.',
+          reason: 'Internet disconnected. Bot paused for safety.',
         );
       }
       return;
     }
 
-    await marketService.connectWebSocketFeed();
+    // Network returned
+    await persistence.logDiagnosticEvent(
+      'NETWORK_RESTORED',
+      'Internet connection restored (autoResume=${snap.autoResumeEnabled})',
+      timestampMs: nowMs,
+    );
+
     if (snap.userIntention == UserSessionIntention.running &&
-        snap.botState != BotEngineState.stoppedMaxDrawdownReached &&
-        snap.botState != BotEngineState.lockedDailyLossLimit) {
-      await executeAuthoritativeCycle(
-        allowTradingExecution: true,
-        transitionToRunningOnSuccess: true,
-      );
+        (snap.botState == BotEngineState.pausedNetworkLoss ||
+            snap.botState == BotEngineState.pausedStaleData)) {
+      if (snap.autoResumeEnabled) {
+        await executeAuthoritativeCycle(
+          allowTradingExecution: true,
+          transitionToRunningOnSuccess: true,
+        );
+      } else {
+        await persistence.putKv(
+          'statusBannerMessage',
+          'Internet restored. Auto-resume is OFF — tap RESUME or enable Auto-Resume in Settings.',
+        );
+      }
     }
   }
 
+  /// Stage 8: Mark an alert "sent" in SQLite ONLY after it actually posted (`posted == true`).
   Future<void> _emitAlertsForNewOrders(CandleStreamOutcome outcome) async {
     final enabled = await persistence.getTradeAlertsEnabled();
     if (!enabled) return;
@@ -560,16 +569,20 @@ class AuthoritativeTradingEngine {
         takeProfit: pos?.takeProfit ?? 0.0,
       );
       if (!notified.contains(alert.alertId)) {
-        await persistence.markAlertIdNotified(alert.alertId);
-        await onTradeAlert?.call(alert);
+        final posted = (await onTradeAlert?.call(alert)) ?? false;
+        if (posted) {
+          await persistence.markAlertIdNotified(alert.alertId);
+        }
       }
     }
 
     for (final trd in outcome.newClosedTrades) {
       final alert = TradeAlertFormatter.formatExitAlert(trd);
       if (!notified.contains(alert.alertId)) {
-        await persistence.markAlertIdNotified(alert.alertId);
-        await onTradeAlert?.call(alert);
+        final posted = (await onTradeAlert?.call(alert)) ?? false;
+        if (posted) {
+          await persistence.markAlertIdNotified(alert.alertId);
+        }
       }
     }
 
@@ -580,8 +593,10 @@ class AuthoritativeTradingEngine {
         timestampMs: nowMsProvider(),
       );
       if (!notified.contains(alert.alertId)) {
-        await persistence.markAlertIdNotified(alert.alertId);
-        await onTradeAlert?.call(alert);
+        final posted = (await onTradeAlert?.call(alert)) ?? false;
+        if (posted) {
+          await persistence.markAlertIdNotified(alert.alertId);
+        }
       }
     }
   }
@@ -611,6 +626,5 @@ class AuthoritativeTradingEngine {
 
   void dispose() {
     _retryTimer?.cancel();
-    _wsSubscription?.cancel();
   }
 }
