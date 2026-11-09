@@ -1855,34 +1855,31 @@ void main() {
   // ============================================================================
   test('Multi-Pair Test 21: AuthoritativeTradingEngine dynamically discovers eligible pairs, isolates single-pair candle errors, ranks multiple BUY signals, and enforces 1-max-open-position portfolio limit', () async {
     final db = PersistenceDatabase(useInMemoryFallback: true);
-    const nowMs = 200 * 900000;
+    const nowMs = 100 * 3600000;
 
-    // Build synthetic 15m and 1h closed candle series that produce a genuine EMA20 > EMA50 crossover with RSI in [50, 65] and 1h bullish
+    // Build synthetic 15m and 1h closed candle series aligned to nowMs that produce a genuine EMA20 > EMA50 crossover with RSI=61.50 in [50, 65] and 1h bullish
     List<Map<String, dynamic>> buildBullishCrossoverCandlesJson({
       required int intervalMs,
       required double basePrice,
-      required double finalJump,
     }) {
       final list = <Map<String, dynamic>>[];
       for (int i = 0; i < 65; i++) {
-        final openMs = (i + 1) * intervalMs;
+        final openMs = nowMs - ((65 - i) * intervalMs);
         double closePx;
-        if (i < 55) {
-          // Slight decline so EMA20 is just below EMA50 at bar 63
-          closePx = basePrice - (i * 0.2);
+        if (i < 50) {
+          closePx = basePrice;
         } else if (i < 63) {
-          closePx = basePrice - (55 * 0.2) + ((i - 55) * 0.65);
+          closePx = basePrice - 0.15 + (i % 2 == 0 ? 0.25 : -0.25);
         } else if (i == 63) {
-          closePx = basePrice - 6.0;
+          closePx = basePrice - 0.20;
         } else {
-          // Bar 64 (last closed candle): modest upward move that crosses EMA20 above EMA50 with RSI in 50-65
-          closePx = basePrice - 6.0 + finalJump;
+          closePx = basePrice + 1.10;
         }
         list.add({
           'time': openMs,
           'open': closePx - 0.2,
-          'high': closePx + 0.8,
-          'low': closePx - 0.8,
+          'high': closePx + 1.5,
+          'low': closePx - 1.5,
           'close': closePx,
           'volume': 150.0,
         });
@@ -1892,9 +1889,10 @@ void main() {
 
     List<Map<String, dynamic>> buildBullish1hCandlesJson(double basePrice) {
       return List.generate(65, (i) {
+        final openMs = nowMs - ((65 - i) * 3600000);
         final px = basePrice + (i * 1.5);
         return {
-          'time': (i + 1) * 3600000,
+          'time': openMs,
           'open': px - 0.5,
           'high': px + 1.0,
           'low': px - 1.0,
@@ -1946,22 +1944,22 @@ void main() {
           jsonEncode([
             {
               'market': 'SOLUSDT',
-              'last_price': '196.50',
-              'bid': '196.45',
-              'ask': '196.55',
-              'high': '202.0',
-              'low': '190.0',
+              'last_price': '201.10',
+              'bid': '201.05',
+              'ask': '201.15',
+              'high': '205.0',
+              'low': '195.0',
               'volume': '85000.0',
               'change_24_hour': '3.2',
               'timestamp': nowMs - 2000,
             },
             {
               'market': 'AVAXUSDT',
-              'last_price': '96.50',
-              'bid': '96.40',
-              'ask': '96.60',
-              'high': '99.0',
-              'low': '92.0',
+              'last_price': '101.10',
+              'bid': '101.00',
+              'ask': '101.20',
+              'high': '104.0',
+              'low': '97.0',
               'volume': '12000.0',
               'change_24_hour': '1.8',
               'timestamp': nowMs - 2000,
@@ -2008,7 +2006,6 @@ void main() {
             buildBullishCrossoverCandlesJson(
               intervalMs: 900000,
               basePrice: base,
-              finalJump: 2.8,
             ),
           ),
           200,
@@ -2040,6 +2037,10 @@ void main() {
     expect(snap.scanDiagnostics.totalPairsEvaluated, 2);
     expect(snap.scanDiagnostics.skippedPairsReasons.containsKey('B-BROKEN_USDT'), isTrue);
     expect(snap.scanDiagnostics.skippedPairsReasons.containsKey('I-BTC_INR'), isTrue);
+    // Both B-SOL_USDT and B-AVAX_USDT generated valid BUY signals (2 total); top-ranked opened 1 position, second was rejected by 1-position limit!
+    expect(snap.scanDiagnostics.buySignalsCount, 2);
+    expect(snap.openPositions.length, 1);
+    expect(snap.scanDiagnostics.rejectedSignalsCount, 1);
 
     marketService.dispose();
     engine.dispose();
