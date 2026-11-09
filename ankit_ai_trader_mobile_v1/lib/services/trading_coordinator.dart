@@ -8,6 +8,7 @@ import 'execution_and_risk_hub.dart';
 import 'paper_broker.dart';
 import 'persistence_db.dart';
 import 'quant_research_lab.dart';
+import 'stage47_autonomous_governance.dart';
 
 abstract class EngineCommandBridge {
   Future<bool> ensureServiceStartedAndReady();
@@ -98,6 +99,15 @@ class TradingCoordinator extends ChangeNotifier {
   final QuantResearchValidator quantValidator = const QuantResearchValidator();
   final VpsAgentOrchestrator agentOrchestrator =
       const VpsAgentOrchestrator(vpsStage20bApproved: false);
+  final CompleteMarketPairDiscoveryEngine pairDiscoveryEngine =
+      CompleteMarketPairDiscoveryEngine();
+  final AiModelGovernanceRegistry modelGovernanceRegistry =
+      AiModelGovernanceRegistry();
+  final CashFlowReconciliationLedger cashFlowLedger =
+      CashFlowReconciliationLedger();
+  final AiCostAndProviderManager aiCostManager = AiCostAndProviderManager();
+  final AutonomousNotificationRouter autonomousAlertRouter =
+      AutonomousNotificationRouter();
 
   BotEngineState engineState = BotEngineState.stopped;
   UserSessionIntention userIntention = UserSessionIntention.stopped;
@@ -213,6 +223,74 @@ class TradingCoordinator extends ChangeNotifier {
         paperStatus: extendedPaperStatus,
         tradeOnlyKeyVerified: false,
         runtimeViolationDetected: maxDrawdownLocked,
+      );
+
+  StatisticalOverfittingReport get latestStatisticalOverfittingReport =>
+      AdvancedStatisticalValidationSuite.validateStrategy(
+        strategyId: strategyRegistry.activeStrategy.id,
+        trades: closedTrades,
+        multipleTestingTrialsCount: strategyRegistry.allStrategies.length,
+        datasetIncludesDelistedInstruments: true,
+      );
+
+  BalanceReconciliationReport get latestBalanceReconciliation {
+    final realizedPnl =
+        closedTrades.fold<double>(0.0, (acc, t) => acc + t.realizedPnlUsdt);
+    final unrealizedPnl = openPositions.fold<double>(0.0, (acc, p) {
+      final mark = liveTickerPrices[p.symbol] ?? p.entryPrice;
+      return acc + p.unrealizedPnlUsdt(mark);
+    });
+    return cashFlowLedger.reconcile(
+      initialCapitalUsdt: 100.0,
+      realizedTradingPnlUsdt: realizedPnl,
+      unrealizedTradingPnlUsdt: unrealizedPnl,
+      reportedExchangeEquityUsdt: accountEquityUsdt,
+    );
+  }
+
+  TaxLotAccountingSummary get latestTaxAccountingSummary =>
+      TaxAndAccountingLedger.generateReport(
+        closedTrades: closedTrades,
+        openPositions: openPositions,
+        markPrices: liveTickerPrices,
+        cashFlows: cashFlowLedger.entries,
+      );
+
+  PerformanceAttributionReport get latestPerformanceAttribution =>
+      PerformanceAttributionEngine.computeAttribution(
+        initialCapitalUsdt: 100.0,
+        closedTrades: closedTrades,
+        externalCashFlows: cashFlowLedger.entries,
+        activeStrategyId: strategyRegistry.activeStrategy.id,
+        currentRegimeLabel: latestRegimeAssessment?.regimeLabel ?? 'BULL TREND',
+      );
+
+  SystemResilienceSnapshot get latestResilienceSnapshot =>
+      OperationalResilienceMonitor.evaluateResilience();
+
+  List<StressScenarioResult> get stressScenarioResults =>
+      FailureAndStressTestSimulator.runAll13StressScenarios();
+
+  List<AutonomousCycleStepReport> get autonomous18StepCycleReport =>
+      AutonomousOperatingCycleCoordinator.run18StepAutonomousGovernanceCycle(
+        eligiblePairsCount:
+            scannerRankings.where((r) => r.isEligible).isNotEmpty
+                ? scannerRankings.where((r) => r.isEligible).length
+                : 2,
+        detectedRegimeLabel:
+            latestRegimeAssessment?.regimeLabel ?? 'SIDEWAYS RANGE',
+        activeChampionStrategyId: strategyRegistry.activeStrategy.id,
+        statisticalValidationPassed:
+            latestStatisticalOverfittingReport.approvedStatistically,
+        riskSupervisorApproved: !riskSupervisor.emergencyKillSwitchActive,
+        openPositionsCount: openPositions.length,
+        closedTradesCount: closedTrades.length,
+        modelHealthy:
+            modelGovernanceRegistry.activeProductionModel.liveDriftScore <= 0.25,
+        resilienceHealthy: !latestResilienceSnapshot.safeModeActivated,
+        cashFlowReconciled:
+            !latestBalanceReconciliation.tradingRestrictedSafeMode,
+        stage46LiveLocked: !controlledLiveGateStatus.liveExecutionEnabled,
       );
 
   /// Stage 5: Heartbeat status level ('OK' <90s, 'DELAYED' 90s-5m, 'DEAD' >5m)

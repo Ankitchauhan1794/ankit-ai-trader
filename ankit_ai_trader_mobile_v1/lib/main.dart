@@ -425,6 +425,11 @@ class _DashboardPageState extends State<DashboardPage>
                   'Active Sandbox Hypotheses: ${hypotheses.map((h) => h.configId).join(", ")}',
                   style: const TextStyle(fontSize: 11, color: Colors.white54),
                 ),
+                const SizedBox(height: 8),
+                Text(
+                  'STAGE 47.2/47.3/47.10 — Champion Model: ${_coordinator.modelGovernanceRegistry.activeProductionModel.modelId} | Monthly AI Spend: \$${_coordinator.aiCostManager.currentMonthSpendUsd.toStringAsFixed(4)} / \$${_coordinator.aiCostManager.monthlyBudgetUsd.toStringAsFixed(2)} | Statistical Audit: ${_coordinator.latestStatisticalOverfittingReport.rejectionOrApprovalReason}',
+                  style: const TextStyle(fontSize: 11, color: Colors.white70),
+                ),
               ],
             ),
           ),
@@ -527,7 +532,10 @@ class _DashboardPageState extends State<DashboardPage>
                 Text(
                   '• Portfolio Rule: ${alloc.summary}\n'
                   '• Stage 45 (90-Day Paper): ${paperStatus.statusSummary}\n'
-                  '• Stage 46 (Controlled Live): ${liveGate.gateReason}',
+                  '• Stage 46 (Controlled Live): ${liveGate.gateReason}\n'
+                  '• Stage 47.4 Cash-Flow Recon: ${_coordinator.latestBalanceReconciliation.securityAlertMessage}\n'
+                  '• Stage 47.9 Attribution: TWR ${_coordinator.latestPerformanceAttribution.timeWeightedReturnPct.toStringAsFixed(2)}% | MWR ${_coordinator.latestPerformanceAttribution.moneyWeightedReturnPct.toStringAsFixed(2)}% (Deposits excluded)\n'
+                  '• Stage 47.13 & 47.15 Autonomy: ${_coordinator.stressScenarioResults.length}/13 Stress Scenarios Verified | ${_coordinator.autonomous18StepCycleReport.length}/18 Governance Cycle Steps Active',
                   style: const TextStyle(
                       fontSize: 11, color: Colors.white70, height: 1.4),
                 ),

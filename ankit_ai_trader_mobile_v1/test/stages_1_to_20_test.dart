@@ -15,6 +15,7 @@ import 'package:ankit_ai_trader/services/trading_coordinator.dart';
 import 'package:ankit_ai_trader/services/execution_and_risk_hub.dart';
 import 'package:ankit_ai_trader/services/quant_research_lab.dart';
 import 'package:ankit_ai_trader/services/autonomous_intelligence_and_ops.dart';
+import 'package:ankit_ai_trader/services/stage47_autonomous_governance.dart';
 
 class _FakeCommandBridge implements EngineCommandBridge {
   bool serviceReady;
@@ -743,5 +744,284 @@ void main() {
     );
     expect(gateLocked.liveExecutionEnabled, isFalse);
     expect(gateLocked.gateReason, contains('LOCKED (PAPER-ONLY)'));
+  });
+
+  test('Test 19 (Stage 47.1 & 47.11): CompleteMarketPairDiscoveryEngine discovers active pairs, removes suspended/delisted pairs, and BrokerAndMarketRuleEngine enforces spot-only rules', () {
+    final discovery = CompleteMarketPairDiscoveryEngine();
+    final tickers = {
+      'B-BTC_USDT': const LiveMarketTicker(
+        symbol: 'B-BTC_USDT',
+        lastPrice: 95000.0,
+        bid: 94995.0,
+        ask: 95005.0,
+        high24h: 96000.0,
+        low24h: 93000.0,
+        volume24h: 5000.0,
+        change24hPct: 1.5,
+        timestampMs: 1000,
+      ),
+      'B-HALTED_USDT': const LiveMarketTicker(
+        symbol: 'B-HALTED_USDT',
+        lastPrice: 10.0,
+        bid: 9.99,
+        ask: 10.01,
+        high24h: 11.0,
+        low24h: 9.0,
+        volume24h: 500.0,
+        change24hPct: 0.0,
+        timestampMs: 1000,
+      ),
+    };
+
+    final report1 = discovery.discoverAndRefreshWatchlist(
+      rawExchangeMarkets: [
+        {
+          'symbol': 'B-BTC_USDT',
+          'status': 'active',
+          'base_currency_short_name': 'BTC',
+          'target_currency_short_name': 'USDT',
+          'min_quantity': 0.00001,
+          'min_notional': 5.0,
+          'base_currency_precision': 5,
+          'target_currency_precision': 2,
+          'maker_fee': 0.001,
+          'taker_fee': 0.001,
+          'restricted': false,
+        },
+        {
+          'symbol': 'B-HALTED_USDT',
+          'status': 'suspended',
+          'base_currency_short_name': 'HALTED',
+          'target_currency_short_name': 'USDT',
+        },
+      ],
+      liveTickers: tickers,
+      nowMs: 2000,
+    );
+
+    expect(report1.eligibleWatchlist.length, 1);
+    expect(report1.eligibleWatchlist.first.symbol, 'B-BTC_USDT');
+    expect(report1.suspendedSymbols, contains('B-HALTED_USDT'));
+
+    // 47.11: Reject leverage on Spot market
+    const spotRules = MarketExecutionRuleSet(
+      venueId: 'coindcx_spot',
+      symbol: 'B-BTC_USDT',
+      minQuantity: 0.00001,
+      stepSize: 0.00001,
+      tickSize: 0.01,
+      minNotionalUsdt: 5.0,
+    );
+    final levCheck = BrokerAndMarketRuleEngine.validateOrderAgainstMarketRules(
+      rules: spotRules,
+      quantity: 0.001,
+      price: 95000.0,
+      requestedLeverage: 3.0,
+    );
+    expect(levCheck.valid, isFalse);
+  });
+
+  test('Test 20 (Stage 47.2 & 47.3): AdvancedStatisticalValidationSuite (CSCV/PBO, Deflated Sharpe, Survivorship Bias) and AiModelGovernanceRegistry (No Silent Promotion, Auto-Rollback)', () {
+    final trades = List.generate(24, (i) {
+      final win = i % 4 != 0;
+      return ClosedPaperTrade(
+        id: 'ST_$i',
+        symbol: 'B-BTC_USDT',
+        entryPrice: 90000.0,
+        exitPrice: win ? 90900.0 : 89550.0,
+        quantity: 0.002,
+        stopLoss: 89550.0,
+        takeProfit: 90900.0,
+        totalFeesUsdt: 0.12,
+        realizedPnlUsdt: win ? 1.68 : -1.02,
+        openedAtMs: 1000 + i * 1000,
+        closedAtMs: 1500 + i * 1000,
+        exitReason: win ? 'TAKE_PROFIT' : 'STOP_LOSS',
+      );
+    });
+
+    final statReport = AdvancedStatisticalValidationSuite.validateStrategy(
+      strategyId: 'strat_ema_rsi_v1',
+      trades: trades,
+      multipleTestingTrialsCount: 2,
+      datasetIncludesDelistedInstruments: true,
+    );
+    expect(statReport.sampleSizeAdequate, isTrue);
+    expect(statReport.survivorshipBiasFree, isTrue);
+    expect(statReport.probabilityOfBacktestOverfitting, lessThanOrEqualTo(0.25));
+    expect(statReport.deflatedSharpeRatio, greaterThan(0.75));
+    expect(statReport.approvedStatistically, isTrue);
+
+    // 47.3: Silent model replacement without explicit governance approval must be blocked
+    final modelGov = AiModelGovernanceRegistry();
+    final silentAttempt = modelGov.requestModelPromotion(
+      challengerModelId: 'regime_classifier_v2_shadow',
+      explicitGovernanceApproval: false,
+      shadowEvaluationsCompleted: 100,
+    );
+    expect(silentAttempt.promoted, isFalse);
+
+    final approvedAttempt = modelGov.requestModelPromotion(
+      challengerModelId: 'regime_classifier_v2_shadow',
+      explicitGovernanceApproval: true,
+      shadowEvaluationsCompleted: 100,
+    );
+    expect(approvedAttempt.promoted, isTrue);
+    expect(modelGov.activeProductionModel.modelId, 'regime_classifier_v2_shadow');
+
+    // Auto-rollback on high drift
+    final rolledBack = modelGov.checkAndRollbackIfDegraded(currentDriftScore: 0.40);
+    expect(rolledBack, isTrue);
+    expect(modelGov.activeProductionModel.modelId, 'regime_classifier_v1');
+  });
+
+  test('Test 21 (Stage 47.4, 47.5 & 47.9): CashFlowReconciliationLedger, TaxAndAccountingLedger & PerformanceAttributionEngine exclude deposits from trading profit and trigger Safe Mode on unexpected transfers', () {
+    final cfLedger = CashFlowReconciliationLedger();
+    cfLedger.recordCashFlow(
+      const ExternalCashFlowEntry(
+        transactionId: 'DEP_001',
+        type: ExternalCashFlowType.deposit,
+        amountUsdt: 250.0,
+        timestampMs: 1000,
+        verifiedByUser: true,
+        note: 'External bank deposit',
+      ),
+    );
+
+    final sampleTrades = [
+      const ClosedPaperTrade(
+        id: 'T_1',
+        symbol: 'B-BTC_USDT',
+        entryPrice: 90000.0,
+        exitPrice: 90900.0,
+        quantity: 0.002,
+        stopLoss: 89550.0,
+        takeProfit: 90900.0,
+        totalFeesUsdt: 0.18,
+        realizedPnlUsdt: 1.62,
+        openedAtMs: 2000,
+        closedAtMs: 3000,
+        exitReason: 'TAKE_PROFIT',
+      ),
+    ];
+
+    // Expected equity = 100 (initial) + 250 (deposit) + 1.62 (trading profit) = 351.62
+    final reconOk = cfLedger.reconcile(
+      initialCapitalUsdt: 100.0,
+      realizedTradingPnlUsdt: 1.62,
+      unrealizedTradingPnlUsdt: 0.0,
+      reportedExchangeEquityUsdt: 351.62,
+    );
+    expect(reconOk.tradingRestrictedSafeMode, isFalse);
+    expect(reconOk.realizedTradingPnlUsdt, closeTo(1.62, 1e-6));
+
+    // 47.9: Performance attribution must NEVER count the 250 USDT deposit as trading profit
+    final attr = PerformanceAttributionEngine.computeAttribution(
+      initialCapitalUsdt: 100.0,
+      closedTrades: sampleTrades,
+      externalCashFlows: cfLedger.entries,
+    );
+    expect(attr.netTradingProfitUsdt, closeTo(1.62, 1e-6));
+    expect(attr.timeWeightedReturnPct, closeTo(1.62, 1e-6));
+
+    // 47.5: Tax & Accounting export
+    final taxReport = TaxAndAccountingLedger.generateReport(
+      closedTrades: sampleTrades,
+      openPositions: const [],
+      markPrices: const {},
+      cashFlows: cfLedger.entries,
+    );
+    expect(taxReport.userConfiguredTaxRatePct, isNull);
+    expect(taxReport.csvExportContent, contains('TRADE,T_1'));
+    expect(taxReport.csvExportContent, contains('CASHFLOW,DEP_001'));
+
+    // Unexpected outgoing transfer triggers Safe Mode restriction immediately
+    cfLedger.recordCashFlow(
+      const ExternalCashFlowEntry(
+        transactionId: 'UNAUTH_OUT_1',
+        type: ExternalCashFlowType.unexpectedOutgoingTransfer,
+        amountUsdt: 25.0,
+        timestampMs: 4000,
+        verifiedByUser: false,
+        note: 'Unrecognized withdrawal attempt',
+      ),
+    );
+    final reconAlert = cfLedger.reconcile(
+      initialCapitalUsdt: 100.0,
+      realizedTradingPnlUsdt: 1.62,
+      unrealizedTradingPnlUsdt: 0.0,
+      reportedExchangeEquityUsdt: 326.62,
+    );
+    expect(reconAlert.unexpectedTransferDetected, isTrue);
+    expect(reconAlert.tradingRestrictedSafeMode, isTrue);
+  });
+
+  test('Test 22 (Stage 47.6, 47.7, 47.8, 47.10, 47.14): Degradation Monitor, Resilience Safe Mode, AI Cost/Loop/Failover Guard & Correlation Control', () {
+    final degVerdict = StrategyDegradationMonitor.evaluate(
+      backtestExpectancyUsdt: 0.65,
+      recentRealizedExpectancyUsdt: -0.45,
+      expectedSlippageBps: 5.0,
+      realizedSlippageBps: 14.0,
+      consecutiveLosses: 3,
+      currentDrawdownUsdt: 4.5,
+    );
+    expect(degVerdict.degradationDetected, isTrue);
+    expect(degVerdict.haltNewEntries, isTrue);
+    expect(degVerdict.recommendedRiskMultiplier, equals(0.0));
+
+    final resSnap = OperationalResilienceMonitor.evaluateResilience(
+      databaseIntegrityOk: false,
+    );
+    expect(resSnap.safeModeActivated, isTrue);
+
+    // 47.10: AI provider timeout falls back to deterministic logic while keeping deterministic risk protection active
+    final aiManager = AiCostAndProviderManager(monthlyBudgetUsd: 5.0, maxAgentStepsPerCycle: 6);
+    final failoverRes = aiManager.executeManagedResearchTask(
+      cacheKey: 'btc_15m_regime',
+      taskType: 'REGIME_CHECK',
+      currentStepCount: 2,
+      simulateProviderTimeoutOrFailure: true,
+      deterministicFallbackComputation: () => 'DETERMINISTIC_BULL_REGIME',
+    );
+    expect(failoverRes.usedDeterministicFallback, isTrue);
+    expect(failoverRes.deterministicRiskStillActive, isTrue);
+    expect(failoverRes.result, 'DETERMINISTIC_BULL_REGIME');
+
+    // 47.14: Correlated strategies on same symbol cannot double-spend the 1 USDT risk budget
+    final div = StrategyCorrelationAndDiversityController.evaluateDiversity(
+      strategyAReturns: const [0.5, -0.2, 0.8, 0.4],
+      strategyBReturns: const [0.48, -0.18, 0.75, 0.39],
+      strategyATargetSymbol: 'B-BTC_USDT',
+      strategyBTargetSymbol: 'B-BTC_USDT',
+      totalApprovedRiskPerCycleUsdt: 1.0,
+    );
+    expect(div.combinedAllowedRiskBudgetUsdt, closeTo(1.0, 1e-6));
+    expect(div.diversificationScalingFactor, closeTo(0.5, 1e-6));
+  });
+
+  test('Test 23 (Stage 47.12, 47.13 & 47.15): 13-Scenario Stress Simulator, Software Maintenance Changelog & 18-Step Autonomous Operating Cycle', () {
+    final stressResults = FailureAndStressTestSimulator.runAll13StressScenarios();
+    expect(stressResults.length, 13);
+    expect(stressResults.every((s) => s.capitalProtected && s.enteredSafeModeOrBlockedOrder), isTrue);
+
+    final changelog = SoftwareMaintenanceGovernance.changelog;
+    expect(changelog.isNotEmpty, isTrue);
+    expect(changelog.every((c) => !c.autoInstalledIntoLiveWithoutVerification), isTrue);
+
+    final cycle18 = AutonomousOperatingCycleCoordinator.run18StepAutonomousGovernanceCycle(
+      eligiblePairsCount: 2,
+      detectedRegimeLabel: 'BULL TREND',
+      activeChampionStrategyId: 'strat_ema_rsi_v1',
+      statisticalValidationPassed: true,
+      riskSupervisorApproved: true,
+      openPositionsCount: 0,
+      closedTradesCount: 10,
+      modelHealthy: true,
+      resilienceHealthy: true,
+      cashFlowReconciled: true,
+      stage46LiveLocked: true,
+    );
+    expect(cycle18.length, 18);
+    expect(cycle18.every((step) => step.passedSafetyCheck), isTrue);
   });
 }
