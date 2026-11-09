@@ -151,6 +151,12 @@ class TradingCoordinator extends ChangeNotifier {
   MarketRegimeAssessment? latestRegimeAssessment;
   List<RankedScannerCandidate> scannerRankings = [];
   List<TradePostmortemReport> recentPostmortems = [];
+  MarketCatalogueSnapshot marketCatalogue =
+      const MarketCatalogueSnapshot(allMarkets: []);
+  String marketSearchQuery = '';
+  String selectedQuoteCurrencyFilter = 'ALL';
+  bool isRefreshingCatalogue = false;
+  int catalogueRefreshIntervalSeconds = 300;
   bool isRunningBacktest = false;
   bool _isTickerPollInFlight = false;
   bool _disposed = false;
@@ -164,6 +170,7 @@ class TradingCoordinator extends ChangeNotifier {
 
   Timer? _uiStateRefreshTimer;
   Timer? _liveTickerPollTimer;
+  Timer? _catalogueRefreshTimer;
   StreamSubscription<dynamic>? _networkSub;
   StreamSubscription<Map<String, LiveMarketTicker>>? _wsTickerSub;
 
@@ -173,7 +180,7 @@ class TradingCoordinator extends ChangeNotifier {
     EngineCommandBridge? commandBridge,
     int Function()? nowMsProvider,
   })  : persistence = persistence ?? PersistenceDatabase(),
-        marketService = marketService ?? CoinDcxMarketService(),
+        marketService = marketService ?? CoinDcxMarketService(persistence: persistence),
         commandBridge = commandBridge ?? MethodChannelEngineBridge(),
         _nowMs =
             nowMsProvider ?? (() => DateTime.now().millisecondsSinceEpoch) {
@@ -326,6 +333,54 @@ class TradingCoordinator extends ChangeNotifier {
     return 'Heartbeat: ${formatUtcHhMmSs(target)} (${ageSec}s ago • $status)';
   }
 
+  List<CoinDcxMarketRecord> get filteredDiscoveredMarkets =>
+      marketCatalogue.filterMarkets(
+        searchQuery: marketSearchQuery,
+        quoteCurrencyFilter: selectedQuoteCurrencyFilter,
+      );
+
+  void setMarketSearchQuery(String query) {
+    marketSearchQuery = query;
+    notifyListeners();
+  }
+
+  void setQuoteCurrencyFilter(String quote) {
+    selectedQuoteCurrencyFilter = quote;
+    notifyListeners();
+  }
+
+  Future<void> refreshMarketCatalogue({bool force = true}) async {
+    if (_disposed || isRefreshingCatalogue) return;
+    isRefreshingCatalogue = true;
+    notifyListeners();
+    try {
+      final snap = await marketService.refreshMarketCatalogue(
+        force: force,
+        nowMs: _nowMs(),
+      );
+      marketCatalogue = snap;
+      if (snap.allMarkets.isNotEmpty) {
+        for (final m in snap.allMarkets) {
+          if (m.latestTicker != null && m.pair.isNotEmpty) {
+            liveTickers[m.pair] = m.latestTicker!;
+            liveTickerPrices[m.pair] = m.latestTicker!.lastPrice;
+          }
+        }
+        scannerRankings = CoinDcxMarketScanner.rankPairs(tickers: liveTickers);
+      }
+      if (!snap.isUsingCachedCatalogue && snap.allMarkets.isNotEmpty) {
+        await persistence.saveDiscoveredMarkets(
+          snap.allMarkets,
+          refreshedAtMs: snap.lastSuccessfulRefreshMs ?? _nowMs(),
+        );
+      }
+    } catch (_) {
+    } finally {
+      isRefreshingCatalogue = false;
+      notifyListeners();
+    }
+  }
+
   Future<void> initialize({bool enablePlatformChannels = true}) async {
     if (_disposed) return;
     if (enablePlatformChannels) {
@@ -334,9 +389,23 @@ class TradingCoordinator extends ChangeNotifier {
     if (_disposed) return;
     await executionEngine.reconcileStartupOrders(nowMs: _nowMs());
     if (_disposed) return;
+    // Load any cached discovered markets from SQLite immediately
+    final cachedMarkets = await persistence.loadDiscoveredMarkets();
+    final lastRefMs = await persistence.getLastMarketCatalogueRefreshMs();
+    if (cachedMarkets.isNotEmpty && marketCatalogue.allMarkets.isEmpty) {
+      marketCatalogue = MarketCatalogueSnapshot(
+        allMarkets: cachedMarkets,
+        lastSuccessfulRefreshMs: lastRefMs,
+        isUsingCachedCatalogue: true,
+        isCatalogueFresh: false,
+      );
+    }
+    if (_disposed) return;
     await refreshStateFromDatabase(isInitialLoad: true);
     if (_disposed) return;
     if (enablePlatformChannels) {
+      await refreshMarketCatalogue(force: false);
+      if (_disposed) return;
       await _pollLiveTickersForDashboard();
       if (!_disposed) {
         _startUiStateRefreshTimer();
@@ -377,9 +446,17 @@ class TradingCoordinator extends ChangeNotifier {
       refreshStateFromDatabase(isInitialLoad: false);
     });
     _liveTickerPollTimer?.cancel();
+    _catalogueRefreshTimer?.cancel();
     _liveTickerPollTimer = Timer.periodic(const Duration(seconds: 4), (_) {
       _pollLiveTickersForDashboard();
     });
+    _catalogueRefreshTimer?.cancel();
+    _catalogueRefreshTimer = Timer.periodic(
+      Duration(seconds: catalogueRefreshIntervalSeconds),
+      (_) {
+        refreshMarketCatalogue(force: false);
+      },
+    );
   }
 
   Future<void> _pollLiveTickersForDashboard() async {
@@ -394,6 +471,9 @@ class TradingCoordinator extends ChangeNotifier {
           for (final e in fetched.entries) e.key: e.value.lastPrice,
         };
         scannerRankings = CoinDcxMarketScanner.rankPairs(tickers: liveTickers);
+        if (marketService.latestCatalogueSnapshot.allMarkets.isNotEmpty) {
+          marketCatalogue = marketService.latestCatalogueSnapshot;
+        }
         lastMarketDataUpdateMs = now;
         marketDataStatus = MarketDataStatus.healthy;
         notifyListeners();

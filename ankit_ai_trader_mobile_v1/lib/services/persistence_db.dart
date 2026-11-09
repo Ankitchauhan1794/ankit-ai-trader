@@ -77,6 +77,8 @@ class PersistedEngineSnapshot {
 
 class PersistenceDatabase {
   static const String dbFileName = 'ankit_ai_trader_phase1.db';
+  static const int currentSchemaVersion = 4;
+
   Database? _db;
   final Map<String, String> _inMemoryKv = {};
   final List<PaperPosition> _inMemoryOpenPositions = [];
@@ -86,6 +88,7 @@ class PersistenceDatabase {
   final List<DiagnosticEvent> _inMemoryEvents = [];
   final Set<String> _inMemoryProcessedKeys = {};
   final Map<String, Map<String, dynamic>> _inMemoryLocks = {};
+  final Map<String, CoinDcxMarketRecord> _inMemoryDiscoveredMarkets = {};
   final bool useInMemoryFallback;
 
   PersistenceDatabase({this.useInMemoryFallback = false});
@@ -98,7 +101,7 @@ class PersistenceDatabase {
       final fullPath = p.join(dbDir, dbFileName);
       _db = await openDatabase(
         fullPath,
-        version: 3,
+        version: currentSchemaVersion,
         onCreate: _onCreate,
         onUpgrade: _onUpgrade,
       );
@@ -188,10 +191,113 @@ class PersistenceDatabase {
         reason TEXT NOT NULL
       )
     ''');
+    await _createDiscoveredMarketsTable(db);
   }
 
+  Future<void> _createDiscoveredMarketsTable(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS discovered_markets (
+        pair TEXT PRIMARY KEY,
+        exchangeName TEXT NOT NULL,
+        coindcxName TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        ecode TEXT NOT NULL,
+        baseCurrencyShortName TEXT NOT NULL,
+        targetCurrencyShortName TEXT NOT NULL,
+        baseCurrencyName TEXT NOT NULL,
+        targetCurrencyName TEXT NOT NULL,
+        status TEXT NOT NULL,
+        baseCurrencyPrecision INTEGER NOT NULL,
+        targetCurrencyPrecision INTEGER NOT NULL,
+        minQuantity REAL NOT NULL,
+        maxQuantity REAL NOT NULL,
+        maxQuantityMarket REAL NOT NULL,
+        step REAL NOT NULL,
+        minNotional REAL NOT NULL,
+        minPrice REAL NOT NULL,
+        maxPrice REAL NOT NULL,
+        orderTypesJson TEXT NOT NULL,
+        latestTickerJson TEXT,
+        latestDataTimestampMs INTEGER,
+        lastMetadataRefreshMs INTEGER NOT NULL,
+        isNewlyListed INTEGER NOT NULL DEFAULT 0,
+        isInActiveMarketsList INTEGER NOT NULL DEFAULT 1,
+        eligibilityStatus TEXT NOT NULL,
+        eligibilityReason TEXT NOT NULL
+      )
+    ''');
+  }
+
+  /// Backward-compatible migration: preserves all existing tables, $100 account, open positions, orders & trade history.
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
     await _onCreate(db, newVersion);
+    if (oldVersion < 4) {
+      await _createDiscoveredMarketsTable(db);
+    }
+  }
+
+  /// Allow testing backward-compatible schema migration on any Database instance.
+  Future<void> migrateDatabaseSchemaIfNeeded(
+    Database db, {
+    required int oldVersion,
+    int newVersion = currentSchemaVersion,
+  }) async {
+    await _onUpgrade(db, oldVersion, newVersion);
+  }
+
+  /// Stage 47.1 Section 5 & 6: Persist discovered market catalogue without deleting historical trades/positions.
+  Future<void> saveDiscoveredMarkets(
+    List<CoinDcxMarketRecord> markets, {
+    required int refreshedAtMs,
+  }) async {
+    for (final m in markets) {
+      _inMemoryDiscoveredMarkets[m.pair] = m;
+    }
+    await putKv('lastMarketCatalogueRefreshMs', jsonEncode(refreshedAtMs));
+
+    final db = await database;
+    if (db == null) return;
+    await db.transaction((txn) async {
+      for (final m in markets) {
+        await txn.insert(
+          'discovered_markets',
+          m.toMap(),
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+      }
+    });
+  }
+
+  /// Stage 47.1: Load cached discovered markets from SQLite (or in-memory fallback).
+  Future<List<CoinDcxMarketRecord>> loadDiscoveredMarkets() async {
+    final db = await database;
+    if (db == null) {
+      final list = _inMemoryDiscoveredMarkets.values.toList()
+        ..sort((a, b) => a.symbol.compareTo(b.symbol));
+      return list;
+    }
+    final rows = await db.query('discovered_markets', orderBy: 'symbol ASC');
+    if (rows.isEmpty && _inMemoryDiscoveredMarkets.isNotEmpty) {
+      return _inMemoryDiscoveredMarkets.values.toList()
+        ..sort((a, b) => a.symbol.compareTo(b.symbol));
+    }
+    final loaded = rows
+        .map((r) => CoinDcxMarketRecord.fromMap(Map<String, dynamic>.from(r)))
+        .toList();
+    for (final m in loaded) {
+      _inMemoryDiscoveredMarkets[m.pair] = m;
+    }
+    return loaded;
+  }
+
+  Future<int?> getLastMarketCatalogueRefreshMs() async {
+    final raw = await getKv('lastMarketCatalogueRefreshMs');
+    if (raw == null || raw == 'null') return null;
+    try {
+      return (jsonDecode(raw) as num?)?.toInt();
+    } catch (_) {
+      return int.tryParse(raw);
+    }
   }
 
   Future<void> putKv(String key, String value) async {
@@ -273,7 +379,9 @@ class PersistenceDatabase {
     ''');
   }
 
-  Future<List<DiagnosticEvent>> getRecentDiagnosticEvents({int limit = 50}) async {
+  Future<List<DiagnosticEvent>> getRecentDiagnosticEvents({
+    int limit = 50,
+  }) async {
     final db = await database;
     if (db == null) {
       return _inMemoryEvents.take(limit).toList();
@@ -384,7 +492,11 @@ class PersistenceDatabase {
     await putKv('recoveryStartedAtMs', jsonEncode(recoveryStartedAtMs));
     await putKv('nextRecoveryAllowedAtMs', jsonEncode(nextRecoveryAllowedAtMs));
     await putKv('lastError', logMessage);
-    await logDiagnosticEvent('RECOVERY', logMessage, timestampMs: DateTime.now().millisecondsSinceEpoch);
+    await logDiagnosticEvent(
+      'RECOVERY',
+      logMessage,
+      timestampMs: DateTime.now().millisecondsSinceEpoch,
+    );
 
     final rawLogs = await getKv('recoveryLogs');
     final logs = <String>[];

@@ -1,3 +1,6 @@
+import 'dart:async';
+import 'dart:io';
+import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -16,6 +19,23 @@ import 'package:ankit_ai_trader/services/execution_and_risk_hub.dart';
 import 'package:ankit_ai_trader/services/quant_research_lab.dart';
 import 'package:ankit_ai_trader/services/autonomous_intelligence_and_ops.dart';
 import 'package:ankit_ai_trader/services/stage47_autonomous_governance.dart';
+
+
+class _MockCoinDcxHttpClient extends http.BaseClient {
+  final Future<http.Response> Function(Uri url) handler;
+
+  _MockCoinDcxHttpClient(this.handler);
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    final resp = await handler(request.url);
+    return http.StreamedResponse(
+      Stream.value(utf8.encode(resp.body)),
+      resp.statusCode,
+      headers: resp.headers,
+    );
+  }
+}
 
 class _FakeCommandBridge implements EngineCommandBridge {
   bool serviceReady;
@@ -1023,5 +1043,810 @@ void main() {
     );
     expect(cycle18.length, 18);
     expect(cycle18.every((step) => step.passedSafetyCheck), isTrue);
+  });
+
+  // ============================================================================
+  // STAGE 47.1 — 20 AUTOMATED TESTS FOR COMPLETE COINDCX MARKET DISCOVERY
+  // ============================================================================
+  test('Stage 47.1 Test 1: Successful active-market retrieval from /exchange/v1/markets', () {
+    final service = CoinDcxMarketService();
+    final active = service.parseActiveMarketsResponse(
+      jsonEncode(['BTCUSDT', 'ETHUSDT', 'BTCINR', 'XTZBTC', 'TRXETH']),
+    );
+    expect(active.length, 5);
+    expect(active, containsAll(['BTCUSDT', 'ETHUSDT', 'BTCINR', 'XTZBTC', 'TRXETH']));
+    service.dispose();
+  });
+
+  test('Stage 47.1 Test 2: Market-details parsing from /exchange/v1/markets_details with exact CoinDCX fields', () {
+    final service = CoinDcxMarketService();
+    final detailsJson = jsonEncode([
+      {
+        'coindcx_name': 'XTZBTC',
+        'symbol': 'XTZBTC',
+        'pair': 'B-XTZ_BTC',
+        'ecode': 'B',
+        'base_currency_short_name': 'BTC',
+        'target_currency_short_name': 'XTZ',
+        'base_currency_name': 'Bitcoin',
+        'target_currency_name': 'Tezos',
+        'base_currency_precision': 8,
+        'target_currency_precision': 1,
+        'min_quantity': 0.1,
+        'max_quantity': 90000000,
+        'max_quantity_market': 104992.74,
+        'min_notional': 0.0001,
+        'min_price': 1e-8,
+        'max_price': 1000,
+        'step': 0.1,
+        'order_types': ['limit_order', 'market_order', 'stop_limit', 'take_profit_limit'],
+        'status': 'active',
+      }
+    ]);
+    final snap = service.buildCompleteMarketCatalogue(
+      activeMarketsFromEndpoint: {'XTZBTC'},
+      marketsDetailsJson: detailsJson,
+      tickersByMarketKey: {},
+      nowMs: 100000,
+    );
+    expect(snap.allMarkets.length, 1);
+    final rec = snap.allMarkets.first;
+    expect(rec.coindcxName, 'XTZBTC');
+    expect(rec.symbol, 'XTZBTC');
+    expect(rec.pair, 'B-XTZ_BTC');
+    expect(rec.ecode, 'B');
+    // CoinDCX official definition: base_currency_short_name = price/quote currency (BTC), target_currency_short_name = quantity asset (XTZ)
+    expect(rec.baseCurrencyShortName, 'BTC');
+    expect(rec.targetCurrencyShortName, 'XTZ');
+    expect(rec.baseCurrencyPrecision, 8);
+    expect(rec.targetCurrencyPrecision, 1);
+    expect(rec.minQuantity, closeTo(0.1, 1e-9));
+    expect(rec.maxQuantity, closeTo(90000000.0, 1e-3));
+    expect(rec.maxQuantityMarket, closeTo(104992.74, 1e-3));
+    expect(rec.minNotional, closeTo(0.0001, 1e-9));
+    expect(rec.step, closeTo(0.1, 1e-9));
+    expect(rec.orderTypes, contains('market_order'));
+    expect(rec.status, 'active');
+    service.dispose();
+  });
+
+  test('Stage 47.1 Test 3: Ticker parsing across all CoinDCX symbols from /exchange/ticker', () {
+    final service = CoinDcxMarketService();
+    final tickers = service.parseAllTickersResponse(
+      jsonEncode([
+        {
+          'market': 'REQBTC',
+          'change_24_hour': '-1.621',
+          'high': '0.00002799',
+          'low': '0.00002626',
+          'volume': '14.10',
+          'last_price': '0.00002663',
+          'bid': '0.00002663',
+          'ask': '0.00002669',
+          'timestamp': 1731000000000,
+        },
+        {
+          'market': 'BTCINR',
+          'change_24_hour': '3.10',
+          'high': '8200000',
+          'low': '7900000',
+          'volume': '45.2',
+          'last_price': '8150000',
+          'bid': '8149000',
+          'ask': '8151000',
+          'timestamp': 1731000000000,
+        },
+      ]),
+      nowMs: 1731000005000,
+    );
+    expect(tickers.length, 2);
+    expect(tickers['REQBTC']!.lastPrice, closeTo(0.00002663, 1e-10));
+    expect(tickers['BTCINR']!.lastPrice, closeTo(8150000.0, 1e-3));
+    service.dispose();
+  });
+
+  test('Stage 47.1 Test 4: Market-to-ticker matching using exact symbol, coindcx_name, and pair', () {
+    final service = CoinDcxMarketService();
+    final detailsJson = jsonEncode([
+      {
+        'coindcx_name': 'BTCUSDT',
+        'symbol': 'BTCUSDT',
+        'pair': 'B-BTC_USDT',
+        'ecode': 'B',
+        'base_currency_short_name': 'USDT',
+        'target_currency_short_name': 'BTC',
+        'base_currency_precision': 2,
+        'target_currency_precision': 5,
+        'min_quantity': 0.00001,
+        'max_quantity': 1000,
+        'max_quantity_market': 100,
+        'min_notional': 5.0,
+        'min_price': 100.0,
+        'max_price': 500000.0,
+        'step': 0.00001,
+        'order_types': ['limit_order', 'market_order'],
+        'status': 'active',
+      }
+    ]);
+    final rawTickers = service.parseAllTickersResponse(
+      jsonEncode([
+        {
+          'market': 'BTCUSDT',
+          'last_price': '92000.00',
+          'bid': '91995.00',
+          'ask': '92005.00',
+          'high': '93000.00',
+          'low': '90000.00',
+          'volume': '2500.0',
+          'change_24_hour': '1.8',
+          'timestamp': 100000,
+        }
+      ]),
+      nowMs: 100000,
+    );
+    final snap = service.buildCompleteMarketCatalogue(
+      activeMarketsFromEndpoint: {'BTCUSDT'},
+      marketsDetailsJson: detailsJson,
+      tickersByMarketKey: rawTickers,
+      nowMs: 100000,
+    );
+    expect(snap.allMarkets.first.latestTicker, isNotNull);
+    expect(snap.allMarkets.first.latestTicker!.symbol, 'B-BTC_USDT');
+    expect(snap.allMarkets.first.latestTicker!.lastPrice, closeTo(92000.0, 1e-6));
+    service.dispose();
+  });
+
+  test('Stage 47.1 Test 5: INR, USDT, BTC, ETH and OTHER quote currencies discovery and filtering', () {
+    final service = CoinDcxMarketService();
+    Map<String, dynamic> makeSpec(String sym, String pair, String ecode, String quote, String target) => {
+          'coindcx_name': sym,
+          'symbol': sym,
+          'pair': pair,
+          'ecode': ecode,
+          'base_currency_short_name': quote,
+          'target_currency_short_name': target,
+          'base_currency_precision': 2,
+          'target_currency_precision': 4,
+          'min_quantity': 0.001,
+          'max_quantity': 10000,
+          'max_quantity_market': 1000,
+          'min_notional': 5.0,
+          'min_price': 0.01,
+          'max_price': 10000000.0,
+          'step': 0.001,
+          'order_types': ['limit_order', 'market_order'],
+          'status': 'active',
+        };
+    final detailsJson = jsonEncode([
+      makeSpec('BTCINR', 'I-BTC_INR', 'I', 'INR', 'BTC'),
+      makeSpec('BTCUSDT', 'B-BTC_USDT', 'B', 'USDT', 'BTC'),
+      makeSpec('XTZBTC', 'B-XTZ_BTC', 'B', 'BTC', 'XTZ'),
+      makeSpec('TRXETH', 'B-TRX_ETH', 'B', 'ETH', 'TRX'),
+      makeSpec('SOLUSDC', 'B-SOL_USDC', 'B', 'USDC', 'SOL'),
+    ]);
+    final snap = service.buildCompleteMarketCatalogue(
+      activeMarketsFromEndpoint: {'BTCINR', 'BTCUSDT', 'XTZBTC', 'TRXETH', 'SOLUSDC'},
+      marketsDetailsJson: detailsJson,
+      tickersByMarketKey: {},
+      nowMs: 100000,
+    );
+    expect(snap.totalDiscoveredCount, 5);
+    expect(snap.filterMarkets(quoteCurrencyFilter: 'INR').length, 1);
+    expect(snap.filterMarkets(quoteCurrencyFilter: 'USDT').length, 1);
+    expect(snap.filterMarkets(quoteCurrencyFilter: 'BTC').length, 1);
+    expect(snap.filterMarkets(quoteCurrencyFilter: 'ETH').length, 1);
+    expect(snap.filterMarkets(quoteCurrencyFilter: 'OTHER').length, 1);
+    expect(snap.filterMarkets(searchQuery: 'XTZ').first.pair, 'B-XTZ_BTC');
+    service.dispose();
+  });
+
+  test('Stage 47.1 Test 6: Duplicate market handling deduplicates by canonical pair', () {
+    final service = CoinDcxMarketService();
+    final spec = {
+      'coindcx_name': 'BTCUSDT',
+      'symbol': 'BTCUSDT',
+      'pair': 'B-BTC_USDT',
+      'ecode': 'B',
+      'base_currency_short_name': 'USDT',
+      'target_currency_short_name': 'BTC',
+      'base_currency_precision': 2,
+      'target_currency_precision': 5,
+      'min_quantity': 0.00001,
+      'max_quantity': 1000,
+      'max_quantity_market': 100,
+      'min_notional': 5.0,
+      'min_price': 10.0,
+      'max_price': 500000.0,
+      'step': 0.00001,
+      'order_types': ['limit_order'],
+      'status': 'active',
+    };
+    final snap = service.buildCompleteMarketCatalogue(
+      activeMarketsFromEndpoint: {'BTCUSDT'},
+      marketsDetailsJson: jsonEncode([spec, spec, spec]),
+      tickersByMarketKey: {},
+      nowMs: 100000,
+    );
+    expect(snap.allMarkets.length, 1);
+    service.dispose();
+  });
+
+  test('Stage 47.1 Test 7: Newly listed market detection across catalogue refreshes', () {
+    final service = CoinDcxMarketService();
+    Map<String, dynamic> makeSpec(String sym, String pair) => {
+          'coindcx_name': sym,
+          'symbol': sym,
+          'pair': pair,
+          'ecode': 'B',
+          'base_currency_short_name': 'USDT',
+          'target_currency_short_name': sym.replaceAll('USDT', ''),
+          'base_currency_precision': 2,
+          'target_currency_precision': 4,
+          'min_quantity': 0.01,
+          'max_quantity': 1000,
+          'max_quantity_market': 100,
+          'min_notional': 5.0,
+          'min_price': 0.01,
+          'max_price': 100000.0,
+          'step': 0.01,
+          'order_types': ['limit_order'],
+          'status': 'active',
+        };
+    final snap1 = service.buildCompleteMarketCatalogue(
+      activeMarketsFromEndpoint: {'BTCUSDT'},
+      marketsDetailsJson: jsonEncode([makeSpec('BTCUSDT', 'B-BTC_USDT')]),
+      tickersByMarketKey: {},
+      nowMs: 100000,
+    );
+    final prevMap = {for (final m in snap1.allMarkets) m.pair: m};
+    final snap2 = service.buildCompleteMarketCatalogue(
+      activeMarketsFromEndpoint: {'BTCUSDT', 'SUIUSDT'},
+      marketsDetailsJson: jsonEncode([
+        makeSpec('BTCUSDT', 'B-BTC_USDT'),
+        makeSpec('SUIUSDT', 'B-SUI_USDT'),
+      ]),
+      tickersByMarketKey: {},
+      nowMs: 200000,
+      previousCatalogueByPair: prevMap,
+    );
+    expect(snap2.newlyListedPairs, contains('B-SUI_USDT'));
+    final sui = snap2.allMarkets.firstWhere((m) => m.pair == 'B-SUI_USDT');
+    expect(sui.isNewlyListed, isTrue);
+    service.dispose();
+  });
+
+  test('Stage 47.1 Test 8: Inactive market detection and preservation of historical trades/positions', () async {
+    final db = PersistenceDatabase(useInMemoryFallback: true);
+    final service = CoinDcxMarketService(persistence: db);
+    await db.saveFullState(
+      botState: BotEngineState.stopped,
+      availableCashUsdt: 90.0,
+      accountEquityUsdt: 100.0,
+      maxDrawdownLocked: false,
+      statusBannerMessage: 'Holding position',
+      openPositions: const [
+        PaperPosition(
+          id: 'POS_OLD',
+          symbol: 'B-OLD_USDT',
+          entryPrice: 10.0,
+          quantity: 1.0,
+          stopLoss: 9.0,
+          takeProfit: 12.0,
+          entryFeeUsdt: 0.01,
+          signalCandleCloseMs: 1000,
+          openedAtMs: 1000,
+        ),
+      ],
+      orders: const [],
+      closedTrades: const [
+        ClosedPaperTrade(
+          id: 'TRD_OLD',
+          symbol: 'B-OLD_USDT',
+          entryPrice: 10.0,
+          exitPrice: 11.0,
+          quantity: 1.0,
+          stopLoss: 9.0,
+          takeProfit: 12.0,
+          totalFeesUsdt: 0.02,
+          realizedPnlUsdt: 0.98,
+          openedAtMs: 500,
+          closedAtMs: 900,
+          exitReason: 'TAKE_PROFIT',
+        ),
+      ],
+      processedEntrySignalKeys: const {},
+    );
+
+    final priorRecord = CoinDcxMarketRecord(
+      coindcxName: 'OLDUSDT',
+      symbol: 'OLDUSDT',
+      pair: 'B-OLD_USDT',
+      ecode: 'B',
+      baseCurrencyShortName: 'USDT',
+      targetCurrencyShortName: 'OLD',
+      status: 'active',
+      baseCurrencyPrecision: 2,
+      targetCurrencyPrecision: 2,
+      minQuantity: 0.1,
+      maxQuantity: 1000,
+      maxQuantityMarket: 100,
+      step: 0.1,
+      minNotional: 5.0,
+      minPrice: 0.1,
+      maxPrice: 1000,
+      orderTypes: const ['limit_order'],
+      lastMetadataRefreshMs: 1000,
+    );
+
+    // Refresh where B-OLD_USDT disappears from active markets
+    final snap = service.buildCompleteMarketCatalogue(
+      activeMarketsFromEndpoint: const {},
+      marketsDetailsJson: jsonEncode([]),
+      tickersByMarketKey: const {},
+      nowMs: 2000,
+      previousCatalogueByPair: {'B-OLD_USDT': priorRecord},
+    );
+    expect(snap.newlyInactivePairs, contains('B-OLD_USDT'));
+    expect(snap.allMarkets.first.eligibilityStatus, MarketEligibilityStatus.inactive);
+
+    // Verify historical trades and open positions are untouched
+    final persistedState = await db.loadFullState();
+    expect(persistedState.openPositions.length, 1);
+    expect(persistedState.closedTrades.length, 1);
+    service.dispose();
+    await db.close();
+  });
+
+  test('Stage 47.1 Test 9: Missing metadata in markets_details does not guess exchange identifiers and marks invalidMarketSpecifications', () {
+    final service = CoinDcxMarketService();
+    final snap = service.buildCompleteMarketCatalogue(
+      activeMarketsFromEndpoint: {'MYSTERYCOIN'},
+      marketsDetailsJson: jsonEncode([]),
+      tickersByMarketKey: {},
+      nowMs: 100000,
+    );
+    expect(snap.allMarkets.length, 1);
+    final m = snap.allMarkets.first;
+    expect(m.symbol, 'MYSTERYCOIN');
+    expect(m.pair, isEmpty);
+    expect(m.ecode, isEmpty);
+    expect(m.eligibilityStatus, MarketEligibilityStatus.invalidMarketSpecifications);
+    service.dispose();
+  });
+
+  test('Stage 47.1 Test 10: Invalid numeric values in ticker and market details are rejected safely', () {
+    final service = CoinDcxMarketService();
+    final tickers = service.parseAllTickersResponse(
+      jsonEncode([
+        {'market': 'BAD1', 'last_price': 'NaN', 'bid': '-5', 'ask': 'abc'},
+        {'market': 'BAD2', 'last_price': '100', 'bid': '105', 'ask': '95'},
+      ]),
+      nowMs: 100000,
+    );
+    expect(tickers, isEmpty);
+
+    final snap = service.buildCompleteMarketCatalogue(
+      activeMarketsFromEndpoint: {'BADSPEC'},
+      marketsDetailsJson: jsonEncode([
+        {
+          'coindcx_name': 'BADSPEC',
+          'symbol': 'BADSPEC',
+          'pair': 'B-BAD_USDT',
+          'ecode': 'B',
+          'base_currency_short_name': 'USDT',
+          'target_currency_short_name': 'BAD',
+          'base_currency_precision': -2,
+          'target_currency_precision': 4,
+          'min_quantity': -1.0,
+          'max_quantity': 10.0,
+          'min_notional': 0.0,
+          'step': 0.0,
+          'order_types': [],
+          'status': 'active',
+        }
+      ]),
+      tickersByMarketKey: {},
+      nowMs: 100000,
+    );
+    expect(snap.allMarkets.first.eligibilityStatus, MarketEligibilityStatus.invalidMarketSpecifications);
+    service.dispose();
+  });
+
+  test('Stage 47.1 Test 11: API timeouts are retried and handled safely', () async {
+    int calls = 0;
+    final mockClient = _MockCoinDcxHttpClient((uri) async {
+      calls++;
+      throw TimeoutException('Simulated timeout on $uri');
+    });
+    final service = CoinDcxMarketService(
+      httpClient: mockClient,
+      maxApiRetries: 1,
+      initialRetryBackoffMs: 1,
+    );
+    final snap = await service.refreshMarketCatalogue(force: true, nowMs: 100000);
+    expect(calls, greaterThanOrEqualTo(2));
+    expect(snap.isUsingCachedCatalogue, isTrue);
+    expect(snap.isCatalogueFresh, isFalse);
+    expect(snap.lastRefreshError, contains('TimeoutException'));
+    service.dispose();
+  });
+
+  test('Stage 47.1 Test 12: HTTP errors and HTTP 429 rate limits apply backoff and retry safely', () async {
+    int attempts = 0;
+    final mockClient = _MockCoinDcxHttpClient((uri) async {
+      attempts++;
+      if (attempts == 1) {
+        return http.Response('Too Many Requests', 429);
+      }
+      if (uri.path.endsWith('/markets')) {
+        return http.Response(jsonEncode(['BTCUSDT']), 200);
+      }
+      if (uri.path.endsWith('/markets_details')) {
+        return http.Response(
+          jsonEncode([
+            {
+              'coindcx_name': 'BTCUSDT',
+              'symbol': 'BTCUSDT',
+              'pair': 'B-BTC_USDT',
+              'ecode': 'B',
+              'base_currency_short_name': 'USDT',
+              'target_currency_short_name': 'BTC',
+              'base_currency_precision': 2,
+              'target_currency_precision': 5,
+              'min_quantity': 0.00001,
+              'max_quantity': 1000,
+              'max_quantity_market': 100,
+              'min_notional': 5.0,
+              'min_price': 10.0,
+              'max_price': 500000.0,
+              'step': 0.00001,
+              'order_types': ['limit_order', 'market_order'],
+              'status': 'active',
+            }
+          ]),
+          200,
+        );
+      }
+      return http.Response(
+        jsonEncode([
+          {
+            'market': 'BTCUSDT',
+            'last_price': '91000.0',
+            'bid': '90995.0',
+            'ask': '91005.0',
+            'high': '92000.0',
+            'low': '89000.0',
+            'volume': '1200.0',
+            'change_24_hour': '1.2',
+            'timestamp': 100000,
+          }
+        ]),
+        200,
+      );
+    });
+    final service = CoinDcxMarketService(
+      httpClient: mockClient,
+      maxApiRetries: 2,
+      initialRetryBackoffMs: 1,
+    );
+    final snap = await service.refreshMarketCatalogue(force: true, nowMs: 100000);
+    expect(snap.isCatalogueFresh, isTrue);
+    expect(snap.eligibleMarketsCount, 1);
+    service.dispose();
+  });
+
+  test('Stage 47.1 Test 13 & 14: Cached catalogue fallback when offline (never treated as fresh) and automatic network recovery', () async {
+    bool networkOnline = true;
+    final db = PersistenceDatabase(useInMemoryFallback: true);
+    final mockClient = _MockCoinDcxHttpClient((uri) async {
+      if (!networkOnline) {
+        throw const SocketException('No internet');
+      }
+      if (uri.path.endsWith('/markets')) {
+        return http.Response(jsonEncode(['BTCUSDT']), 200);
+      }
+      if (uri.path.endsWith('/markets_details')) {
+        return http.Response(
+          jsonEncode([
+            {
+              'coindcx_name': 'BTCUSDT',
+              'symbol': 'BTCUSDT',
+              'pair': 'B-BTC_USDT',
+              'ecode': 'B',
+              'base_currency_short_name': 'USDT',
+              'target_currency_short_name': 'BTC',
+              'base_currency_precision': 2,
+              'target_currency_precision': 5,
+              'min_quantity': 0.00001,
+              'max_quantity': 1000,
+              'max_quantity_market': 100,
+              'min_notional': 5.0,
+              'min_price': 10.0,
+              'max_price': 500000.0,
+              'step': 0.00001,
+              'order_types': ['limit_order', 'market_order'],
+              'status': 'active',
+            }
+          ]),
+          200,
+        );
+      }
+      return http.Response(
+        jsonEncode([
+          {
+            'market': 'BTCUSDT',
+            'last_price': '91000.0',
+            'bid': '90995.0',
+            'ask': '91005.0',
+            'high': '92000.0',
+            'low': '89000.0',
+            'volume': '1200.0',
+            'change_24_hour': '1.2',
+            'timestamp': 100000,
+          }
+        ]),
+        200,
+      );
+    });
+
+    final service = CoinDcxMarketService(
+      httpClient: mockClient,
+      persistence: db,
+      maxApiRetries: 0,
+    );
+
+    // 1. Online initial refresh
+    final liveSnap = await service.refreshMarketCatalogue(force: true, nowMs: 100000);
+    expect(liveSnap.isUsingCachedCatalogue, isFalse);
+    expect(liveSnap.isCatalogueFresh, isTrue);
+    expect(liveSnap.totalDiscoveredCount, 1);
+
+    // 2. Network drops -> serves cached catalogue but marks isUsingCachedCatalogue=true & isCatalogueFresh=false
+    networkOnline = false;
+    final cachedSnap = await service.refreshMarketCatalogue(force: true, nowMs: 150000);
+    expect(cachedSnap.totalDiscoveredCount, 1);
+    expect(cachedSnap.isUsingCachedCatalogue, isTrue);
+    expect(cachedSnap.isCatalogueFresh, isFalse);
+
+    // 3. Network recovers -> transitions back to fresh live catalogue
+    networkOnline = true;
+    final recoveredSnap = await service.refreshMarketCatalogue(force: true, nowMs: 160000);
+    expect(recoveredSnap.isUsingCachedCatalogue, isFalse);
+    expect(recoveredSnap.isCatalogueFresh, isTrue);
+
+    service.dispose();
+    await db.close();
+  });
+
+  test('Stage 47.1 Test 15 & 16: Database persistence of discovered markets and backward-compatible migration preserving \$100 account', () async {
+    final db = PersistenceDatabase(useInMemoryFallback: true);
+    await db.saveFullState(
+      botState: BotEngineState.running,
+      userIntention: UserSessionIntention.running,
+      availableCashUsdt: 100.0,
+      accountEquityUsdt: 100.0,
+      maxDrawdownLocked: false,
+      statusBannerMessage: 'Running',
+      openPositions: const [],
+      orders: const [],
+      closedTrades: const [],
+      processedEntrySignalKeys: const {},
+    );
+
+    const record = CoinDcxMarketRecord(
+      coindcxName: 'ETHINR',
+      symbol: 'ETHINR',
+      pair: 'I-ETH_INR',
+      ecode: 'I',
+      baseCurrencyShortName: 'INR',
+      targetCurrencyShortName: 'ETH',
+      status: 'active',
+      baseCurrencyPrecision: 2,
+      targetCurrencyPrecision: 4,
+      minQuantity: 0.001,
+      maxQuantity: 500.0,
+      maxQuantityMarket: 50.0,
+      step: 0.001,
+      minNotional: 100.0,
+      minPrice: 1000.0,
+      maxPrice: 10000000.0,
+      orderTypes: ['limit_order', 'market_order'],
+      lastMetadataRefreshMs: 123456,
+      eligibilityStatus: MarketEligibilityStatus.pendingThresholdConfiguration,
+      eligibilityReason: 'Pending INR threshold config',
+    );
+
+    await db.saveDiscoveredMarkets([record], refreshedAtMs: 123456);
+    final loaded = await db.loadDiscoveredMarkets();
+    expect(loaded.length, 1);
+    expect(loaded.first.pair, 'I-ETH_INR');
+    expect(loaded.first.baseCurrencyShortName, 'INR');
+    expect(loaded.first.targetCurrencyShortName, 'ETH');
+    expect(await db.getLastMarketCatalogueRefreshMs(), 123456);
+
+    final stateAfter = await db.loadFullState();
+    expect(stateAfter.availableCashUsdt, closeTo(100.0, 1e-6));
+    expect(stateAfter.userIntention, UserSessionIntention.running);
+    await db.close();
+  });
+
+  test('Stage 47.1 Test 17, 18 & 19: Quantity/price precision rounding, minimum quantity validation, and minimum notional validation', () {
+    const btcRecord = CoinDcxMarketRecord(
+      coindcxName: 'BTCUSDT',
+      symbol: 'BTCUSDT',
+      pair: 'B-BTC_USDT',
+      ecode: 'B',
+      baseCurrencyShortName: 'USDT',
+      targetCurrencyShortName: 'BTC',
+      status: 'active',
+      baseCurrencyPrecision: 2,
+      targetCurrencyPrecision: 5,
+      minQuantity: 0.0001,
+      maxQuantity: 100.0,
+      maxQuantityMarket: 10.0,
+      step: 0.00001,
+      minNotional: 10.0,
+      minPrice: 1000.0,
+      maxPrice: 500000.0,
+      orderTypes: ['limit_order', 'market_order'],
+      lastMetadataRefreshMs: 1000,
+    );
+
+    // Test 17: Precision rounding
+    expect(btcRecord.roundQuantityToPrecision(0.001239), closeTo(0.00123, 1e-8));
+    expect(btcRecord.roundPriceToPrecision(91234.567), closeTo(91234.57, 1e-5));
+
+    // Test 18: Minimum quantity validation
+    final belowMinQty = btcRecord.validateOrder(quantity: 0.00005, price: 90000.0);
+    expect(belowMinQty.valid, isFalse);
+    expect(belowMinQty.reason, contains('min_quantity'));
+
+    // Test 19: Minimum notional validation (0.0001 BTC * $50,000 = $5.00 < $10.00 min_notional)
+    final belowMinNotional = btcRecord.validateOrder(quantity: 0.0001, price: 50000.0);
+    expect(belowMinNotional.valid, isFalse);
+    expect(belowMinNotional.reason, contains('min_notional'));
+
+    final validOrder = btcRecord.validateOrder(quantity: 0.0002, price: 90000.0);
+    expect(validOrder.valid, isTrue);
+  });
+
+  test('Stage 47.1 Test 20: Eligibility classification across all statuses (eligible, excessiveSpread, insufficientLiquidity, pendingThresholdConfiguration, dataUnavailable, inactive, rejectedByRiskControls)', () {
+    final service = CoinDcxMarketService();
+    CoinDcxMarketRecord makeRecord({
+      required String pair,
+      required String quote,
+      String status = 'active',
+      double minNotional = 5.0,
+      LiveMarketTicker? ticker,
+    }) {
+      return CoinDcxMarketRecord(
+        coindcxName: pair,
+        symbol: pair,
+        pair: pair,
+        ecode: 'B',
+        baseCurrencyShortName: quote,
+        targetCurrencyShortName: 'ASSET',
+        status: status,
+        baseCurrencyPrecision: 2,
+        targetCurrencyPrecision: 4,
+        minQuantity: 0.001,
+        maxQuantity: 10000.0,
+        maxQuantityMarket: 1000.0,
+        step: 0.001,
+        minNotional: minNotional,
+        minPrice: 0.01,
+        maxPrice: 500000.0,
+        orderTypes: const ['limit_order', 'market_order'],
+        latestTicker: ticker,
+        lastMetadataRefreshMs: 100000,
+      );
+    }
+
+    // 1. Eligible USDT market
+    final elig = service.classifyMarketEligibility(
+      record: makeRecord(
+        pair: 'B-BTC_USDT',
+        quote: 'USDT',
+        ticker: const LiveMarketTicker(
+          symbol: 'B-BTC_USDT',
+          lastPrice: 90000.0,
+          bid: 89995.0,
+          ask: 90005.0,
+          high24h: 91000.0,
+          low24h: 88000.0,
+          volume24h: 1500.0,
+          change24hPct: 1.0,
+          timestampMs: 95000,
+        ),
+      ),
+      nowMs: 100000,
+    );
+    expect(elig.status, MarketEligibilityStatus.eligibleForPaperTrading);
+
+    // 2. Excessive spread (>25 bps)
+    final wideSpread = service.classifyMarketEligibility(
+      record: makeRecord(
+        pair: 'B-WIDE_USDT',
+        quote: 'USDT',
+        ticker: const LiveMarketTicker(
+          symbol: 'B-WIDE_USDT',
+          lastPrice: 100.0,
+          bid: 99.0,
+          ask: 101.0,
+          high24h: 105.0,
+          low24h: 95.0,
+          volume24h: 5000.0,
+          change24hPct: 0.5,
+          timestampMs: 95000,
+        ),
+      ),
+      nowMs: 100000,
+    );
+    expect(wideSpread.status, MarketEligibilityStatus.excessiveSpread);
+
+    // 3. Insufficient liquidity (<100 vol)
+    final lowLiq = service.classifyMarketEligibility(
+      record: makeRecord(
+        pair: 'B-LOWVOL_USDT',
+        quote: 'USDT',
+        ticker: const LiveMarketTicker(
+          symbol: 'B-LOWVOL_USDT',
+          lastPrice: 100.0,
+          bid: 99.99,
+          ask: 100.01,
+          high24h: 101.0,
+          low24h: 99.0,
+          volume24h: 12.0,
+          change24hPct: 0.1,
+          timestampMs: 95000,
+        ),
+      ),
+      nowMs: 100000,
+    );
+    expect(lowLiq.status, MarketEligibilityStatus.insufficientLiquidity);
+
+    // 4. Non-USDT quote currency without configured threshold -> pendingThresholdConfiguration
+    final inrPending = service.classifyMarketEligibility(
+      record: makeRecord(
+        pair: 'I-BTC_INR',
+        quote: 'INR',
+        ticker: const LiveMarketTicker(
+          symbol: 'I-BTC_INR',
+          lastPrice: 8100000.0,
+          bid: 8099500.0,
+          ask: 8100500.0,
+          high24h: 8200000.0,
+          low24h: 8000000.0,
+          volume24h: 500.0,
+          change24hPct: 1.2,
+          timestampMs: 95000,
+        ),
+      ),
+      nowMs: 100000,
+    );
+    expect(inrPending.status, MarketEligibilityStatus.pendingThresholdConfiguration);
+
+    // 5. Rejected by risk controls (min_notional > $100 paper account cap)
+    final riskRejected = service.classifyMarketEligibility(
+      record: makeRecord(
+        pair: 'B-WHALE_USDT',
+        quote: 'USDT',
+        minNotional: 250.0,
+        ticker: const LiveMarketTicker(
+          symbol: 'B-WHALE_USDT',
+          lastPrice: 1000.0,
+          bid: 999.9,
+          ask: 1000.1,
+          high24h: 1010.0,
+          low24h: 990.0,
+          volume24h: 5000.0,
+          change24hPct: 0.5,
+          timestampMs: 95000,
+        ),
+      ),
+      nowMs: 100000,
+    );
+    expect(riskRejected.status, MarketEligibilityStatus.rejectedByRiskControls);
+    service.dispose();
   });
 }

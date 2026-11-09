@@ -285,7 +285,17 @@ class AuthoritativeTradingEngine {
       final canTrade = allowTradingExecution && userWantsRunning;
       int latestCandleMs = snap.lastCandleUpdateMs ?? 0;
 
-      for (final symbol in watchedSymbols) {
+      final dynamicEligible = marketService.latestCatalogueSnapshot.eligibleMarkets
+          .map((m) => m.pair)
+          .where((p) => p.isNotEmpty)
+          .toList();
+      final activeSymbolsToEvaluate = <String>{
+        ...(dynamicEligible.isNotEmpty ? dynamicEligible : watchedSymbols),
+        // Always include symbols with open positions even if market later became inactive (Section 4.11)
+        ...broker.openPositions.map((p) => p.symbol),
+      };
+
+      for (final symbol in activeSymbolsToEvaluate) {
         List<Candle> candles15m;
         List<Candle> candles1h;
         try {
@@ -323,11 +333,16 @@ class AuthoritativeTradingEngine {
           latestCandleMs = candles15m.last.closeTimeMs;
         }
 
-        final pairMeta = MarketPairMetadata(
-          symbol: symbol,
-          baseCurrency: symbol.contains('BTC') ? 'BTC' : 'ETH',
-          quoteCurrency: 'USDT',
-        );
+        final discoveredRecord = marketService.catalogueByPair[symbol];
+        final pairMeta = discoveredRecord != null
+            ? discoveredRecord.toMarketPairMetadata()
+            : MarketPairMetadata(
+                symbol: symbol,
+                baseCurrency: symbol.contains('BTC') ? 'BTC' : 'ETH',
+                quoteCurrency: 'USDT',
+              );
+        final allowEntryForMarket = canTrade &&
+            (discoveredRecord == null || discoveredRecord.isEligibleForPaperTrading);
 
         final outcome = broker.processClosedCandleStream(
           symbol: symbol,
@@ -337,7 +352,7 @@ class AuthoritativeTradingEngine {
           pairMetadata: pairMeta,
           currentMarkPrices: livePrices,
           liveTicker: liveTickers[symbol],
-          allowNewEntries: canTrade,
+          allowNewEntries: allowEntryForMarket,
         );
 
         if (outcome.whyNoTradeReason != null) {

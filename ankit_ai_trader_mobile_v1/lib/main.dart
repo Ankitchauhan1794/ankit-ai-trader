@@ -335,11 +335,15 @@ class _DashboardPageState extends State<DashboardPage>
     );
   }
 
-  /// STAGE 22 & 33 — MARKETS TAB:
+  /// STAGE 22, 33 & 47.1 — MARKETS TAB (Dynamic CoinDCX Market Catalogue, Search & Quote Filters):
   Widget _buildMarketsTab() {
     return ListView(
       padding: const EdgeInsets.all(14),
       children: [
+        _buildMarketCatalogueSummaryAndFiltersCard(),
+        const SizedBox(height: 14),
+        _buildDiscoveredMarketCatalogueListCard(),
+        const SizedBox(height: 14),
         _buildLiveMarketCard(),
         const SizedBox(height: 14),
         _buildMarketScannerCard(),
@@ -645,6 +649,231 @@ class _DashboardPageState extends State<DashboardPage>
           ),
         ),
       ],
+    );
+  }
+
+  Widget _buildMarketCatalogueSummaryAndFiltersCard() {
+    final cat = _coordinator.marketCatalogue;
+    final lastRef = cat.lastSuccessfulRefreshMs != null
+        ? TradingCoordinator.formatUtcHhMmSs(cat.lastSuccessfulRefreshMs!)
+        : 'Never';
+    final cacheBadgeText = cat.isUsingCachedCatalogue
+        ? 'CACHED CATALOGUE (OFFLINE)'
+        : (cat.isCatalogueFresh ? 'LIVE CATALOGUE' : 'AWAITING REFRESH');
+    final cacheBadgeColor = cat.isUsingCachedCatalogue
+        ? _orangeWarn
+        : (cat.isCatalogueFresh ? _greenProfit : Colors.white54);
+
+    const quoteOptions = ['ALL', 'USDT', 'INR', 'BTC', 'ETH', 'OTHER'];
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Expanded(
+                  child: Text(
+                    'STAGE 47.1 — COINDCX SPOT MARKET CATALOGUE',
+                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                  ),
+                ),
+                Text(
+                  cacheBadgeText,
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.bold,
+                    color: cacheBadgeColor,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: _metricTile(
+                    'Discovered',
+                    '${cat.totalDiscoveredCount}',
+                    valueColor: Colors.white,
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: _metricTile(
+                    'Active',
+                    '${cat.activeMarketsCount}',
+                    valueColor: _greenProfit,
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: _metricTile(
+                    'Inactive',
+                    '${cat.inactiveMarketsCount}',
+                    valueColor: Colors.white60,
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: _metricTile(
+                    'Eligible',
+                    '${cat.eligibleMarketsCount}',
+                    valueColor: _greenProfit,
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: _metricTile(
+                    'Rejected',
+                    '${cat.rejectedMarketsCount}',
+                    valueColor: _orangeWarn,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Expanded(
+                  child: Text(
+                    'Last Catalogue Refresh: $lastRef',
+                    style: const TextStyle(fontSize: 11, color: Colors.white70),
+                  ),
+                ),
+                OutlinedButton.icon(
+                  key: const ValueKey('refresh_market_catalogue_button'),
+                  onPressed: _coordinator.isRefreshingCatalogue
+                      ? null
+                      : () => _coordinator.refreshMarketCatalogue(force: true),
+                  icon: const Icon(Icons.refresh, size: 15),
+                  label: Text(
+                    _coordinator.isRefreshingCatalogue
+                        ? 'REFRESHING...'
+                        : 'REFRESH CATALOGUE',
+                    style: const TextStyle(fontSize: 11),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              key: const ValueKey('market_search_field'),
+              onChanged: _coordinator.setMarketSearchQuery,
+              style: const TextStyle(fontSize: 12),
+              decoration: const InputDecoration(
+                isDense: true,
+                prefixIcon: Icon(Icons.search, size: 18),
+                hintText: 'Search symbol, pair, base or quote currency...',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: quoteOptions.map((q) {
+                final selected = _coordinator.selectedQuoteCurrencyFilter == q;
+                return ChoiceChip(
+                  key: ValueKey('quote_filter_$q'),
+                  label: Text(q, style: const TextStyle(fontSize: 11)),
+                  selected: selected,
+                  onSelected: (_) => _coordinator.setQuoteCurrencyFilter(q),
+                );
+              }).toList(),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDiscoveredMarketCatalogueListCard() {
+    final filtered = _coordinator.filteredDiscoveredMarkets;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'DISCOVERED MARKETS (${filtered.length} SHOWN)',
+              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+            ),
+            const SizedBox(height: 8),
+            if (filtered.isEmpty)
+              const Text(
+                'No discovered markets match the current search/quote filter.',
+                style: TextStyle(fontSize: 12, color: Colors.white60),
+              )
+            else
+              ...filtered.take(60).map((m) {
+                final t = m.latestTicker;
+                final lastPx =
+                    t != null ? t.lastPrice.toStringAsFixed(m.pricePrecision.clamp(2, 8)) : '--';
+                final spreadStr = t != null
+                    ? '${t.spreadBps.toStringAsFixed(1)} bps (${t.spreadPct.toStringAsFixed(3)}%)'
+                    : '--';
+                final volStr = t != null ? t.volume24h.toStringAsFixed(2) : '--';
+                final eligColor = m.isEligibleForPaperTrading
+                    ? _greenProfit
+                    : (m.isActiveStatus ? _orangeWarn : _redLoss);
+
+                return Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 6),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Flexible(
+                            child: Text(
+                              '${m.symbol} (${m.pair.isNotEmpty ? m.pair : "NO_PAIR"}) • Quote: ${m.baseCurrencyShortName.isNotEmpty ? m.baseCurrencyShortName : "--"}${m.isNewlyListed ? " [NEW]" : ""}',
+                              style: const TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ),
+                          Text(
+                            m.status.toUpperCase(),
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.bold,
+                              color: m.isActiveStatus ? _greenProfit : _redLoss,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        'Last: $lastPx ${m.baseCurrencyShortName} | Spread: $spreadStr | 24h Vol: $volStr | MinQty: ${m.minQuantity} | MinNotional: ${m.minNotional}',
+                        style: const TextStyle(
+                          fontSize: 11,
+                          color: Colors.white70,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        'Eligibility: ${m.eligibilityStatus.name} — ${m.eligibilityReason}',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          color: eligColor,
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }),
+          ],
+        ),
+      ),
     );
   }
 

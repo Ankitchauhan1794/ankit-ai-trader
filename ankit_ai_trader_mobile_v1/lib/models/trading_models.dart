@@ -1,3 +1,6 @@
+import 'dart:convert';
+import 'dart:math' as math;
+
 enum BotEngineState {
   stopped,
   running,
@@ -8,7 +11,7 @@ enum BotEngineState {
   stoppedMaxDrawdownReached,
 }
 
-/// Stage 2: Explicit user session intention persisted independently from runtime state.
+/// Stage 3: Explicit user session intention persisted independently from runtime state.
 enum UserSessionIntention {
   stopped,
   running,
@@ -26,6 +29,21 @@ enum StrategySignalType {
   none,
   buy,
   sell,
+}
+
+/// Stage 47.1 Section 7: Market Eligibility states (Discovered != Approved Trading Market).
+enum MarketEligibilityStatus {
+  discovered,
+  active,
+  inactive,
+  dataUnavailable,
+  insufficientLiquidity,
+  excessiveSpread,
+  invalidMarketSpecifications,
+  belowMinimumOrderRequirements,
+  eligibleForPaperTrading,
+  rejectedByRiskControls,
+  pendingThresholdConfiguration,
 }
 
 class LiveMarketTicker {
@@ -52,7 +70,11 @@ class LiveMarketTicker {
   });
 
   double get spreadPct =>
-      lastPrice > 0 && ask >= bid ? ((ask - bid) / lastPrice) * 100.0 : 0.0;
+      lastPrice > 0 && ask >= bid && bid > 0
+          ? ((ask - bid) / ((ask + bid) / 2.0)) * 100.0
+          : 0.0;
+
+  double get spreadBps => spreadPct * 100.0;
 
   bool isFresh(int nowMs, {int maxAgeMs = 120000}) =>
       timestampMs > 0 && (nowMs - timestampMs) <= maxAgeMs;
@@ -91,6 +113,10 @@ class MarketPairMetadata {
   final String quoteCurrency;
   final double minNotionalUsdt;
   final double stepSize;
+  final double minQuantity;
+  final double maxQuantity;
+  final int pricePrecision;
+  final int quantityPrecision;
 
   const MarketPairMetadata({
     required this.symbol,
@@ -98,7 +124,361 @@ class MarketPairMetadata {
     required this.quoteCurrency,
     this.minNotionalUsdt = 5.0,
     this.stepSize = 0.00001,
+    this.minQuantity = 0.00001,
+    this.maxQuantity = 90000000.0,
+    this.pricePrecision = 2,
+    this.quantityPrecision = 5,
   });
+}
+
+/// Stage 47.1 Section 5: Complete CoinDCX Spot Market Record.
+/// Preserves CoinDCX's exact official terminology from https://docs.coindcx.com/:
+/// - `baseCurrencyShortName` (`base_currency_short_name`): The price / quote currency (e.g., INR, USDT, BTC, ETH).
+/// - `targetCurrencyShortName` (`target_currency_short_name`): The quantity / traded asset (e.g., BTC, ETH, XTZ, TRX).
+/// - `baseCurrencyPrecision` (`base_currency_precision`): Decimal precision for price (`base_currency`).
+/// - `targetCurrencyPrecision` (`target_currency_precision`): Decimal precision for quantity (`target_currency`).
+/// - `pair`: Exact CoinDCX pair string `(ecode, target_currency_short_name, base_currency_short_name)` e.g. `B-BTC_USDT`, `I-BTC_INR`.
+class CoinDcxMarketRecord {
+  final String exchangeName;
+  final String coindcxName;
+  final String symbol;
+  final String pair;
+  final String ecode;
+  final String baseCurrencyShortName;
+  final String targetCurrencyShortName;
+  final String baseCurrencyName;
+  final String targetCurrencyName;
+  final String status;
+  final int baseCurrencyPrecision;
+  final int targetCurrencyPrecision;
+  final double minQuantity;
+  final double maxQuantity;
+  final double maxQuantityMarket;
+  final double step;
+  final double minNotional;
+  final double minPrice;
+  final double maxPrice;
+  final List<String> orderTypes;
+  final LiveMarketTicker? latestTicker;
+  final int? latestDataTimestampMs;
+  final int lastMetadataRefreshMs;
+  final bool isNewlyListed;
+  final bool isInActiveMarketsList;
+  final MarketEligibilityStatus eligibilityStatus;
+  final String eligibilityReason;
+
+  const CoinDcxMarketRecord({
+    this.exchangeName = 'CoinDCX',
+    required this.coindcxName,
+    required this.symbol,
+    required this.pair,
+    required this.ecode,
+    required this.baseCurrencyShortName,
+    required this.targetCurrencyShortName,
+    this.baseCurrencyName = '',
+    this.targetCurrencyName = '',
+    required this.status,
+    required this.baseCurrencyPrecision,
+    required this.targetCurrencyPrecision,
+    required this.minQuantity,
+    required this.maxQuantity,
+    required this.maxQuantityMarket,
+    required this.step,
+    required this.minNotional,
+    required this.minPrice,
+    required this.maxPrice,
+    required this.orderTypes,
+    this.latestTicker,
+    this.latestDataTimestampMs,
+    required this.lastMetadataRefreshMs,
+    this.isNewlyListed = false,
+    this.isInActiveMarketsList = true,
+    this.eligibilityStatus = MarketEligibilityStatus.discovered,
+    this.eligibilityReason = 'Discovered in CoinDCX catalogue',
+  });
+
+  /// In CoinDCX terminology, `base_currency_short_name` is the quote/pricing currency (INR, USDT, BTC, ETH).
+  String get quoteCurrency => baseCurrencyShortName;
+
+  /// In CoinDCX terminology, `target_currency_short_name` is the traded quantity asset.
+  String get tradedAssetCurrency => targetCurrencyShortName;
+
+  int get pricePrecision => baseCurrencyPrecision;
+  int get quantityPrecision => targetCurrencyPrecision;
+
+  bool get isActiveStatus =>
+      status.toLowerCase() == 'active' && isInActiveMarketsList;
+
+  bool get isEligibleForPaperTrading =>
+      eligibilityStatus == MarketEligibilityStatus.eligibleForPaperTrading;
+
+  double? get spreadBps => latestTicker?.spreadBps;
+  double? get spreadPct => latestTicker?.spreadPct;
+
+  bool get hasValidSpecifications {
+    if (symbol.isEmpty || pair.isEmpty || ecode.isEmpty) return false;
+    if (baseCurrencyShortName.isEmpty || targetCurrencyShortName.isEmpty) {
+      return false;
+    }
+    if (baseCurrencyPrecision < 0 || targetCurrencyPrecision < 0) return false;
+    if (minQuantity.isNaN || minQuantity.isInfinite || minQuantity <= 0) {
+      return false;
+    }
+    if (maxQuantity.isNaN ||
+        maxQuantity.isInfinite ||
+        maxQuantity < minQuantity) {
+      return false;
+    }
+    if (step.isNaN || step.isInfinite || step <= 0) return false;
+    if (minNotional.isNaN || minNotional.isInfinite || minNotional <= 0) {
+      return false;
+    }
+    if (minPrice.isNaN || minPrice.isInfinite || minPrice < 0) return false;
+    if (maxPrice.isNaN ||
+        maxPrice.isInfinite ||
+        (maxPrice > 0 && maxPrice < minPrice)) {
+      return false;
+    }
+    if (orderTypes.isEmpty) return false;
+    return true;
+  }
+
+  /// Round quantity down to both `step` and `target_currency_precision` without floating-point underflow.
+  double roundQuantityToPrecision(double rawQuantity) {
+    if (rawQuantity <= 0 || step <= 0) return 0.0;
+    final stepped = (((rawQuantity / step) + 1e-9).floorToDouble()) * step;
+    final factor = math.pow(10, targetCurrencyPrecision).toDouble();
+    return ((stepped * factor + 1e-9).floorToDouble()) / factor;
+  }
+
+  /// Round price to `base_currency_precision`.
+  double roundPriceToPrecision(double rawPrice) {
+    if (rawPrice <= 0) return 0.0;
+    final factor = math.pow(10, baseCurrencyPrecision).toDouble();
+    return (rawPrice * factor).roundToDouble() / factor;
+  }
+
+  /// Validate a candidate order against this market's exact specifications.
+  ({bool valid, String? reason}) validateOrder({
+    required double quantity,
+    required double price,
+    bool isMarketOrder = false,
+  }) {
+    if (!hasValidSpecifications) {
+      return (valid: false, reason: 'Invalid market specifications for $pair');
+    }
+    if (!isActiveStatus) {
+      return (valid: false, reason: 'Market $pair is not active ($status)');
+    }
+    final roundedQty = roundQuantityToPrecision(quantity);
+    if (roundedQty + 1e-12 < minQuantity) {
+      return (
+        valid: false,
+        reason:
+            'Quantity $roundedQty below min_quantity $minQuantity $targetCurrencyShortName',
+      );
+    }
+    if (roundedQty > maxQuantity + 1e-12) {
+      return (
+        valid: false,
+        reason:
+            'Quantity $roundedQty exceeds max_quantity $maxQuantity $targetCurrencyShortName',
+      );
+    }
+    if (isMarketOrder &&
+        maxQuantityMarket > 0 &&
+        roundedQty > maxQuantityMarket + 1e-12) {
+      return (
+        valid: false,
+        reason:
+            'Market order quantity $roundedQty exceeds max_quantity_market $maxQuantityMarket',
+      );
+    }
+    if (minPrice > 0 && price < minPrice) {
+      return (
+        valid: false,
+        reason: 'Price $price below min_price $minPrice $baseCurrencyShortName',
+      );
+    }
+    if (maxPrice > 0 && price > maxPrice) {
+      return (
+        valid: false,
+        reason: 'Price $price exceeds max_price $maxPrice $baseCurrencyShortName',
+      );
+    }
+    final notional = roundedQty * price;
+    if (notional + 1e-9 < minNotional) {
+      return (
+        valid: false,
+        reason:
+            'Order notional $notional below min_notional $minNotional $baseCurrencyShortName',
+      );
+    }
+    return (valid: true, reason: null);
+  }
+
+  MarketPairMetadata toMarketPairMetadata() {
+    return MarketPairMetadata(
+      symbol: pair,
+      baseCurrency: targetCurrencyShortName,
+      quoteCurrency: baseCurrencyShortName,
+      minNotionalUsdt: minNotional,
+      stepSize: step,
+      minQuantity: minQuantity,
+      maxQuantity: maxQuantity,
+      pricePrecision: baseCurrencyPrecision,
+      quantityPrecision: targetCurrencyPrecision,
+    );
+  }
+
+  CoinDcxMarketRecord copyWith({
+    String? status,
+    LiveMarketTicker? latestTicker,
+    int? latestDataTimestampMs,
+    int? lastMetadataRefreshMs,
+    bool? isNewlyListed,
+    bool? isInActiveMarketsList,
+    MarketEligibilityStatus? eligibilityStatus,
+    String? eligibilityReason,
+  }) {
+    return CoinDcxMarketRecord(
+      exchangeName: exchangeName,
+      coindcxName: coindcxName,
+      symbol: symbol,
+      pair: pair,
+      ecode: ecode,
+      baseCurrencyShortName: baseCurrencyShortName,
+      targetCurrencyShortName: targetCurrencyShortName,
+      baseCurrencyName: baseCurrencyName,
+      targetCurrencyName: targetCurrencyName,
+      status: status ?? this.status,
+      baseCurrencyPrecision: baseCurrencyPrecision,
+      targetCurrencyPrecision: targetCurrencyPrecision,
+      minQuantity: minQuantity,
+      maxQuantity: maxQuantity,
+      maxQuantityMarket: maxQuantityMarket,
+      step: step,
+      minNotional: minNotional,
+      minPrice: minPrice,
+      maxPrice: maxPrice,
+      orderTypes: orderTypes,
+      latestTicker: latestTicker ?? this.latestTicker,
+      latestDataTimestampMs:
+          latestDataTimestampMs ?? this.latestDataTimestampMs,
+      lastMetadataRefreshMs:
+          lastMetadataRefreshMs ?? this.lastMetadataRefreshMs,
+      isNewlyListed: isNewlyListed ?? this.isNewlyListed,
+      isInActiveMarketsList:
+          isInActiveMarketsList ?? this.isInActiveMarketsList,
+      eligibilityStatus: eligibilityStatus ?? this.eligibilityStatus,
+      eligibilityReason: eligibilityReason ?? this.eligibilityReason,
+    );
+  }
+
+  Map<String, dynamic> toMap() => {
+        'pair': pair,
+        'exchangeName': exchangeName,
+        'coindcxName': coindcxName,
+        'symbol': symbol,
+        'ecode': ecode,
+        'baseCurrencyShortName': baseCurrencyShortName,
+        'targetCurrencyShortName': targetCurrencyShortName,
+        'baseCurrencyName': baseCurrencyName,
+        'targetCurrencyName': targetCurrencyName,
+        'status': status,
+        'baseCurrencyPrecision': baseCurrencyPrecision,
+        'targetCurrencyPrecision': targetCurrencyPrecision,
+        'minQuantity': minQuantity,
+        'maxQuantity': maxQuantity,
+        'maxQuantityMarket': maxQuantityMarket,
+        'step': step,
+        'minNotional': minNotional,
+        'minPrice': minPrice,
+        'maxPrice': maxPrice,
+        'orderTypesJson': jsonEncode(orderTypes),
+        'latestTickerJson':
+            latestTicker != null ? jsonEncode(latestTicker!.toMap()) : null,
+        'latestDataTimestampMs': latestDataTimestampMs,
+        'lastMetadataRefreshMs': lastMetadataRefreshMs,
+        'isNewlyListed': isNewlyListed ? 1 : 0,
+        'isInActiveMarketsList': isInActiveMarketsList ? 1 : 0,
+        'eligibilityStatus': eligibilityStatus.name,
+        'eligibilityReason': eligibilityReason,
+      };
+
+  factory CoinDcxMarketRecord.fromMap(Map<String, dynamic> map) {
+    List<String> parsedOrderTypes = const [];
+    final rawTypes = map['orderTypesJson'];
+    if (rawTypes is String && rawTypes.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(rawTypes);
+        if (decoded is List) {
+          parsedOrderTypes = decoded.map((e) => e.toString()).toList();
+        }
+      } catch (_) {}
+    } else if (map['order_types'] is List) {
+      parsedOrderTypes =
+          (map['order_types'] as List).map((e) => e.toString()).toList();
+    }
+
+    LiveMarketTicker? parsedTicker;
+    final rawTicker = map['latestTickerJson'];
+    if (rawTicker is String && rawTicker.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(rawTicker);
+        if (decoded is Map) {
+          parsedTicker =
+              LiveMarketTicker.fromMap(Map<String, dynamic>.from(decoded));
+        }
+      } catch (_) {}
+    }
+
+    final eligName = (map['eligibilityStatus'] as String?) ??
+        MarketEligibilityStatus.discovered.name;
+    final elig = MarketEligibilityStatus.values.firstWhere(
+      (e) => e.name == eligName,
+      orElse: () => MarketEligibilityStatus.discovered,
+    );
+
+    return CoinDcxMarketRecord(
+      exchangeName: (map['exchangeName'] as String?) ?? 'CoinDCX',
+      coindcxName: (map['coindcxName'] as String?) ?? '',
+      symbol: (map['symbol'] as String?) ?? '',
+      pair: (map['pair'] as String?) ?? '',
+      ecode: (map['ecode'] as String?) ?? '',
+      baseCurrencyShortName: (map['baseCurrencyShortName'] as String?) ?? '',
+      targetCurrencyShortName:
+          (map['targetCurrencyShortName'] as String?) ?? '',
+      baseCurrencyName: (map['baseCurrencyName'] as String?) ?? '',
+      targetCurrencyName: (map['targetCurrencyName'] as String?) ?? '',
+      status: (map['status'] as String?) ?? 'inactive',
+      baseCurrencyPrecision:
+          (map['baseCurrencyPrecision'] as num?)?.toInt() ?? 0,
+      targetCurrencyPrecision:
+          (map['targetCurrencyPrecision'] as num?)?.toInt() ?? 0,
+      minQuantity: (map['minQuantity'] as num?)?.toDouble() ?? 0.0,
+      maxQuantity: (map['maxQuantity'] as num?)?.toDouble() ?? 0.0,
+      maxQuantityMarket:
+          (map['maxQuantityMarket'] as num?)?.toDouble() ?? 0.0,
+      step: (map['step'] as num?)?.toDouble() ?? 0.0,
+      minNotional: (map['minNotional'] as num?)?.toDouble() ?? 0.0,
+      minPrice: (map['minPrice'] as num?)?.toDouble() ?? 0.0,
+      maxPrice: (map['maxPrice'] as num?)?.toDouble() ?? 0.0,
+      orderTypes: parsedOrderTypes,
+      latestTicker: parsedTicker,
+      latestDataTimestampMs:
+          (map['latestDataTimestampMs'] as num?)?.toInt(),
+      lastMetadataRefreshMs:
+          (map['lastMetadataRefreshMs'] as num?)?.toInt() ?? 0,
+      isNewlyListed: map['isNewlyListed'] == 1 || map['isNewlyListed'] == true,
+      isInActiveMarketsList: map['isInActiveMarketsList'] == null
+          ? true
+          : (map['isInActiveMarketsList'] == 1 ||
+              map['isInActiveMarketsList'] == true),
+      eligibilityStatus: elig,
+      eligibilityReason: (map['eligibilityReason'] as String?) ?? '',
+    );
+  }
 }
 
 class Candle {
@@ -395,6 +775,7 @@ class BacktestReport {
     required this.maxDrawdownUsdt,
   });
 }
+
 class DiagnosticEvent {
   final int id;
   final int timestampMs;
