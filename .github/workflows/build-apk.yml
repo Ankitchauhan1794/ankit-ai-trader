@@ -31,6 +31,7 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
+          cache: 'gradle'
 
       - name: Set up Flutter 3.27.4
         uses: subosito/flutter-action@v2
@@ -42,11 +43,21 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
-      - name: Run automated unit & integration tests (Stage 20)
+      - name: Run automated unit & integration tests (Stages 1 to 47)
         run: flutter test test/stages_1_to_20_test.dart
 
-      - name: Build Release APK
-        run: flutter build apk --release
+      - name: Build Release APK (with Maven/GitHub 504 network retry guard)
+        run: |
+          for attempt in 1 2 3; do
+            echo "Building Release APK (attempt $attempt/3)..."
+            if flutter build apk --release; then
+              echo "Release APK built successfully on attempt $attempt!"
+              exit 0
+            fi
+            echo "Attempt $attempt hit a transient artifact download timeout; retrying in 10s..."
+            sleep 10
+          done
+          exit 1
 
       - name: Package APK for download
         run: |
