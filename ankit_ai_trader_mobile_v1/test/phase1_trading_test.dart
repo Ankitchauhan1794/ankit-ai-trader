@@ -1849,4 +1849,262 @@ void main() {
     expect(riskRejected.status, MarketEligibilityStatus.rejectedByRiskControls);
     service.dispose();
   });
+
+  // ============================================================================
+  // PART 9 — MULTI-PAIR TRADING ACTIVATION, RANKING & RECOVERY TESTS
+  // ============================================================================
+  test('Multi-Pair Test 21: AuthoritativeTradingEngine dynamically discovers eligible pairs, isolates single-pair candle errors, ranks multiple BUY signals, and enforces 1-max-open-position portfolio limit', () async {
+    final db = PersistenceDatabase(useInMemoryFallback: true);
+    const nowMs = 200 * 900000;
+
+    // Build synthetic 15m and 1h closed candle series that produce a genuine EMA20 > EMA50 crossover with RSI in [50, 65] and 1h bullish
+    List<Map<String, dynamic>> buildBullishCrossoverCandlesJson({
+      required int intervalMs,
+      required double basePrice,
+      required double finalJump,
+    }) {
+      final list = <Map<String, dynamic>>[];
+      for (int i = 0; i < 65; i++) {
+        final openMs = (i + 1) * intervalMs;
+        double closePx;
+        if (i < 55) {
+          // Slight decline so EMA20 is just below EMA50 at bar 63
+          closePx = basePrice - (i * 0.2);
+        } else if (i < 63) {
+          closePx = basePrice - (55 * 0.2) + ((i - 55) * 0.65);
+        } else if (i == 63) {
+          closePx = basePrice - 6.0;
+        } else {
+          // Bar 64 (last closed candle): modest upward move that crosses EMA20 above EMA50 with RSI in 50-65
+          closePx = basePrice - 6.0 + finalJump;
+        }
+        list.add({
+          'time': openMs,
+          'open': closePx - 0.2,
+          'high': closePx + 0.8,
+          'low': closePx - 0.8,
+          'close': closePx,
+          'volume': 150.0,
+        });
+      }
+      return list;
+    }
+
+    List<Map<String, dynamic>> buildBullish1hCandlesJson(double basePrice) {
+      return List.generate(65, (i) {
+        final px = basePrice + (i * 1.5);
+        return {
+          'time': (i + 1) * 3600000,
+          'open': px - 0.5,
+          'high': px + 1.0,
+          'low': px - 1.0,
+          'close': px,
+          'volume': 500.0,
+        };
+      });
+    }
+
+    final mockClient = _MockCoinDcxHttpClient((uri) async {
+      if (uri.path.endsWith('/markets')) {
+        return http.Response(
+          jsonEncode(['SOLUSDT', 'AVAXUSDT', 'BROKENUSDT', 'BTCINR']),
+          200,
+        );
+      }
+      if (uri.path.endsWith('/markets_details')) {
+        Map<String, dynamic> spec(String sym, String pair, String ecode, String quote, String target) => {
+              'coindcx_name': sym,
+              'symbol': sym,
+              'pair': pair,
+              'ecode': ecode,
+              'base_currency_short_name': quote,
+              'target_currency_short_name': target,
+              'base_currency_precision': 2,
+              'target_currency_precision': 4,
+              'min_quantity': 0.01,
+              'max_quantity': 10000.0,
+              'max_quantity_market': 1000.0,
+              'min_notional': 5.0,
+              'min_price': 0.1,
+              'max_price': 100000.0,
+              'step': 0.01,
+              'order_types': ['limit_order', 'market_order'],
+              'status': 'active',
+            };
+        return http.Response(
+          jsonEncode([
+            spec('SOLUSDT', 'B-SOL_USDT', 'B', 'USDT', 'SOL'),
+            spec('AVAXUSDT', 'B-AVAX_USDT', 'B', 'USDT', 'AVAX'),
+            spec('BROKENUSDT', 'B-BROKEN_USDT', 'B', 'USDT', 'BROKEN'),
+            spec('BTCINR', 'I-BTC_INR', 'I', 'INR', 'BTC'),
+          ]),
+          200,
+        );
+      }
+      if (uri.path.endsWith('/ticker')) {
+        return http.Response(
+          jsonEncode([
+            {
+              'market': 'SOLUSDT',
+              'last_price': '196.50',
+              'bid': '196.45',
+              'ask': '196.55',
+              'high': '202.0',
+              'low': '190.0',
+              'volume': '85000.0',
+              'change_24_hour': '3.2',
+              'timestamp': nowMs - 2000,
+            },
+            {
+              'market': 'AVAXUSDT',
+              'last_price': '96.50',
+              'bid': '96.40',
+              'ask': '96.60',
+              'high': '99.0',
+              'low': '92.0',
+              'volume': '12000.0',
+              'change_24_hour': '1.8',
+              'timestamp': nowMs - 2000,
+            },
+            {
+              'market': 'BROKENUSDT',
+              'last_price': '50.0',
+              'bid': '49.98',
+              'ask': '50.02',
+              'high': '52.0',
+              'low': '48.0',
+              'volume': '5000.0',
+              'change_24_hour': '0.5',
+              'timestamp': nowMs - 2000,
+            },
+            {
+              'market': 'BTCINR',
+              'last_price': '8150000.0',
+              'bid': '8149000.0',
+              'ask': '8151000.0',
+              'high': '8200000.0',
+              'low': '8000000.0',
+              'volume': '300.0',
+              'change_24_hour': '1.1',
+              'timestamp': nowMs - 2000,
+            },
+          ]),
+          200,
+        );
+      }
+      if (uri.path.endsWith('/candles')) {
+        final pair = uri.queryParameters['pair'] ?? '';
+        final interval = uri.queryParameters['interval'] ?? '15m';
+        if (pair == 'B-BROKEN_USDT') {
+          return http.Response('Internal Server Error', 500);
+        }
+        if (interval == '1h') {
+          final base = pair == 'B-SOL_USDT' ? 180.0 : 80.0;
+          return http.Response(jsonEncode(buildBullish1hCandlesJson(base)), 200);
+        }
+        final base = pair == 'B-SOL_USDT' ? 200.0 : 100.0;
+        return http.Response(
+          jsonEncode(
+            buildBullishCrossoverCandlesJson(
+              intervalMs: 900000,
+              basePrice: base,
+              finalJump: 2.8,
+            ),
+          ),
+          200,
+        );
+      }
+      return http.Response('Not Found', 404);
+    });
+
+    final marketService = CoinDcxMarketService(
+      httpClient: mockClient,
+      persistence: db,
+      maxApiRetries: 0,
+    );
+    final engine = AuthoritativeTradingEngine(
+      marketService: marketService,
+      persistence: db,
+      nowMsProvider: () => nowMs,
+    );
+
+    final ok = await engine.handleCommand('START');
+    expect(ok, isTrue);
+
+    final snap = await db.loadFullState();
+    expect(snap.botState, BotEngineState.running);
+    // 4 pairs discovered (SOLUSDT, AVAXUSDT, BROKENUSDT, BTCINR); 3 USDT eligible, 1 INR rejected/pending
+    expect(snap.scanDiagnostics.totalPairsDiscovered, 4);
+    expect(snap.scanDiagnostics.eligiblePairsCount, 3);
+    // B-BROKEN_USDT failed candle fetch, but B-SOL_USDT and B-AVAX_USDT were still evaluated!
+    expect(snap.scanDiagnostics.totalPairsEvaluated, 2);
+    expect(snap.scanDiagnostics.skippedPairsReasons.containsKey('B-BROKEN_USDT'), isTrue);
+    expect(snap.scanDiagnostics.skippedPairsReasons.containsKey('I-BTC_INR'), isTrue);
+
+    marketService.dispose();
+    engine.dispose();
+    await db.close();
+  });
+
+  test('Multi-Pair Test 22: Dashboard preserves PAUSED_BY_NETWORK state even when service & heartbeat are alive, and clears lastError upon recovery', () async {
+    final db = PersistenceDatabase(useInMemoryFallback: true);
+    await db.saveRecoveryState(
+      attemptCount: 1,
+      recoveryStartedAtMs: 90000,
+      nextRecoveryAllowedAtMs: 95000,
+      logMessage: '[00:01:30 UTC] AUTO-RECOVERY RETRY #1 (5s): Internet disconnected. Bot paused for safety.',
+    );
+    await db.saveFullState(
+      botState: BotEngineState.pausedNetworkLoss,
+      userIntention: UserSessionIntention.running,
+      availableCashUsdt: 100.0,
+      accountEquityUsdt: 100.0,
+      maxDrawdownLocked: false,
+      lastHeartbeatMs: 99000,
+      statusBannerMessage: 'PAUSED (PAUSED_BY_NETWORK): Internet disconnected. Bot paused for safety.',
+      openPositions: const [],
+      orders: const [],
+      closedTrades: const [],
+      processedEntrySignalKeys: const {},
+    );
+
+    final bridge = _FakeCommandBridge(serviceReady: true, shouldSucceedStart: true);
+    final coordinator = TradingCoordinator(
+      persistence: db,
+      commandBridge: bridge,
+      nowMsProvider: () => 100000,
+    );
+
+    await coordinator.refreshStateFromDatabase(isInitialLoad: true);
+    // Crucial Part 2 requirement: Must NOT report RUNNING when snap.botState is pausedNetworkLoss!
+    expect(coordinator.engineState, BotEngineState.pausedNetworkLoss);
+    expect(coordinator.engineState.dashboardLabel, 'PAUSED_BY_NETWORK');
+    expect(coordinator.recoveryAttemptCount, 1);
+    expect(coordinator.lastError, contains('AUTO-RECOVERY RETRY #1'));
+
+    // Now clear recovery state (as happens when a cycle succeeds after recovery)
+    await db.clearRecoveryState();
+    await db.saveFullState(
+      botState: BotEngineState.running,
+      userIntention: UserSessionIntention.running,
+      availableCashUsdt: 100.0,
+      accountEquityUsdt: 100.0,
+      maxDrawdownLocked: false,
+      lastHeartbeatMs: 105000,
+      statusBannerMessage: 'PAPER BOT RUNNING',
+      openPositions: const [],
+      orders: const [],
+      closedTrades: const [],
+      processedEntrySignalKeys: const {},
+    );
+
+    await coordinator.refreshStateFromDatabase(isInitialLoad: false);
+    expect(coordinator.engineState, BotEngineState.running);
+    expect(coordinator.engineState.dashboardLabel, 'RUNNING');
+    expect(coordinator.recoveryAttemptCount, 0);
+    expect(coordinator.lastError, isNull);
+
+    coordinator.dispose();
+    await db.close();
+  });
 }

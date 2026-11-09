@@ -5,10 +5,49 @@ enum BotEngineState {
   stopped,
   running,
   pausedNetworkLoss,
+  reconnecting,
+  waitingForFreshData,
   pausedStaleData,
   pausedAfterRecoveryManualStartRequired,
+  recoveryFailed,
   lockedDailyLossLimit,
   stoppedMaxDrawdownReached,
+}
+
+extension BotEngineStateDisplay on BotEngineState {
+  /// Part 2: Exact dashboard state label distinguishing all required states.
+  String get dashboardLabel {
+    switch (this) {
+      case BotEngineState.running:
+        return 'RUNNING';
+      case BotEngineState.pausedNetworkLoss:
+        return 'PAUSED_BY_NETWORK';
+      case BotEngineState.reconnecting:
+        return 'RECONNECTING';
+      case BotEngineState.waitingForFreshData:
+      case BotEngineState.pausedStaleData:
+        return 'WAITING_FOR_FRESH_DATA';
+      case BotEngineState.pausedAfterRecoveryManualStartRequired:
+        return 'PAUSED_BY_USER';
+      case BotEngineState.lockedDailyLossLimit:
+      case BotEngineState.stoppedMaxDrawdownReached:
+        return 'PAUSED_BY_RISK';
+      case BotEngineState.recoveryFailed:
+        return 'RECOVERY_FAILED';
+      case BotEngineState.stopped:
+        return 'STOPPED';
+    }
+  }
+
+  bool get isNetworkOrStalePause =>
+      this == BotEngineState.pausedNetworkLoss ||
+      this == BotEngineState.reconnecting ||
+      this == BotEngineState.waitingForFreshData ||
+      this == BotEngineState.pausedStaleData;
+
+  bool get isRiskLock =>
+      this == BotEngineState.lockedDailyLossLimit ||
+      this == BotEngineState.stoppedMaxDrawdownReached;
 }
 
 /// Stage 3: Explicit user session intention persisted independently from runtime state.
@@ -31,7 +70,7 @@ enum StrategySignalType {
   sell,
 }
 
-/// Stage 47.1 Section 7: Market Eligibility states (Discovered != Approved Trading Market).
+/// Stage 47.1 Section 7 & Part 3: Market Eligibility states (Discovered != Approved Trading Market).
 enum MarketEligibilityStatus {
   discovered,
   active,
@@ -44,6 +83,162 @@ enum MarketEligibilityStatus {
   eligibleForPaperTrading,
   rejectedByRiskControls,
   pendingThresholdConfiguration,
+}
+
+extension MarketEligibilityCategory on MarketEligibilityStatus {
+  /// Part 3 high-level category label (DISCOVERED, ACTIVE, ELIGIBLE, REJECTED, INACTIVE, DATA_UNAVAILABLE).
+  String get categoryLabel {
+    switch (this) {
+      case MarketEligibilityStatus.eligibleForPaperTrading:
+        return 'ELIGIBLE';
+      case MarketEligibilityStatus.inactive:
+        return 'INACTIVE';
+      case MarketEligibilityStatus.dataUnavailable:
+        return 'DATA_UNAVAILABLE';
+      case MarketEligibilityStatus.active:
+        return 'ACTIVE';
+      case MarketEligibilityStatus.discovered:
+        return 'DISCOVERED';
+      case MarketEligibilityStatus.insufficientLiquidity:
+      case MarketEligibilityStatus.excessiveSpread:
+      case MarketEligibilityStatus.invalidMarketSpecifications:
+      case MarketEligibilityStatus.belowMinimumOrderRequirements:
+      case MarketEligibilityStatus.rejectedByRiskControls:
+      case MarketEligibilityStatus.pendingThresholdConfiguration:
+        return 'REJECTED';
+    }
+  }
+}
+
+/// Part 4 & Part 5: Multi-Pair Ranked Signal Opportunity.
+class RankedSignalOpportunity {
+  final CoinDcxMarketRecord market;
+  final StrategyEvaluationResult evaluation;
+  final List<Candle> closedCandles15m;
+  final List<Candle> closedCandles1h;
+  final LiveMarketTicker ticker;
+  final double rankingScore;
+
+  const RankedSignalOpportunity({
+    required this.market,
+    required this.evaluation,
+    required this.closedCandles15m,
+    required this.closedCandles1h,
+    required this.ticker,
+    required this.rankingScore,
+  });
+}
+
+/// Part 7: Detailed Trading Diagnostics Snapshot persisted in SQLite.
+class ScanCycleDiagnosticsSnapshot {
+  final int? lastCycleTimestampMs;
+  final int? lastSuccessfulScanMs;
+  final int totalPairsDiscovered;
+  final int activePairsCount;
+  final int eligiblePairsCount;
+  final int rejectedPairsCount;
+  final int? lastCatalogueRefreshMs;
+  final int totalPairsEvaluated;
+  final int pairsSkippedCount;
+  final Map<String, String> skippedPairsReasons;
+  final int signalsGeneratedCount;
+  final int buySignalsCount;
+  final int sellSignalsCount;
+  final int rejectedSignalsCount;
+  final Map<String, String> signalRejectionReasons;
+  final int paperOrdersSubmittedCount;
+  final int acceptedOrdersCount;
+  final int rejectedOrdersCount;
+  final String coindcxRestStatus;
+  final String webSocketStatus;
+  final String recoveryStateLabel;
+
+  const ScanCycleDiagnosticsSnapshot({
+    this.lastCycleTimestampMs,
+    this.lastSuccessfulScanMs,
+    this.totalPairsDiscovered = 0,
+    this.activePairsCount = 0,
+    this.eligiblePairsCount = 0,
+    this.rejectedPairsCount = 0,
+    this.lastCatalogueRefreshMs,
+    this.totalPairsEvaluated = 0,
+    this.pairsSkippedCount = 0,
+    this.skippedPairsReasons = const {},
+    this.signalsGeneratedCount = 0,
+    this.buySignalsCount = 0,
+    this.sellSignalsCount = 0,
+    this.rejectedSignalsCount = 0,
+    this.signalRejectionReasons = const {},
+    this.paperOrdersSubmittedCount = 0,
+    this.acceptedOrdersCount = 0,
+    this.rejectedOrdersCount = 0,
+    this.coindcxRestStatus = 'IDLE',
+    this.webSocketStatus = 'REST_POLLING_ACTIVE',
+    this.recoveryStateLabel = 'NORMAL',
+  });
+
+  Map<String, dynamic> toMap() => {
+        'lastCycleTimestampMs': lastCycleTimestampMs,
+        'lastSuccessfulScanMs': lastSuccessfulScanMs,
+        'totalPairsDiscovered': totalPairsDiscovered,
+        'activePairsCount': activePairsCount,
+        'eligiblePairsCount': eligiblePairsCount,
+        'rejectedPairsCount': rejectedPairsCount,
+        'lastCatalogueRefreshMs': lastCatalogueRefreshMs,
+        'totalPairsEvaluated': totalPairsEvaluated,
+        'pairsSkippedCount': pairsSkippedCount,
+        'skippedPairsReasons': skippedPairsReasons,
+        'signalsGeneratedCount': signalsGeneratedCount,
+        'buySignalsCount': buySignalsCount,
+        'sellSignalsCount': sellSignalsCount,
+        'rejectedSignalsCount': rejectedSignalsCount,
+        'signalRejectionReasons': signalRejectionReasons,
+        'paperOrdersSubmittedCount': paperOrdersSubmittedCount,
+        'acceptedOrdersCount': acceptedOrdersCount,
+        'rejectedOrdersCount': rejectedOrdersCount,
+        'coindcxRestStatus': coindcxRestStatus,
+        'webSocketStatus': webSocketStatus,
+        'recoveryStateLabel': recoveryStateLabel,
+      };
+
+  factory ScanCycleDiagnosticsSnapshot.fromMap(Map<String, dynamic> map) {
+    Map<String, String> parseStrMap(dynamic raw) {
+      if (raw is Map) {
+        return {
+          for (final e in raw.entries) e.key.toString(): e.value.toString(),
+        };
+      }
+      return const {};
+    }
+
+    return ScanCycleDiagnosticsSnapshot(
+      lastCycleTimestampMs: (map['lastCycleTimestampMs'] as num?)?.toInt(),
+      lastSuccessfulScanMs: (map['lastSuccessfulScanMs'] as num?)?.toInt(),
+      totalPairsDiscovered: (map['totalPairsDiscovered'] as num?)?.toInt() ?? 0,
+      activePairsCount: (map['activePairsCount'] as num?)?.toInt() ?? 0,
+      eligiblePairsCount: (map['eligiblePairsCount'] as num?)?.toInt() ?? 0,
+      rejectedPairsCount: (map['rejectedPairsCount'] as num?)?.toInt() ?? 0,
+      lastCatalogueRefreshMs: (map['lastCatalogueRefreshMs'] as num?)?.toInt(),
+      totalPairsEvaluated: (map['totalPairsEvaluated'] as num?)?.toInt() ?? 0,
+      pairsSkippedCount: (map['pairsSkippedCount'] as num?)?.toInt() ?? 0,
+      skippedPairsReasons: parseStrMap(map['skippedPairsReasons']),
+      signalsGeneratedCount:
+          (map['signalsGeneratedCount'] as num?)?.toInt() ?? 0,
+      buySignalsCount: (map['buySignalsCount'] as num?)?.toInt() ?? 0,
+      sellSignalsCount: (map['sellSignalsCount'] as num?)?.toInt() ?? 0,
+      rejectedSignalsCount:
+          (map['rejectedSignalsCount'] as num?)?.toInt() ?? 0,
+      signalRejectionReasons: parseStrMap(map['signalRejectionReasons']),
+      paperOrdersSubmittedCount:
+          (map['paperOrdersSubmittedCount'] as num?)?.toInt() ?? 0,
+      acceptedOrdersCount: (map['acceptedOrdersCount'] as num?)?.toInt() ?? 0,
+      rejectedOrdersCount: (map['rejectedOrdersCount'] as num?)?.toInt() ?? 0,
+      coindcxRestStatus: (map['coindcxRestStatus'] as String?) ?? 'IDLE',
+      webSocketStatus:
+          (map['webSocketStatus'] as String?) ?? 'REST_POLLING_ACTIVE',
+      recoveryStateLabel: (map['recoveryStateLabel'] as String?) ?? 'NORMAL',
+    );
+  }
 }
 
 class LiveMarketTicker {

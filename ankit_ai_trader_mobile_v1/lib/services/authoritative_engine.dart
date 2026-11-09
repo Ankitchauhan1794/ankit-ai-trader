@@ -1,6 +1,8 @@
 import 'dart:async';
+import 'dart:math' as math;
 import '../models/trading_models.dart';
 import 'coindcx_market_service.dart';
+import 'execution_and_risk_hub.dart';
 import 'paper_broker.dart';
 import 'persistence_db.dart';
 import 'strategy_engine.dart';
@@ -9,17 +11,20 @@ import 'trade_alert_formatter.dart';
 class AuthoritativeTradingEngine {
   static const String authoritativeLockName = 'AUTHORITATIVE_ENGINE_LOCK';
   static const List<String> watchedSymbols = ['B-BTC_USDT', 'B-ETH_USDT'];
+  static const int maxEligiblePairsPerScanCycle = 25;
 
   final CoinDcxMarketService marketService;
   final PersistenceDatabase persistence;
   final PaperBroker broker;
   final StrategyEngine strategyEngine;
+  final IndependentRiskSupervisor riskSupervisor;
   final int Function() nowMsProvider;
   final Future<void> Function(String title, String text)? onNotificationUpdate;
   final Future<bool> Function(TradeAlertPayload alert)? onTradeAlert;
   final Future<void> Function(int delayMs, String reason)? onSchedulerRetry;
   final Future<void> Function(UserSessionIntention intention)?
       onSyncUserIntention;
+  final bool verifyReachabilityBeforeNetworkPause;
 
   final String _ownerId;
   bool _isCycleExecuting = false;
@@ -30,12 +35,15 @@ class AuthoritativeTradingEngine {
     required this.persistence,
     PaperBroker? broker,
     this.strategyEngine = const StrategyEngine(),
+    IndependentRiskSupervisor? riskSupervisor,
     int Function()? nowMsProvider,
     this.onNotificationUpdate,
     this.onTradeAlert,
     this.onSchedulerRetry,
     this.onSyncUserIntention,
+    this.verifyReachabilityBeforeNetworkPause = false,
   })  : broker = broker ?? PaperBroker(),
+        riskSupervisor = riskSupervisor ?? IndependentRiskSupervisor(),
         nowMsProvider =
             nowMsProvider ?? (() => DateTime.now().millisecondsSinceEpoch),
         _ownerId = 'auth_engine_${DateTime.now().microsecondsSinceEpoch}';
@@ -106,6 +114,7 @@ class AuthoritativeTradingEngine {
             orders: broker.orders,
             closedTrades: broker.closedTrades,
             processedEntrySignalKeys: broker.processedEntrySignalKeys,
+            scanDiagnostics: snap.scanDiagnostics,
           );
           return false;
         }
@@ -140,6 +149,7 @@ class AuthoritativeTradingEngine {
           orders: broker.orders,
           closedTrades: broker.closedTrades,
           processedEntrySignalKeys: broker.processedEntrySignalKeys,
+          scanDiagnostics: snap.scanDiagnostics,
         );
         await onSyncUserIntention?.call(UserSessionIntention.paused);
         await _notify(
@@ -174,6 +184,7 @@ class AuthoritativeTradingEngine {
           orders: broker.orders,
           closedTrades: broker.closedTrades,
           processedEntrySignalKeys: broker.processedEntrySignalKeys,
+          scanDiagnostics: snap.scanDiagnostics,
         );
         await onSyncUserIntention?.call(UserSessionIntention.stopped);
         return true;
@@ -184,6 +195,7 @@ class AuthoritativeTradingEngine {
         // Stage 8: Preserve notifiedAlertIds across RESET
         final preservedAlerts = await persistence.getNotifiedAlertIds();
         broker.manualResetPaperAccount();
+        riskSupervisor.consecutiveLosses = 0;
         await persistence.saveFullState(
           botState: BotEngineState.stopped,
           userIntention: UserSessionIntention.stopped,
@@ -204,6 +216,7 @@ class AuthoritativeTradingEngine {
           orders: const [],
           closedTrades: const [],
           processedEntrySignalKeys: const {},
+          scanDiagnostics: const ScanCycleDiagnosticsSnapshot(),
         );
         for (final id in preservedAlerts) {
           await persistence.markAlertIdNotified(id);
@@ -222,7 +235,37 @@ class AuthoritativeTradingEngine {
     }
   }
 
-  /// Stage 8: Single authoritative engine execution covered by SQLite lease lock.
+  /// Compute ranking score for valid BUY signals across multiple eligible pairs (Part 4 & Part 5).
+  static double computeOpportunityRankingScore({
+    required StrategyEvaluationResult evaluation,
+    required LiveMarketTicker? ticker,
+  }) {
+    final px = evaluation.closePrice > 0 ? evaluation.closePrice : 1.0;
+    final ema15mSpreadBps =
+        ((evaluation.ema20_15m - evaluation.ema50_15m) / px) * 10000.0;
+    final ema1hSpreadBps =
+        ((evaluation.ema20_1h - evaluation.ema50_1h) / px) * 10000.0;
+    // Prefer RSI near middle of 50-65 band (57.5)
+    final rsiScore =
+        (15.0 - (evaluation.rsi14_15m - 57.5).abs()).clamp(0.0, 15.0) * 2.0;
+    final spreadBps = ticker?.spreadBps ?? 10.0;
+    final tightSpreadScore = (25.0 - spreadBps).clamp(0.0, 25.0) * 1.2;
+    final volScore = ticker != null && ticker.volume24h > 0
+        ? (math.log(ticker.volume24h + 1.0) / math.log(1000000.0))
+                .clamp(0.0, 1.0) *
+            20.0
+        : 5.0;
+
+    return (ema15mSpreadBps.clamp(0.0, 50.0) * 0.6) +
+        (ema1hSpreadBps.clamp(0.0, 80.0) * 0.3) +
+        rsiScore +
+        tightSpreadScore +
+        volScore;
+  }
+
+  /// Stage 8, Part 4, Part 5 & Part 6: Single authoritative engine execution covered by SQLite lease lock.
+  /// Dynamically discovers all CoinDCX markets, evaluates every eligible pair, ranks valid BUY opportunities,
+  /// and executes within the $100 / 1-max-open-position portfolio risk controls.
   Future<bool> executeAuthoritativeCycle({
     required bool allowTradingExecution,
     bool transitionToRunningOnSuccess = false,
@@ -257,11 +300,26 @@ class AuthoritativeTradingEngine {
         return false;
       }
 
+      // Part 2: If paused due to network/stale data and Auto Resume is OFF, do NOT silently resume on background ticks!
+      // Only resume when transitionToRunningOnSuccess == true (explicit START/RESUME) or snap.autoResumeEnabled == true.
+      if (snap.botState.isNetworkOrStalePause &&
+          !snap.autoResumeEnabled &&
+          !transitionToRunningOnSuccess) {
+        return false;
+      }
+
+      // Part 3 & Part 4: Refresh dynamic CoinDCX market catalogue so newly listed & eligible pairs enter the pipeline automatically.
+      try {
+        await marketService.refreshMarketCatalogue(force: false, nowMs: nowMs);
+      } catch (_) {}
+
       // Stage 12 & 14: Fetch live tickers for current price, equity, uPnL & live SL/TP
       Map<String, LiveMarketTicker> liveTickers = {};
+      String restStatus = 'OK';
       try {
         liveTickers = await marketService.fetchLiveTickers(nowMs: nowMs);
       } catch (e) {
+        restStatus = 'ERROR: $e';
         liveTickers = Map.from(marketService.latestTickers);
       }
 
@@ -271,12 +329,14 @@ class AuthoritativeTradingEngine {
             snap: snap,
             nowMs: nowMs,
             pauseState: BotEngineState.pausedNetworkLoss,
-            reason: 'Live ticker feed unavailable — waiting for network recovery',
+            reason:
+                'Live ticker feed unavailable — waiting for network recovery',
           );
         }
         return false;
       }
 
+      final catSnap = marketService.latestCatalogueSnapshot;
       final livePrices = {
         for (final e in liveTickers.entries) e.key: e.value.lastPrice,
       };
@@ -285,16 +345,56 @@ class AuthoritativeTradingEngine {
       final canTrade = allowTradingExecution && userWantsRunning;
       int latestCandleMs = snap.lastCandleUpdateMs ?? 0;
 
-      final dynamicEligible = marketService.latestCatalogueSnapshot.eligibleMarkets
+      // Build dynamic list of eligible pairs (sorted by volume/tight spread, capped at maxEligiblePairsPerScanCycle)
+      final eligibleRecords = List<CoinDcxMarketRecord>.from(
+        catSnap.eligibleMarkets,
+      )..sort((a, b) {
+          final volA = a.latestTicker?.volume24h ?? 0.0;
+          final volB = b.latestTicker?.volume24h ?? 0.0;
+          return volB.compareTo(volA);
+        });
+
+      final dynamicEligiblePairs = eligibleRecords
+          .take(maxEligiblePairsPerScanCycle)
           .map((m) => m.pair)
           .where((p) => p.isNotEmpty)
           .toList();
+
+      final openPositionSymbols =
+          broker.openPositions.map((p) => p.symbol).toSet();
+
       final activeSymbolsToEvaluate = <String>{
-        ...(dynamicEligible.isNotEmpty ? dynamicEligible : watchedSymbols),
-        // Always include symbols with open positions even if market later became inactive (Section 4.11)
-        ...broker.openPositions.map((p) => p.symbol),
+        ...openPositionSymbols,
+        ...(dynamicEligiblePairs.isNotEmpty
+            ? dynamicEligiblePairs
+            : watchedSymbols),
       };
 
+      final skippedPairsReasons = <String, String>{};
+      final signalRejectionReasons = <String, String>{};
+      final rankedBuyOpportunities = <RankedSignalOpportunity>[];
+
+      int pairsEvaluatedCount = 0;
+      int signalsGeneratedCount = 0;
+      int buySignalsCount = 0;
+      int sellSignalsCount = 0;
+      int rejectedSignalsCount = 0;
+      int paperOrdersSubmittedCount = 0;
+      int acceptedOrdersCount = 0;
+      int rejectedOrdersCount = 0;
+      int newOrderSeqDelta = 0;
+      bool anyNetworkError = false;
+      String? lastSymbolFetchError;
+
+      // Record catalogue-level rejections in skippedPairsReasons for visibility
+      for (final m in catSnap.allMarkets) {
+        if (!m.isEligibleForPaperTrading && m.pair.isNotEmpty) {
+          skippedPairsReasons[m.pair] =
+              '${m.eligibilityStatus.categoryLabel}: ${m.eligibilityReason}';
+        }
+      }
+
+      // Phase 1: Fetch candles, evaluate SL/TP & SELL exits for open positions, and collect BUY signals across all eligible pairs
       for (final symbol in activeSymbolsToEvaluate) {
         List<Candle> candles15m;
         List<Candle> candles1h;
@@ -302,35 +402,28 @@ class AuthoritativeTradingEngine {
           candles15m = await _fetchClosedCandlesWithRetry(symbol, '15m', nowMs);
           candles1h = await _fetchClosedCandlesWithRetry(symbol, '1h', nowMs);
         } catch (e) {
-          if (userWantsRunning) {
-            await _handleBoundedRecoveryOrPause(
-              snap: snap,
-              nowMs: nowMs,
-              pauseState: BotEngineState.pausedNetworkLoss,
-              reason: 'Candle fetch error for $symbol: $e',
-            );
-          }
-          return false;
+          anyNetworkError = true;
+          lastSymbolFetchError = 'Candle fetch error for $symbol: $e';
+          skippedPairsReasons[symbol] = 'SKIPPED: Candle fetch failed ($e)';
+          whyNoTrade[symbol] = 'Why no trade: Candle fetch failed';
+          continue;
         }
 
         if (marketService.isDataStale(
           closedCandles15m: candles15m,
           nowMs: nowMs,
         )) {
-          if (userWantsRunning) {
-            await _handleBoundedRecoveryOrPause(
-              snap: snap,
-              nowMs: nowMs,
-              pauseState: BotEngineState.pausedStaleData,
-              reason: 'Why no trade: Stale data for $symbol',
-            );
-          }
-          return false;
+          skippedPairsReasons[symbol] =
+              'SKIPPED: Stale or incomplete 15m candle history (${candles15m.length} bars)';
+          whyNoTrade[symbol] = 'Why no trade: Stale data for $symbol';
+          continue;
         }
 
-        closedPrices[symbol] = candles15m.last.close;
-        if (candles15m.last.closeTimeMs > latestCandleMs) {
-          latestCandleMs = candles15m.last.closeTimeMs;
+        pairsEvaluatedCount++;
+        final latestCandle = candles15m.last;
+        closedPrices[symbol] = latestCandle.close;
+        if (latestCandle.closeTimeMs > latestCandleMs) {
+          latestCandleMs = latestCandle.closeTimeMs;
         }
 
         final discoveredRecord = marketService.catalogueByPair[symbol];
@@ -341,25 +434,220 @@ class AuthoritativeTradingEngine {
                 baseCurrency: symbol.contains('BTC') ? 'BTC' : 'ETH',
                 quoteCurrency: 'USDT',
               );
-        final allowEntryForMarket = canTrade &&
-            (discoveredRecord == null || discoveredRecord.isEligibleForPaperTrading);
 
-        final outcome = broker.processClosedCandleStream(
+        // 1A. If we hold an open position on this symbol, process SL/TP & bearish EMA crossover exits immediately
+        final holdsPositionOnSymbol =
+            broker.openPositions.any((p) => p.symbol == symbol);
+        if (holdsPositionOnSymbol) {
+          final exitOutcome = broker.processClosedCandleStream(
+            symbol: symbol,
+            closedCandles15m: candles15m,
+            closedCandles1h: candles1h,
+            strategyEngine: strategyEngine,
+            pairMetadata: pairMeta,
+            currentMarkPrices: livePrices,
+            liveTicker: liveTickers[symbol],
+            allowNewEntries: false,
+          );
+          if (exitOutcome.whyNoTradeReason != null) {
+            whyNoTrade[symbol] = exitOutcome.whyNoTradeReason!;
+          }
+          if (exitOutcome.newOrders.isNotEmpty) {
+            newOrderSeqDelta += exitOutcome.newOrders.length;
+            paperOrdersSubmittedCount += exitOutcome.newOrders.length;
+            acceptedOrdersCount += exitOutcome.newOrders.length;
+          }
+          for (final closedTrd in exitOutcome.newClosedTrades) {
+            riskSupervisor.recordClosedTradeOutcome(closedTrd.realizedPnlUsdt);
+          }
+          await _emitAlertsForNewOrders(exitOutcome);
+
+          if (exitOutcome.triggeredSafetyState != null) {
+            final eq = broker.accountEquityUsdt(livePrices);
+            await persistence.logDiagnosticEvent(
+              'SAFETY_LOCK',
+              exitOutcome.safetyMessage ??
+                  exitOutcome.triggeredSafetyState!.name,
+              timestampMs: nowMs,
+            );
+            await persistence.saveFullState(
+              botState: exitOutcome.triggeredSafetyState!,
+              availableCashUsdt: broker.availableCashUsdt,
+              accountEquityUsdt: eq,
+              maxDrawdownLocked: broker.maxDrawdownLocked,
+              lockedDailyLossUtcDate: broker.lockedDailyLossUtcDate,
+              lastStopLossClosedAtMs: broker.lastStopLossClosedAtMs,
+              lastHeartbeatMs: nowMs,
+              lastMarketDataUpdateMs: nowMs,
+              lastCandleUpdateMs: latestCandleMs,
+              orderSeq: snap.orderSeq + newOrderSeqDelta,
+              statusBannerMessage:
+                  exitOutcome.safetyMessage ?? 'SAFETY LOCK TRIGGERED',
+              liveTickerPrices: livePrices,
+              liveTickers: liveTickers,
+              closedCandlePrices: closedPrices,
+              whyNoTradeForSymbol: whyNoTrade,
+              openPositions: broker.openPositions,
+              orders: broker.orders,
+              closedTrades: broker.closedTrades,
+              processedEntrySignalKeys: broker.processedEntrySignalKeys,
+            );
+            return false;
+          }
+        }
+
+        // 1B. Evaluate strategy on closed 15m and 1h candles
+        final eval = strategyEngine.evaluateClosedCandles(
           symbol: symbol,
           closedCandles15m: candles15m,
           closedCandles1h: candles1h,
+        );
+        whyNoTrade[symbol] = eval.reason;
+
+        if (eval.signal == StrategySignalType.sell) {
+          signalsGeneratedCount++;
+          sellSignalsCount++;
+        } else if (eval.signal == StrategySignalType.buy) {
+          signalsGeneratedCount++;
+          buySignalsCount++;
+
+          final allowEntryForMarket = canTrade &&
+              (discoveredRecord == null ||
+                  discoveredRecord.isEligibleForPaperTrading);
+          if (!allowEntryForMarket) {
+            rejectedSignalsCount++;
+            final rejReason = discoveredRecord != null &&
+                    !discoveredRecord.isEligibleForPaperTrading
+                ? 'Rejected: Market ${discoveredRecord.pair} is not eligible (${discoveredRecord.eligibilityReason})'
+                : 'Rejected: Trading execution not active in current mode';
+            signalRejectionReasons[symbol] = rejReason;
+            whyNoTrade[symbol] = rejReason;
+            continue;
+          }
+
+          final ticker = liveTickers[symbol] ??
+              discoveredRecord?.latestTicker ??
+              LiveMarketTicker(
+                symbol: symbol,
+                lastPrice: latestCandle.close,
+                bid: latestCandle.close,
+                ask: latestCandle.close,
+                high24h: latestCandle.high,
+                low24h: latestCandle.low,
+                volume24h: latestCandle.volume,
+                change24hPct: 0.0,
+                timestampMs: latestCandle.closeTimeMs,
+              );
+
+          final recordForOpportunity = discoveredRecord ??
+              CoinDcxMarketRecord(
+                coindcxName: symbol,
+                symbol: symbol,
+                pair: symbol,
+                ecode: 'B',
+                baseCurrencyShortName: 'USDT',
+                targetCurrencyShortName:
+                    symbol.contains('BTC') ? 'BTC' : 'ETH',
+                status: 'active',
+                baseCurrencyPrecision: 2,
+                targetCurrencyPrecision: 5,
+                minQuantity: 0.00001,
+                maxQuantity: 90000000.0,
+                maxQuantityMarket: 100000.0,
+                step: 0.00001,
+                minNotional: 5.0,
+                minPrice: 0.01,
+                maxPrice: 1000000.0,
+                orderTypes: const ['limit_order', 'market_order'],
+                latestTicker: ticker,
+                lastMetadataRefreshMs: nowMs,
+                eligibilityStatus:
+                    MarketEligibilityStatus.eligibleForPaperTrading,
+              );
+
+          final score = computeOpportunityRankingScore(
+            evaluation: eval,
+            ticker: ticker,
+          );
+
+          rankedBuyOpportunities.add(
+            RankedSignalOpportunity(
+              market: recordForOpportunity,
+              evaluation: eval,
+              closedCandles15m: candles15m,
+              closedCandles1h: candles1h,
+              ticker: ticker,
+              rankingScore: score,
+            ),
+          );
+        }
+      }
+
+      // If zero pairs could be evaluated, pause safely for network or stale data
+      if (pairsEvaluatedCount == 0 && activeSymbolsToEvaluate.isNotEmpty) {
+        if (userWantsRunning) {
+          final pauseTarget = anyNetworkError
+              ? BotEngineState.pausedNetworkLoss
+              : BotEngineState.pausedStaleData;
+          final pauseReason = anyNetworkError
+              ? (lastSymbolFetchError ?? 'All candle requests failed')
+              : 'Why no trade: Stale data across all evaluated pairs';
+          await _handleBoundedRecoveryOrPause(
+            snap: snap,
+            nowMs: nowMs,
+            pauseState: pauseTarget,
+            reason: pauseReason,
+          );
+        }
+        return false;
+      }
+
+      // Phase 2: Sort all valid BUY opportunities by descending rankingScore and execute within portfolio risk limits
+      rankedBuyOpportunities
+          .sort((a, b) => b.rankingScore.compareTo(a.rankingScore));
+
+      for (final opp in rankedBuyOpportunities) {
+        final symbol = opp.market.pair;
+        final pairMeta = opp.market.toMarketPairMetadata();
+
+        // Check portfolio max concurrent open positions (1) before submitting
+        if (broker.openPositions.length >=
+            broker.riskManager.config.maxConcurrentOpenPositions) {
+          rejectedSignalsCount++;
+          rejectedOrdersCount++;
+          const reason =
+              'Why no trade: Max concurrent open positions (1/1) reached after higher-ranked opportunity';
+          signalRejectionReasons[symbol] = reason;
+          whyNoTrade[symbol] = reason;
+          continue;
+        }
+
+        paperOrdersSubmittedCount++;
+        final outcome = broker.processClosedCandleStream(
+          symbol: symbol,
+          closedCandles15m: opp.closedCandles15m,
+          closedCandles1h: opp.closedCandles1h,
           strategyEngine: strategyEngine,
           pairMetadata: pairMeta,
           currentMarkPrices: livePrices,
-          liveTicker: liveTickers[symbol],
-          allowNewEntries: allowEntryForMarket,
+          liveTicker: opp.ticker,
+          allowNewEntries: true,
         );
 
         if (outcome.whyNoTradeReason != null) {
           whyNoTrade[symbol] = outcome.whyNoTradeReason!;
         }
 
-        await _emitAlertsForNewOrders(outcome);
+        if (outcome.newOrders.isNotEmpty) {
+          acceptedOrdersCount += outcome.newOrders.length;
+          newOrderSeqDelta += outcome.newOrders.length;
+          await _emitAlertsForNewOrders(outcome);
+        } else {
+          rejectedSignalsCount++;
+          rejectedOrdersCount++;
+          signalRejectionReasons[symbol] =
+              outcome.whyNoTradeReason ?? 'Rejected by RiskManager / PaperBroker';
+        }
 
         if (outcome.triggeredSafetyState != null) {
           final eq = broker.accountEquityUsdt(livePrices);
@@ -368,7 +656,6 @@ class AuthoritativeTradingEngine {
             outcome.safetyMessage ?? outcome.triggeredSafetyState!.name,
             timestampMs: nowMs,
           );
-          // Stage 3: Never mutate userIntention on safety lock!
           await persistence.saveFullState(
             botState: outcome.triggeredSafetyState!,
             availableCashUsdt: broker.availableCashUsdt,
@@ -379,7 +666,7 @@ class AuthoritativeTradingEngine {
             lastHeartbeatMs: nowMs,
             lastMarketDataUpdateMs: nowMs,
             lastCandleUpdateMs: latestCandleMs,
-            orderSeq: snap.orderSeq + outcome.newOrders.length,
+            orderSeq: snap.orderSeq + newOrderSeqDelta,
             statusBannerMessage:
                 outcome.safetyMessage ?? 'SAFETY LOCK TRIGGERED',
             liveTickerPrices: livePrices,
@@ -395,13 +682,72 @@ class AuthoritativeTradingEngine {
         }
       }
 
+      // Check drawdown / daily loss even when no BUY signals occurred
+      if (broker.enforceMaxDrawdownCheck(livePrices)) {
+        final eq = broker.accountEquityUsdt(livePrices);
+        await persistence.saveFullState(
+          botState: BotEngineState.stoppedMaxDrawdownReached,
+          availableCashUsdt: broker.availableCashUsdt,
+          accountEquityUsdt: eq,
+          maxDrawdownLocked: true,
+          lockedDailyLossUtcDate: broker.lockedDailyLossUtcDate,
+          lastStopLossClosedAtMs: broker.lastStopLossClosedAtMs,
+          lastHeartbeatMs: nowMs,
+          lastMarketDataUpdateMs: nowMs,
+          lastCandleUpdateMs: latestCandleMs,
+          orderSeq: snap.orderSeq + newOrderSeqDelta,
+          statusBannerMessage:
+              'Account equity reached or fell below \$90.00 floor. Engine stopped; manual review & reset required.',
+          liveTickerPrices: livePrices,
+          liveTickers: liveTickers,
+          closedCandlePrices: closedPrices,
+          whyNoTradeForSymbol: whyNoTrade,
+          openPositions: broker.openPositions,
+          orders: broker.orders,
+          closedTrades: broker.closedTrades,
+          processedEntrySignalKeys: broker.processedEntrySignalKeys,
+        );
+        return false;
+      }
+
+      // Cycle succeeded with fresh validated data -> clear recovery tracking & lastError!
       await _resetRecoveryTracking();
       final eq = broker.accountEquityUsdt(livePrices);
       final targetState =
           userWantsRunning ? BotEngineState.running : snap.botState;
       final banner = userWantsRunning
-          ? 'PAPER BOT RUNNING — Heartbeat ${_formatHhMmSs(nowMs)}'
+          ? 'PAPER BOT RUNNING — Scanned $pairsEvaluatedCount pair(s) • Heartbeat ${_formatHhMmSs(nowMs)}'
           : snap.statusBannerMessage;
+
+      final scanDiag = ScanCycleDiagnosticsSnapshot(
+        lastCycleTimestampMs: nowMs,
+        lastSuccessfulScanMs: nowMs,
+        totalPairsDiscovered: catSnap.totalDiscoveredCount > 0
+            ? catSnap.totalDiscoveredCount
+            : activeSymbolsToEvaluate.length,
+        activePairsCount: catSnap.activeMarketsCount > 0
+            ? catSnap.activeMarketsCount
+            : activeSymbolsToEvaluate.length,
+        eligiblePairsCount: catSnap.eligibleMarketsCount > 0
+            ? catSnap.eligibleMarketsCount
+            : activeSymbolsToEvaluate.length,
+        rejectedPairsCount: catSnap.rejectedMarketsCount,
+        lastCatalogueRefreshMs: catSnap.lastSuccessfulRefreshMs ?? nowMs,
+        totalPairsEvaluated: pairsEvaluatedCount,
+        pairsSkippedCount: skippedPairsReasons.length,
+        skippedPairsReasons: skippedPairsReasons,
+        signalsGeneratedCount: signalsGeneratedCount,
+        buySignalsCount: buySignalsCount,
+        sellSignalsCount: sellSignalsCount,
+        rejectedSignalsCount: rejectedSignalsCount,
+        signalRejectionReasons: signalRejectionReasons,
+        paperOrdersSubmittedCount: paperOrdersSubmittedCount,
+        acceptedOrdersCount: acceptedOrdersCount,
+        rejectedOrdersCount: rejectedOrdersCount,
+        coindcxRestStatus: restStatus,
+        webSocketStatus: 'REST_AUTHORITATIVE_4S_POLL',
+        recoveryStateLabel: 'NORMAL (0 RETRIES)',
+      );
 
       await persistence.saveFullState(
         botState: targetState,
@@ -416,7 +762,7 @@ class AuthoritativeTradingEngine {
         runningSinceMs:
             snap.runningSinceMs ?? (userWantsRunning ? nowMs : null),
         totalActiveMs: snap.totalActiveMs,
-        orderSeq: snap.orderSeq + 1,
+        orderSeq: snap.orderSeq + newOrderSeqDelta + 1,
         statusBannerMessage: banner,
         liveTickerPrices: livePrices,
         liveTickers: liveTickers,
@@ -426,6 +772,7 @@ class AuthoritativeTradingEngine {
         orders: broker.orders,
         closedTrades: broker.closedTrades,
         processedEntrySignalKeys: broker.processedEntrySignalKeys,
+        scanDiagnostics: scanDiag,
       );
 
       if (userWantsRunning) {
@@ -459,7 +806,7 @@ class AuthoritativeTradingEngine {
         );
       } catch (e) {
         lastErr = e;
-        await Future<void>.delayed(const Duration(milliseconds: 500));
+        await Future<void>.delayed(const Duration(milliseconds: 200));
       }
     }
     throw lastErr ?? Exception('Failed to fetch candles for $pair');
@@ -487,6 +834,31 @@ class AuthoritativeTradingEngine {
       logMessage: logLine,
     );
 
+    final updatedDiag = ScanCycleDiagnosticsSnapshot(
+      lastCycleTimestampMs: nowMs,
+      lastSuccessfulScanMs: snap.scanDiagnostics.lastSuccessfulScanMs,
+      totalPairsDiscovered: snap.scanDiagnostics.totalPairsDiscovered,
+      activePairsCount: snap.scanDiagnostics.activePairsCount,
+      eligiblePairsCount: snap.scanDiagnostics.eligiblePairsCount,
+      rejectedPairsCount: snap.scanDiagnostics.rejectedPairsCount,
+      lastCatalogueRefreshMs: snap.scanDiagnostics.lastCatalogueRefreshMs,
+      totalPairsEvaluated: 0,
+      pairsSkippedCount: snap.scanDiagnostics.pairsSkippedCount,
+      skippedPairsReasons: snap.scanDiagnostics.skippedPairsReasons,
+      signalsGeneratedCount: 0,
+      buySignalsCount: 0,
+      sellSignalsCount: 0,
+      rejectedSignalsCount: 0,
+      signalRejectionReasons: snap.scanDiagnostics.signalRejectionReasons,
+      paperOrdersSubmittedCount: 0,
+      acceptedOrdersCount: 0,
+      rejectedOrdersCount: 0,
+      coindcxRestStatus: 'DEGRADED: $reason',
+      webSocketStatus: 'DISCONNECTED_OR_WAITING',
+      recoveryStateLabel:
+          '${pauseState.dashboardLabel} (RETRY #$attempt • AutoResume=${snap.autoResumeEnabled ? "ON" : "OFF"})',
+    );
+
     // Stage 3: Never mutate userIntention on transient errors/network loss/stale data!
     await persistence.saveFullState(
       botState: pauseState,
@@ -496,8 +868,7 @@ class AuthoritativeTradingEngine {
       lockedDailyLossUtcDate: broker.lockedDailyLossUtcDate,
       lastStopLossClosedAtMs: broker.lastStopLossClosedAtMs,
       lastHeartbeatMs: nowMs,
-      statusBannerMessage:
-          'PAUSED (${pauseState.name}): $reason',
+      statusBannerMessage: 'PAUSED (${pauseState.dashboardLabel}): $reason',
       liveTickerPrices: snap.liveTickerPrices,
       liveTickers: snap.liveTickers,
       closedCandlePrices: snap.closedCandlePrices,
@@ -506,6 +877,7 @@ class AuthoritativeTradingEngine {
       orders: broker.orders,
       closedTrades: broker.closedTrades,
       processedEntrySignalKeys: broker.processedEntrySignalKeys,
+      scanDiagnostics: updatedDiag,
     );
 
     if (snap.autoResumeEnabled) {
@@ -525,7 +897,7 @@ class AuthoritativeTradingEngine {
     await persistence.clearRecoveryState();
   }
 
-  /// Stage 9: Network transition handler respecting autoResumeEnabled (default OFF).
+  /// Stage 9 & Part 2: Network transition handler respecting autoResumeEnabled (default OFF).
   /// When ON, resumes ONLY after fresh validated data and ONLY from network/stale-data pauses.
   /// NEVER resumes from user PAUSE/STOP, daily-loss lock, or drawdown lock.
   Future<void> handleNetworkTransition(bool connected) async {
@@ -534,6 +906,19 @@ class AuthoritativeTradingEngine {
     if (!connected) {
       if (snap.userIntention == UserSessionIntention.running &&
           snap.botState == BotEngineState.running) {
+        if (verifyReachabilityBeforeNetworkPause) {
+          try {
+            final probe = await marketService.fetchLiveTickers(nowMs: nowMs);
+            if (probe.isNotEmpty) {
+              await persistence.logDiagnosticEvent(
+                'NETWORK_FLICKER_IGNORED',
+                'OS NetworkCallback reported loss, but CoinDCX REST probe succeeded',
+                timestampMs: nowMs,
+              );
+              return;
+            }
+          } catch (_) {}
+        }
         await _handleBoundedRecoveryOrPause(
           snap: snap,
           nowMs: nowMs,
@@ -552,9 +937,16 @@ class AuthoritativeTradingEngine {
     );
 
     if (snap.userIntention == UserSessionIntention.running &&
-        (snap.botState == BotEngineState.pausedNetworkLoss ||
-            snap.botState == BotEngineState.pausedStaleData)) {
+        snap.botState.isNetworkOrStalePause) {
       if (snap.autoResumeEnabled) {
+        await persistence.putKv(
+          'botState',
+          BotEngineState.reconnecting.name,
+        );
+        await persistence.putKv(
+          'statusBannerMessage',
+          'RECONNECTING — Validating fresh market data...',
+        );
         await executeAuthoritativeCycle(
           allowTradingExecution: true,
           transitionToRunningOnSuccess: true,
@@ -562,7 +954,7 @@ class AuthoritativeTradingEngine {
       } else {
         await persistence.putKv(
           'statusBannerMessage',
-          'Internet restored. Auto-resume is OFF — tap RESUME or enable Auto-Resume in Settings.',
+          'PAUSED_BY_NETWORK: Internet restored, but Auto-Resume is OFF — tap RESUME to continue.',
         );
       }
     }

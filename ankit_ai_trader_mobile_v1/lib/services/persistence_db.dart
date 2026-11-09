@@ -37,6 +37,7 @@ class PersistedEngineSnapshot {
   final int? recoveryStartedAtMs;
   final int? nextRecoveryAllowedAtMs;
   final List<String> recoveryLogs;
+  final ScanCycleDiagnosticsSnapshot scanDiagnostics;
 
   const PersistedEngineSnapshot({
     required this.botState,
@@ -72,6 +73,7 @@ class PersistedEngineSnapshot {
     this.recoveryStartedAtMs,
     this.nextRecoveryAllowedAtMs,
     this.recoveryLogs = const [],
+    this.scanDiagnostics = const ScanCycleDiagnosticsSnapshot(),
   });
 }
 
@@ -519,6 +521,29 @@ class PersistenceDatabase {
     await putKv('recoveryAttemptCount', jsonEncode(0));
     await putKv('recoveryStartedAtMs', jsonEncode(null));
     await putKv('nextRecoveryAllowedAtMs', jsonEncode(null));
+    await putKv('lastError', jsonEncode(null));
+  }
+
+  Future<void> saveScanCycleDiagnostics(
+    ScanCycleDiagnosticsSnapshot diagnostics,
+  ) async {
+    await putKv('scanCycleDiagnostics', jsonEncode(diagnostics.toMap()));
+  }
+
+  Future<ScanCycleDiagnosticsSnapshot> loadScanCycleDiagnostics() async {
+    final raw = await getKv('scanCycleDiagnostics');
+    if (raw == null || raw.isEmpty) {
+      return const ScanCycleDiagnosticsSnapshot();
+    }
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map) {
+        return ScanCycleDiagnosticsSnapshot.fromMap(
+          Map<String, dynamic>.from(decoded),
+        );
+      }
+    } catch (_) {}
+    return const ScanCycleDiagnosticsSnapshot();
   }
 
   Future<bool> getTradeAlertsEnabled() async {
@@ -576,6 +601,7 @@ class PersistenceDatabase {
     required List<SimulatedOrder> orders,
     required List<ClosedPaperTrade> closedTrades,
     required Set<String> processedEntrySignalKeys,
+    ScanCycleDiagnosticsSnapshot? scanDiagnostics,
   }) async {
     await putKv('botState', botState.name);
     if (userIntention != null) {
@@ -608,6 +634,9 @@ class PersistenceDatabase {
     );
     await putKv('closedCandlePrices', jsonEncode(closedCandlePrices));
     await putKv('whyNoTradeForSymbol', jsonEncode(whyNoTradeForSymbol));
+    if (scanDiagnostics != null) {
+      await putKv('scanCycleDiagnostics', jsonEncode(scanDiagnostics.toMap()));
+    }
 
     final nowMs = lastHeartbeatMs ?? DateTime.now().millisecondsSinceEpoch;
     _inMemoryEquityCurve.add(
@@ -872,6 +901,7 @@ class PersistenceDatabase {
       recoveryStartedAtMs: parseIntOrNull('recoveryStartedAtMs'),
       nextRecoveryAllowedAtMs: parseIntOrNull('nextRecoveryAllowedAtMs'),
       recoveryLogs: parseStringList('recoveryLogs'),
+      scanDiagnostics: await loadScanCycleDiagnostics(),
     );
   }
 

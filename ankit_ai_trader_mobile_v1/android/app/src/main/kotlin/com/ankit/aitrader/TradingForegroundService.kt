@@ -401,26 +401,31 @@ class TradingForegroundService : Service() {
             val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
             connectivityManager = cm
             unregisterServiceNetworkCallback()
+            var lastDispatchedState: Boolean? = null
+            fun dispatchIfChanged(connected: Boolean) {
+                if (lastDispatchedState != connected) {
+                    lastDispatchedState = connected
+                    notifyNetworkTransition(connected)
+                    MainActivity.forwardNetworkEventToUi(connected)
+                }
+            }
             val callback = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
-                    notifyNetworkTransition(true)
-                    MainActivity.forwardNetworkEventToUi(true)
+                    dispatchIfChanged(true)
                 }
 
                 override fun onLost(network: Network) {
                     val stillConnected = isInternetAvailable(cm)
-                    notifyNetworkTransition(stillConnected)
-                    MainActivity.forwardNetworkEventToUi(stillConnected)
+                    dispatchIfChanged(stillConnected)
                 }
 
                 override fun onCapabilitiesChanged(
                     network: Network,
                     networkCapabilities: NetworkCapabilities
                 ) {
-                    val validated = networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
-                        networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-                    notifyNetworkTransition(validated)
-                    MainActivity.forwardNetworkEventToUi(validated)
+                    val hasInternet = networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    val activeConnected = isInternetAvailable(cm) || hasInternet
+                    dispatchIfChanged(activeConnected)
                 }
             }
             serviceNetworkCallback = callback

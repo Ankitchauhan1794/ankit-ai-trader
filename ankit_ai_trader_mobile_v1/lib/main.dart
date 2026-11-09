@@ -14,13 +14,14 @@ import 'services/trading_coordinator.dart';
 Future<void> backgroundServiceMain() async {
   WidgetsFlutterBinding.ensureInitialized();
   const channel = MethodChannel('com.ankit.aitrader/background_worker');
-  final marketService = CoinDcxMarketService();
   final persistence = PersistenceDatabase();
+  final marketService = CoinDcxMarketService(persistence: persistence);
 
   late final AuthoritativeTradingEngine engine;
   engine = AuthoritativeTradingEngine(
     marketService: marketService,
     persistence: persistence,
+    verifyReachabilityBeforeNetworkPause: true,
     onNotificationUpdate: (title, text) async {
       try {
         await channel.invokeMethod('updateServiceNotification', {
@@ -502,7 +503,7 @@ class _DashboardPageState extends State<DashboardPage>
                 ),
                 _diagRow(
                   'Runtime State',
-                  _coordinator.engineState.name,
+                  '${_coordinator.engineState.dashboardLabel} (${_coordinator.engineState.name})',
                   _coordinator.engineState == BotEngineState.running
                       ? _greenProfit
                       : _orangeWarn,
@@ -521,6 +522,8 @@ class _DashboardPageState extends State<DashboardPage>
             ),
           ),
         ),
+        const SizedBox(height: 14),
+        _buildMultiPairPipelineDiagnosticsCard(),
         const SizedBox(height: 14),
         Card(
           child: Padding(
@@ -912,6 +915,103 @@ class _DashboardPageState extends State<DashboardPage>
     );
   }
 
+  Widget _buildMultiPairPipelineDiagnosticsCard() {
+    final sd = _coordinator.scanDiagnostics;
+    final cat = _coordinator.marketCatalogue;
+    final discCount = cat.totalDiscoveredCount > 0
+        ? cat.totalDiscoveredCount
+        : sd.totalPairsDiscovered;
+    final actCount = cat.activeMarketsCount > 0
+        ? cat.activeMarketsCount
+        : sd.activePairsCount;
+    final eligCount = cat.eligibleMarketsCount > 0
+        ? cat.eligibleMarketsCount
+        : sd.eligiblePairsCount;
+    final rejCount = cat.rejectedMarketsCount > 0
+        ? cat.rejectedMarketsCount
+        : sd.rejectedPairsCount;
+    final catRefMs = cat.lastSuccessfulRefreshMs ?? sd.lastCatalogueRefreshMs;
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'PART 7 — MULTI-PAIR PIPELINE, SIGNAL & RECOVERY DIAGNOSTICS',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+            ),
+            const SizedBox(height: 8),
+            _diagRow(
+              'Market Discovery (Total / Active / Eligible / Rejected)',
+              '$discCount / $actCount / $eligCount / $rejCount',
+              eligCount > 0 ? _greenProfit : _orangeWarn,
+            ),
+            _diagRow(
+              'Last Catalogue Refresh',
+              catRefMs != null
+                  ? TradingCoordinator.formatUtcHhMmSs(catRefMs)
+                  : 'Never',
+              Colors.white70,
+            ),
+            _diagRow(
+              'Last Cycle / Last Successful Scan',
+              '${sd.lastCycleTimestampMs != null ? TradingCoordinator.formatUtcHhMmSs(sd.lastCycleTimestampMs!) : "--"} / ${sd.lastSuccessfulScanMs != null ? TradingCoordinator.formatUtcHhMmSs(sd.lastSuccessfulScanMs!) : "--"}',
+              Colors.white70,
+            ),
+            _diagRow(
+              'Pairs Evaluated / Pairs Skipped',
+              '${sd.totalPairsEvaluated} evaluated / ${sd.pairsSkippedCount} skipped',
+              sd.totalPairsEvaluated > 0 ? _greenProfit : _orangeWarn,
+            ),
+            _diagRow(
+              'Signals (Total / BUY / SELL / Rejected)',
+              '${sd.signalsGeneratedCount} total (${sd.buySignalsCount} BUY, ${sd.sellSignalsCount} SELL, ${sd.rejectedSignalsCount} rejected)',
+              Colors.white70,
+            ),
+            _diagRow(
+              'Paper Orders (Submitted / Accepted / Rejected)',
+              '${sd.paperOrdersSubmittedCount} / ${sd.acceptedOrdersCount} / ${sd.rejectedOrdersCount}',
+              Colors.white70,
+            ),
+            _diagRow(
+              'Positions (Open / Closed Trades)',
+              '${_coordinator.openPositions.length} open / ${_coordinator.closedTrades.length} closed',
+              Colors.white70,
+            ),
+            _diagRow(
+              'Connectivity (Internet / CoinDCX REST / Stream)',
+              '${_coordinator.internetConnected ? "ONLINE" : "OFFLINE"} | ${sd.coindcxRestStatus} | ${sd.webSocketStatus}',
+              _coordinator.internetConnected ? _greenProfit : _redLoss,
+            ),
+            _diagRow(
+              'Recovery State & Retry Count',
+              '${_coordinator.engineState.dashboardLabel} (Retries: ${_coordinator.recoveryAttemptCount})',
+              _coordinator.recoveryAttemptCount == 0
+                  ? _greenProfit
+                  : _orangeWarn,
+            ),
+            if (sd.signalRejectionReasons.isNotEmpty) ...[
+              const SizedBox(height: 6),
+              Text(
+                'Signal Rejections: ${sd.signalRejectionReasons.entries.take(5).map((e) => "${e.key}: ${e.value}").join(" | ")}',
+                style: const TextStyle(fontSize: 11, color: Colors.white60),
+              ),
+            ],
+            if (sd.skippedPairsReasons.isNotEmpty) ...[
+              const SizedBox(height: 4),
+              Text(
+                'Skipped Pairs (Top 5): ${sd.skippedPairsReasons.entries.take(5).map((e) => "${e.key}: ${e.value}").join(" | ")}',
+                style: const TextStyle(fontSize: 11, color: Colors.white54),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _diagRow(String label, String value, Color valueColor) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 3),
@@ -1039,29 +1139,25 @@ class _DashboardPageState extends State<DashboardPage>
 
   Widget _statusChip(BotEngineState state) {
     Color bg;
-    String label;
+    final String label = state.dashboardLabel;
     switch (state) {
       case BotEngineState.running:
         bg = _greenProfit.withOpacity(0.2);
-        label = 'RUNNING';
         break;
       case BotEngineState.pausedNetworkLoss:
+      case BotEngineState.reconnecting:
+      case BotEngineState.waitingForFreshData:
       case BotEngineState.pausedStaleData:
-        bg = _orangeWarn.withOpacity(0.2);
-        label = 'RECOVERING';
-        break;
       case BotEngineState.pausedAfterRecoveryManualStartRequired:
         bg = _orangeWarn.withOpacity(0.2);
-        label = 'PAUSED';
         break;
+      case BotEngineState.recoveryFailed:
       case BotEngineState.lockedDailyLossLimit:
       case BotEngineState.stoppedMaxDrawdownReached:
         bg = _redLoss.withOpacity(0.25);
-        label = 'SAFETY LOCK';
         break;
       case BotEngineState.stopped:
         bg = Colors.blueGrey.withOpacity(0.3);
-        label = 'STOPPED';
         break;
     }
     return Container(
@@ -1154,7 +1250,8 @@ class _DashboardPageState extends State<DashboardPage>
       );
     }
 
-    if (intention == UserSessionIntention.paused) {
+    if (intention == UserSessionIntention.paused ||
+        _coordinator.engineState.isNetworkOrStalePause) {
       return Row(
         children: [
           Expanded(

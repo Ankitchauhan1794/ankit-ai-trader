@@ -146,6 +146,9 @@ class TradingCoordinator extends ChangeNotifier {
   List<EquityPoint> equityCurve = [];
   List<DiagnosticEvent> recentEvents = [];
   List<String> recoveryLogs = [];
+  int recoveryAttemptCount = 0;
+  ScanCycleDiagnosticsSnapshot scanDiagnostics =
+      const ScanCycleDiagnosticsSnapshot();
   BacktestReport? latestBacktestReport;
   RobustnessValidationReport? latestRobustnessReport;
   MarketRegimeAssessment? latestRegimeAssessment;
@@ -537,8 +540,10 @@ class TradingCoordinator extends ChangeNotifier {
           restoreFailedRequiresRestart = false;
           restoreFailureReason = null;
           _applySnapshotToFields(snap);
-          engineState = BotEngineState.running;
-          if (isInitialLoad) {
+          // Part 2 Fix: Preserve actual snap.botState (e.g., pausedNetworkLoss, waitingForFreshData, reconnecting)
+          // instead of blindly forcing BotEngineState.running when only the heartbeat is alive!
+          engineState = snap.botState;
+          if (isInitialLoad && snap.botState == BotEngineState.running) {
             statusBannerMessage =
                 'RECONNECTED — heartbeat ${formatUtcHhMmSs(hbMs)}';
           }
@@ -546,6 +551,7 @@ class TradingCoordinator extends ChangeNotifier {
           return;
         } else if (isInitialLoad) {
           _applySnapshotToFields(snap);
+          engineState = BotEngineState.reconnecting;
           statusBannerMessage = 'Restoring running session...';
           notifyListeners();
 
@@ -565,12 +571,17 @@ class TradingCoordinator extends ChangeNotifier {
             );
             final refreshed = await persistence.loadFullState();
             _applySnapshotToFields(refreshed);
-            engineState = BotEngineState.running;
+            engineState = refreshed.botState == BotEngineState.stopped
+                ? BotEngineState.running
+                : refreshed.botState;
             final displayHb = refreshed.lastHeartbeatMs ?? nowMs;
-            statusBannerMessage =
-                'RECONNECTED — heartbeat ${formatUtcHhMmSs(displayHb)}';
+            if (engineState == BotEngineState.running) {
+              statusBannerMessage =
+                  'RECONNECTED — heartbeat ${formatUtcHhMmSs(displayHb)}';
+            }
           } else {
             restoreFailedRequiresRestart = true;
+            engineState = BotEngineState.recoveryFailed;
             restoreFailureReason = lastError ??
                 'Background service did not respond to single-shot restore';
             statusBannerMessage =
@@ -607,7 +618,9 @@ class TradingCoordinator extends ChangeNotifier {
     serviceRestartCount = snap.serviceRestartCount;
     orderSeq = snap.orderSeq;
     autoResumeEnabled = snap.autoResumeEnabled;
-    lastError = snap.lastError ?? lastError;
+    lastError = snap.lastError;
+    recoveryAttemptCount = snap.recoveryAttemptCount;
+    scanDiagnostics = snap.scanDiagnostics;
     statusBannerMessage = snap.statusBannerMessage;
     tradeAlertsEnabled = snap.tradeAlertsEnabled;
     if (snap.liveTickers.isNotEmpty && liveTickers.isEmpty) {
