@@ -396,8 +396,11 @@ class CoinDcxMarketService {
     // Check minimum order requirements against paper account & market rules
     final minQtyNotional = record.minQuantity * ticker.ask;
     final requiredMinNotional = math.max(record.minNotional, minQtyNotional);
-    final minFeasibleQty =
-        record.roundQuantityToPrecision(requiredMinNotional / ticker.ask);
+    final stepsForMinNotional =
+        ((requiredMinNotional / ticker.ask) / record.step - 1e-9).ceilToDouble();
+    final minFeasibleQty = record.roundQuantityToPrecision(
+      stepsForMinNotional * record.step,
+    );
     final candidateQty = math.max(record.minQuantity, minFeasibleQty);
     final orderValidation = record.validateOrder(
       quantity: candidateQty,
@@ -652,15 +655,16 @@ class CoinDcxMarketService {
     }
 
     Object? lastError;
+    bool hitRateLimit429 = false;
     for (int attempt = 0; attempt <= maxApiRetries; attempt++) {
       try {
         final response = await _httpClient.get(uri).timeout(timeout);
         if (response.statusCode == 200) {
+          _rateLimitBackoffUntilMs = 0;
           return response;
         }
         if (response.statusCode == 429) {
-          final backoffMs = initialRetryBackoffMs * (1 << (attempt + 2));
-          _rateLimitBackoffUntilMs = nowMs + backoffMs;
+          hitRateLimit429 = true;
           lastError = HttpException('CoinDCX HTTP 429 rate limited', uri: uri);
         } else if (response.statusCode >= 500) {
           lastError = HttpException(
@@ -683,6 +687,10 @@ class CoinDcxMarketService {
         final delayMs = initialRetryBackoffMs * (1 << attempt);
         await Future<void>.delayed(Duration(milliseconds: delayMs));
       }
+    }
+    if (hitRateLimit429) {
+      final backoffMs = initialRetryBackoffMs * (1 << (maxApiRetries + 2));
+      _rateLimitBackoffUntilMs = nowMs + backoffMs;
     }
     throw lastError ?? HttpException('Request failed for $uri', uri: uri);
   }
