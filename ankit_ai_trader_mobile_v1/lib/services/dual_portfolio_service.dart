@@ -453,7 +453,7 @@ class HighVolatilityMarketClassifier {
       );
     }
 
-    final atr14 = IndicatorEngine.calculateAtr(closedCandles, 14);
+    final atr14 = const IndicatorEngine().calculateAtr(closedCandles, period: 14);
     final realizedVol = computeRealizedVolatilityPct(closedCandles);
     final lastClose = closedCandles.last.close;
     if (atr14 == null || realizedVol == null || lastClose <= 0) {
