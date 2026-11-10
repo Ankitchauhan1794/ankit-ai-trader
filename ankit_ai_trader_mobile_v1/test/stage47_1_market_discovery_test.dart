@@ -2107,5 +2107,54 @@ void main() {
 
     coordinator.dispose();
     await db.close();
+
+    test('UI Redesign Test 23: TradingCoordinator UI helpers (favourites, equity timeframes, margin, risk budgets, trade filters, duration & pair P&L)', () {
+      final coordinator = TradingCoordinator(autoInit: false);
+
+      // 1. Favourites & Market Filtering
+      expect(coordinator.favouriteMarketPairs.contains('BTCUSDT'), isTrue);
+      expect(coordinator.favouriteMarketPairs.contains('ETHUSDT'), isTrue);
+      expect(coordinator.showOnlyFavouriteMarkets, isFalse);
+
+      coordinator.toggleFavouriteMarket('SOLUSDT');
+      expect(coordinator.favouriteMarketPairs.contains('SOLUSDT'), isTrue);
+      coordinator.toggleFavouriteMarket('SOLUSDT');
+      expect(coordinator.favouriteMarketPairs.contains('SOLUSDT'), isFalse);
+
+      coordinator.setShowOnlyFavouriteMarkets(true);
+      expect(coordinator.showOnlyFavouriteMarkets, isTrue);
+      coordinator.setShowOnlyFavouriteMarkets(false);
+
+      // 2. Equity Curve Timeframes (1D, 7D, 30D, ALL)
+      for (final tf in ['1D', '7D', '30D', 'ALL']) {
+        coordinator.setEquityTimeframe(tf);
+        expect(coordinator.selectedEquityTimeframe, equals(tf));
+        expect(coordinator.filteredEquityCurve, isNotEmpty);
+      }
+
+      // 3. Margin & Risk Budgets on $100 Paper Account
+      expect(coordinator.account.initialCapitalUsdt, closeTo(100.0, 0.001));
+      expect(coordinator.usedMarginUsdt, greaterThanOrEqualTo(0.0));
+      expect(coordinator.freeMarginUsdt, closeTo(coordinator.account.availableBalanceUsdt, 0.001));
+      expect(coordinator.remainingDailyRiskBudgetUsdt, closeTo(2.0, 0.001));
+      expect(coordinator.remainingDrawdownBudgetUsdt, closeTo(10.0, 0.001));
+
+      // 4. Closed Trades Filtering & Analytics
+      coordinator.setClosedTradesOutcomeFilter('PROFIT');
+      expect(coordinator.closedTradesOutcomeFilter, equals('PROFIT'));
+      coordinator.setClosedTradesOutcomeFilter('LOSS');
+      expect(coordinator.closedTradesOutcomeFilter, equals('LOSS'));
+      coordinator.setClosedTradesOutcomeFilter('ALL');
+      coordinator.setClosedTradesPairFilter('BTCUSDT');
+      expect(coordinator.closedTradesPairFilter, equals('BTCUSDT'));
+      coordinator.setClosedTradesPairFilter('ALL');
+
+      final durStats = coordinator.tradeDurationStats;
+      expect(durStats.containsKey('avgMin'), isTrue);
+      expect(durStats.containsKey('shortestMin'), isTrue);
+      expect(durStats.containsKey('longestMin'), isTrue);
+
+      coordinator.dispose();
+    });
   });
 }

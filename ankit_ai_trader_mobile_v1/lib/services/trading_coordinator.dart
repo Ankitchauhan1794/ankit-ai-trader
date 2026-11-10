@@ -158,6 +158,11 @@ class TradingCoordinator extends ChangeNotifier {
       const MarketCatalogueSnapshot(allMarkets: []);
   String marketSearchQuery = '';
   String selectedQuoteCurrencyFilter = 'ALL';
+  bool showOnlyFavouriteMarkets = false;
+  Set<String> favouriteMarketPairs = {};
+  String selectedEquityTimeframe = 'ALL';
+  String closedTradesOutcomeFilter = 'ALL';
+  String closedTradesPairFilter = 'ALL';
   bool isRefreshingCatalogue = false;
   int catalogueRefreshIntervalSeconds = 300;
   bool isRunningBacktest = false;
@@ -336,11 +341,154 @@ class TradingCoordinator extends ChangeNotifier {
     return 'Heartbeat: ${formatUtcHhMmSs(target)} (${ageSec}s ago • $status)';
   }
 
-  List<CoinDcxMarketRecord> get filteredDiscoveredMarkets =>
-      marketCatalogue.filterMarkets(
-        searchQuery: marketSearchQuery,
-        quoteCurrencyFilter: selectedQuoteCurrencyFilter,
+  List<CoinDcxMarketRecord> get filteredDiscoveredMarkets {
+    final baseList = marketCatalogue.filterMarkets(
+      searchQuery: marketSearchQuery,
+      quoteCurrencyFilter: selectedQuoteCurrencyFilter,
+    );
+    if (!showOnlyFavouriteMarkets) return baseList;
+    return baseList
+        .where((m) =>
+            favouriteMarketPairs.contains(m.pair) ||
+            favouriteMarketPairs.contains(m.symbol))
+        .toList();
+  }
+
+  void toggleFavouriteMarket(String pairKey) {
+    if (favouriteMarketPairs.contains(pairKey)) {
+      favouriteMarketPairs.remove(pairKey);
+    } else {
+      favouriteMarketPairs.add(pairKey);
+    }
+    persistence.putKv(
+      'favouriteMarketPairs',
+      favouriteMarketPairs.toList().join(','),
+    );
+    notifyListeners();
+  }
+
+  void setShowOnlyFavouriteMarkets(bool value) {
+    showOnlyFavouriteMarkets = value;
+    notifyListeners();
+  }
+
+  void setSelectedEquityTimeframe(String tf) {
+    selectedEquityTimeframe = tf;
+    notifyListeners();
+  }
+
+  void setClosedTradesOutcomeFilter(String filter) {
+    closedTradesOutcomeFilter = filter;
+    notifyListeners();
+  }
+
+  void setClosedTradesPairFilter(String pair) {
+    closedTradesPairFilter = pair;
+    notifyListeners();
+  }
+
+  List<EquityPoint> get filteredEquityCurve {
+    if (equityCurve.isEmpty) return const [];
+    final now = _nowMs();
+    int? cutoffMs;
+    switch (selectedEquityTimeframe) {
+      case '1D':
+        cutoffMs = now - (24 * 60 * 60 * 1000);
+        break;
+      case '7D':
+        cutoffMs = now - (7 * 24 * 60 * 60 * 1000);
+        break;
+      case '30D':
+        cutoffMs = now - (30 * 24 * 60 * 60 * 1000);
+        break;
+      default:
+        cutoffMs = null;
+    }
+    if (cutoffMs == null) return equityCurve;
+    final filtered =
+        equityCurve.where((p) => p.timestampMs >= cutoffMs!).toList();
+    return filtered.isNotEmpty ? filtered : equityCurve;
+  }
+
+  double get usedMarginUsdt => openPositions.fold<double>(
+        0.0,
+        (acc, p) => acc + p.investedNotionalUsdt,
       );
+
+  double get freeMarginUsdt =>
+      (accountEquityUsdt - usedMarginUsdt).clamp(0.0, double.infinity);
+
+  double get currentOpenPositionRiskUsdt => openPositions.fold<double>(
+        0.0,
+        (acc, p) {
+          final stopDist = (p.entryPrice - p.stopLoss).clamp(0.0, p.entryPrice);
+          return acc + (stopDist * p.quantity) + (p.entryFeeUsdt * 2.0);
+        },
+      );
+
+  double get remainingDailyRiskBudgetUsdt {
+    final usedLoss =
+        (startOfDayEquityUsdt - accountEquityUsdt).clamp(0.0, 2.0);
+    return (2.0 - usedLoss).clamp(0.0, 2.0);
+  }
+
+  double get remainingDrawdownBudgetUsdt =>
+      (accountEquityUsdt - 90.0).clamp(0.0, 10.0);
+
+  List<ClosedPaperTrade> get filteredClosedTrades {
+    return closedTrades.where((t) {
+      if (closedTradesOutcomeFilter == 'WINNING' && t.realizedPnlUsdt < 0) {
+        return false;
+      }
+      if (closedTradesOutcomeFilter == 'LOSING' && t.realizedPnlUsdt >= 0) {
+        return false;
+      }
+      if (closedTradesPairFilter != 'ALL' &&
+          t.symbol != closedTradesPairFilter) {
+        return false;
+      }
+      return true;
+    }).toList();
+  }
+
+  Set<String> get tradedPairSymbols =>
+      closedTrades.map((t) => t.symbol).toSet();
+
+  double computeRealizedPnlForWindowMs(int windowMs) {
+    final cutoff = _nowMs() - windowMs;
+    return closedTrades
+        .where((t) => t.closedAtMs >= cutoff)
+        .fold<double>(0.0, (acc, t) => acc + t.realizedPnlUsdt);
+  }
+
+  Map<String, double> get realizedPnlByPair {
+    final map = <String, double>{};
+    for (final t in closedTrades) {
+      map[t.symbol] = (map[t.symbol] ?? 0.0) + t.realizedPnlUsdt;
+    }
+    return map;
+  }
+
+  ({int avgMinutes, int minMinutes, int maxMinutes}) get tradeDurationStats {
+    if (closedTrades.isEmpty) {
+      return (avgMinutes: 0, minMinutes: 0, maxMinutes: 0);
+    }
+    int sumMin = 0;
+    int minM = 99999999;
+    int maxM = 0;
+    for (final t in closedTrades) {
+      final durMin =
+          ((t.closedAtMs - t.openedAtMs).abs() / 60000.0).round();
+      sumMin += durMin;
+      if (durMin < minM) minM = durMin;
+      if (durMin > maxM) maxM = durMin;
+    }
+    return (
+      avgMinutes: (sumMin / closedTrades.length).round(),
+      minMinutes: minM == 99999999 ? 0 : minM,
+      maxMinutes: maxM,
+    );
+  }
 
   void setMarketSearchQuery(String query) {
     marketSearchQuery = query;
