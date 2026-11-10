@@ -2107,54 +2107,64 @@ void main() {
 
     coordinator.dispose();
     await db.close();
+  });
 
-    test('UI Redesign Test 23: TradingCoordinator UI helpers (favourites, equity timeframes, margin, risk budgets, trade filters, duration & pair P&L)', () {
-      final coordinator = TradingCoordinator(autoInit: false);
+  test('UI Redesign Test 23: TradingCoordinator UI helpers (favourites, equity timeframes, margin, risk budgets, trade filters, duration & pair P&L)', () async {
+    final db = PersistenceDatabase(useInMemoryFallback: true);
+    final bridge = _FakeCommandBridge(serviceReady: true, shouldSucceedStart: true);
+    final coordinator = TradingCoordinator(
+      persistence: db,
+      commandBridge: bridge,
+      nowMsProvider: () => 200000,
+    );
 
-      // 1. Favourites & Market Filtering
-      expect(coordinator.favouriteMarketPairs.contains('BTCUSDT'), isTrue);
-      expect(coordinator.favouriteMarketPairs.contains('ETHUSDT'), isTrue);
-      expect(coordinator.showOnlyFavouriteMarkets, isFalse);
+    // 1. Favourites & Market Filtering
+    expect(coordinator.favouriteMarketPairs.isEmpty, isTrue);
+    expect(coordinator.showOnlyFavouriteMarkets, isFalse);
 
-      coordinator.toggleFavouriteMarket('SOLUSDT');
-      expect(coordinator.favouriteMarketPairs.contains('SOLUSDT'), isTrue);
-      coordinator.toggleFavouriteMarket('SOLUSDT');
-      expect(coordinator.favouriteMarketPairs.contains('SOLUSDT'), isFalse);
+    coordinator.toggleFavouriteMarket('SOLUSDT');
+    expect(coordinator.favouriteMarketPairs.contains('SOLUSDT'), isTrue);
+    coordinator.toggleFavouriteMarket('SOLUSDT');
+    expect(coordinator.favouriteMarketPairs.contains('SOLUSDT'), isFalse);
 
-      coordinator.setShowOnlyFavouriteMarkets(true);
-      expect(coordinator.showOnlyFavouriteMarkets, isTrue);
-      coordinator.setShowOnlyFavouriteMarkets(false);
+    coordinator.setShowOnlyFavouriteMarkets(true);
+    expect(coordinator.showOnlyFavouriteMarkets, isTrue);
+    coordinator.setShowOnlyFavouriteMarkets(false);
 
-      // 2. Equity Curve Timeframes (1D, 7D, 30D, ALL)
-      for (final tf in ['1D', '7D', '30D', 'ALL']) {
-        coordinator.setEquityTimeframe(tf);
-        expect(coordinator.selectedEquityTimeframe, equals(tf));
-        expect(coordinator.filteredEquityCurve, isNotEmpty);
-      }
+    // 2. Equity Curve Timeframes (1D, 7D, 30D, ALL)
+    coordinator.equityCurve = const [
+      EquityPoint(timestampMs: 190000, equityUsdt: 100.0),
+      EquityPoint(timestampMs: 200000, equityUsdt: 101.25),
+    ];
+    for (final tf in ['1D', '7D', '30D', 'ALL']) {
+      coordinator.setSelectedEquityTimeframe(tf);
+      expect(coordinator.selectedEquityTimeframe, equals(tf));
+      expect(coordinator.filteredEquityCurve, isNotEmpty);
+    }
 
-      // 3. Margin & Risk Budgets on $100 Paper Account
-      expect(coordinator.account.initialCapitalUsdt, closeTo(100.0, 0.001));
-      expect(coordinator.usedMarginUsdt, greaterThanOrEqualTo(0.0));
-      expect(coordinator.freeMarginUsdt, closeTo(coordinator.account.availableBalanceUsdt, 0.001));
-      expect(coordinator.remainingDailyRiskBudgetUsdt, closeTo(2.0, 0.001));
-      expect(coordinator.remainingDrawdownBudgetUsdt, closeTo(10.0, 0.001));
+    // 3. Margin & Risk Budgets on $100 Paper Account
+    expect(coordinator.accountEquityUsdt, closeTo(100.0, 0.001));
+    expect(coordinator.usedMarginUsdt, closeTo(0.0, 0.001));
+    expect(coordinator.freeMarginUsdt, closeTo(coordinator.availableCashUsdt, 0.001));
+    expect(coordinator.remainingDailyRiskBudgetUsdt, closeTo(2.0, 0.001));
+    expect(coordinator.remainingDrawdownBudgetUsdt, closeTo(10.0, 0.001));
 
-      // 4. Closed Trades Filtering & Analytics
-      coordinator.setClosedTradesOutcomeFilter('PROFIT');
-      expect(coordinator.closedTradesOutcomeFilter, equals('PROFIT'));
-      coordinator.setClosedTradesOutcomeFilter('LOSS');
-      expect(coordinator.closedTradesOutcomeFilter, equals('LOSS'));
-      coordinator.setClosedTradesOutcomeFilter('ALL');
-      coordinator.setClosedTradesPairFilter('BTCUSDT');
-      expect(coordinator.closedTradesPairFilter, equals('BTCUSDT'));
-      coordinator.setClosedTradesPairFilter('ALL');
+    // 4. Closed Trades Filtering & Analytics
+    coordinator.setClosedTradesOutcomeFilter('WINNING');
+    expect(coordinator.closedTradesOutcomeFilter, equals('WINNING'));
+    coordinator.setClosedTradesOutcomeFilter('LOSING');
+    expect(coordinator.closedTradesOutcomeFilter, equals('LOSING'));
+    coordinator.setClosedTradesOutcomeFilter('ALL');
+    coordinator.setClosedTradesPairFilter('BTCUSDT');
+    expect(coordinator.closedTradesPairFilter, equals('BTCUSDT'));
+    coordinator.setClosedTradesPairFilter('ALL');
 
-      final durStats = coordinator.tradeDurationStats;
-      expect(durStats.containsKey('avgMin'), isTrue);
-      expect(durStats.containsKey('shortestMin'), isTrue);
-      expect(durStats.containsKey('longestMin'), isTrue);
+    final durStats = coordinator.tradeDurationStats;
+    expect(durStats.avgMinutes, equals(0));
+    expect(durStats.minMinutes, equals(0));
+    expect(durStats.maxMinutes, equals(0));
 
-      coordinator.dispose();
-    });
+    coordinator.dispose();
+    await db.close();
   });
 }
