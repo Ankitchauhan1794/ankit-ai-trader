@@ -5,7 +5,9 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ankit_ai_trader/main.dart';
+import 'package:ankit_ai_trader/models/dual_portfolio_models.dart';
 import 'package:ankit_ai_trader/models/trading_models.dart';
+import 'package:ankit_ai_trader/services/dual_portfolio_service.dart';
 import 'package:ankit_ai_trader/services/authoritative_engine.dart';
 import 'package:ankit_ai_trader/services/coindcx_market_service.dart';
 import 'package:ankit_ai_trader/services/indicator_engine.dart';
@@ -2163,6 +2165,283 @@ void main() {
     expect(durStats.avgMinutes, equals(0));
     expect(durStats.minMinutes, equals(0));
     expect(durStats.maxMinutes, equals(0));
+
+    coordinator.dispose();
+    await db.close();
+  });
+
+  test('Dual Portfolio Tests 1–12 (Task 1): Backward-compatible migration, separate balances, isolated positions/trades/risk supervisors, XAUUSD/XAGUSD research-only lock, and live trading lock', () async {
+    final db = PersistenceDatabase(useInMemoryFallback: true);
+
+    // 1. Existing crypto account data remains unchanged when synced into DualPortfolioManager
+    final existingCryptoPos = const PaperPosition(
+      id: 'EXISTING_CRYPTO_POS_1',
+      symbol: 'B-BTC_USDT',
+      entryPrice: 90000.0,
+      quantity: 0.0005,
+      stopLoss: 88000.0,
+      takeProfit: 94000.0,
+      entryFeeUsdt: 0.045,
+      signalCandleCloseMs: 100000,
+      openedAtMs: 100005,
+    );
+    final existingCryptoTrade = const ClosedPaperTrade(
+      id: 'EXISTING_CRYPTO_TRD_1',
+      symbol: 'B-ETH_USDT',
+      entryPrice: 3000.0,
+      exitPrice: 3120.0,
+      quantity: 0.02,
+      stopLoss: 2940.0,
+      takeProfit: 3120.0,
+      totalFeesUsdt: 0.12,
+      realizedPnlUsdt: 2.28,
+      openedAtMs: 80000,
+      closedAtMs: 95000,
+      exitReason: 'TAKE_PROFIT',
+    );
+    await db.saveFullState(
+      botState: BotEngineState.running,
+      userIntention: UserSessionIntention.running,
+      availableCashUsdt: 57.235,
+      accountEquityUsdt: 102.28,
+      maxDrawdownLocked: false,
+      lastHeartbeatMs: 105000,
+      statusBannerMessage: 'PAPER BOT RUNNING',
+      openPositions: [existingCryptoPos],
+      orders: const [],
+      closedTrades: [existingCryptoTrade],
+      processedEntrySignalKeys: const {'B-BTC_USDT_100000'},
+    );
+
+    final bridge = _FakeCommandBridge(serviceReady: true, shouldSucceedStart: true);
+    final coordinator = TradingCoordinator(
+      persistence: db,
+      commandBridge: bridge,
+      nowMsProvider: () => 110000,
+    );
+    await coordinator.refreshStateFromDatabase(isInitialLoad: true);
+
+    // Test 1: Existing crypto account data remains unchanged
+    expect(coordinator.cryptoPortfolio.portfolioId, equals(PortfolioId.crypto));
+    expect(coordinator.cryptoPortfolio.availableCashUsdt, closeTo(57.235, 0.001));
+    expect(coordinator.cryptoPortfolio.accountEquityUsdt, closeTo(102.28, 0.001));
+    expect(coordinator.cryptoPortfolio.openPositions.length, equals(1));
+    expect(coordinator.cryptoPortfolio.openPositions.first.id, equals('EXISTING_CRYPTO_POS_1'));
+    expect(coordinator.cryptoPortfolio.closedTrades.length, equals(1));
+    expect(coordinator.cryptoPortfolio.closedTrades.first.id, equals('EXISTING_CRYPTO_TRD_1'));
+
+    // Test 2: Both portfolios maintain separate balances ($102.28 Crypto vs $100.00 High-Volatility)
+    expect(coordinator.highVolatilityPortfolio.portfolioId, equals(PortfolioId.highVolatility));
+    expect(coordinator.highVolatilityPortfolio.startingBalanceUsdt, closeTo(100.0, 0.001));
+    expect(coordinator.highVolatilityPortfolio.availableCashUsdt, closeTo(100.0, 0.001));
+    expect(coordinator.highVolatilityPortfolio.accountEquityUsdt, closeTo(100.0, 0.001));
+    expect(coordinator.highVolatilityPortfolio.openPositions, isEmpty);
+    expect(coordinator.highVolatilityPortfolio.closedTrades, isEmpty);
+
+    // Test 10: High-volatility trading remains disabled until verification (Research-Only mode by default)
+    expect(coordinator.highVolatilityPortfolio.isResearchOnlyMode, isTrue);
+    expect(coordinator.highVolatilityPortfolio.executionEnabled, isFalse);
+
+    final manager = coordinator.dualPortfolioManager;
+    final btcSpec = manager.cryptoProvider.getInstrumentSpecification('BTCUSDT');
+    final blockedHighVolAttempt = await manager.openIsolatedPaperPosition(
+      portfolioId: PortfolioId.highVolatility,
+      instrumentSpec: btcSpec,
+      entryPrice: 90000.0,
+      stopLossPrice: 88500.0,
+      takeProfitPrice: 93000.0,
+      quantity: 0.0005,
+      nowMs: 115000,
+    );
+    expect(blockedHighVolAttempt.executed, isFalse);
+    expect(blockedHighVolAttempt.reason, contains('PORTFOLIO_RESEARCH_ONLY_LOCK'));
+
+    // Test 9: Unsupported instruments (XAUUSD Gold, XAGUSD Silver, unverified pairs) cannot execute orders
+    final xauOnCoinDcx = manager.cryptoProvider.getInstrumentSpecification('XAUUSD');
+    expect(xauOnCoinDcx.isSpecificationVerified, isFalse);
+    expect(xauOnCoinDcx.isExecutionAuthorized, isFalse);
+    expect(xauOnCoinDcx.statusNote, contains('UNSUPPORTED_ON_COINDCX'));
+
+    final xauOnHighVol = manager.highVolProvider.getInstrumentSpecification('XAUUSD');
+    final xagOnHighVol = manager.highVolProvider.getInstrumentSpecification('XAGUSD');
+    expect(xauOnHighVol.isSpecificationVerified, isFalse);
+    expect(xauOnHighVol.isExecutionAuthorized, isFalse);
+    expect(xauOnHighVol.contractSize, isNull); // Never invented!
+    expect(xagOnHighVol.isSpecificationVerified, isFalse);
+    expect(xagOnHighVol.isExecutionAuthorized, isFalse);
+
+    final xauOrderAttempt = manager.vetAndSizePortfolioOrder(
+      portfolioId: PortfolioId.crypto,
+      instrumentSpec: xauOnCoinDcx,
+      entryPrice: 2650.0,
+      stopLossPrice: 2630.0,
+      spreadPct: 0.05,
+      atr14: 12.0,
+      isDataFresh: true,
+      nowMs: 116000,
+    );
+    expect(xauOrderAttempt.approved, isFalse);
+    expect(xauOrderAttempt.rejectionReason, contains('UNVERIFIED_INSTRUMENT_SPECIFICATION'));
+
+    // Test 11: Live trading remains locked across both portfolios
+    final liveAttempt = manager.vetAndSizePortfolioOrder(
+      portfolioId: PortfolioId.crypto,
+      instrumentSpec: btcSpec,
+      entryPrice: 90000.0,
+      stopLossPrice: 88500.0,
+      spreadPct: 0.05,
+      atr14: 450.0,
+      isDataFresh: true,
+      nowMs: 116500,
+      isLiveTradingAttempt: true,
+    );
+    expect(liveAttempt.approved, isFalse);
+    expect(liveAttempt.rejectionReason, contains('LIVE_TRADING_HARD_LOCKED'));
+    expect(coordinator.controlledLiveGateStatus.liveExecutionEnabled, isFalse);
+
+    // Test 3: Crypto transactions cannot change High-Volatility balances
+    final closeCryptoRes = await manager.closeIsolatedPaperPosition(
+      portfolioId: PortfolioId.crypto,
+      positionId: 'EXISTING_CRYPTO_POS_1',
+      exitPrice: 92000.0,
+      nowMs: 120000,
+    );
+    expect(closeCryptoRes.closed, isTrue);
+    expect(coordinator.cryptoPortfolio.openPositions, isEmpty);
+    expect(coordinator.cryptoPortfolio.closedTrades.length, equals(2));
+    // High-Volatility balance and history remain 100% untouched
+    expect(coordinator.highVolatilityPortfolio.availableCashUsdt, closeTo(100.0, 0.001));
+    expect(coordinator.highVolatilityPortfolio.accountEquityUsdt, closeTo(100.0, 0.001));
+    expect(coordinator.highVolatilityPortfolio.closedTrades, isEmpty);
+
+    // Test 4, 6 & 7: High-Volatility transactions (when explicitly approved in test) cannot change Crypto balances, positions, or trade history
+    await manager.setHighVolatilityExecutionApproval(
+      approvedAndVerified: true,
+      nowMs: 125000,
+    );
+    final cryptoCashBefore = coordinator.cryptoPortfolio.availableCashUsdt;
+    final cryptoEqBefore = coordinator.cryptoPortfolio.accountEquityUsdt;
+    final cryptoTradesBefore = coordinator.cryptoPortfolio.closedTrades.length;
+
+    final verifiedHighVolCryptoSpec = const VerifiedInstrumentSpecification(
+      symbol: 'SOLUSDT',
+      canonicalPair: 'B-SOL_USDT',
+      providerId: 'VERIFIED_TEST_PROVIDER',
+      baseCurrency: 'SOL',
+      quoteCurrency: 'USDT',
+      category: PortfolioAssetCategory.highVolatilityCryptoSpot,
+      contractSize: 1.0,
+      minQuantity: 0.01,
+      maxQuantity: 1000.0,
+      quantityStep: 0.01,
+      tickSize: 0.01,
+      tickValue: 0.01,
+      minNotional: 5.0,
+      currentSpreadBps: 8.0,
+      makerFeeRate: 0.001,
+      takerFeeRate: 0.001,
+      tradingSessions: ['24/7_SPOT'],
+      supportedOrderTypes: ['market_order', 'limit_order'],
+      isProviderConnected: true,
+      isSpecificationVerified: true,
+      isExecutionAuthorized: true,
+      statusNote: 'Verified high-volatility test instrument',
+    );
+
+    final openHvRes = await manager.openIsolatedPaperPosition(
+      portfolioId: PortfolioId.highVolatility,
+      instrumentSpec: verifiedHighVolCryptoSpec,
+      entryPrice: 200.0,
+      stopLossPrice: 190.0,
+      takeProfitPrice: 220.0,
+      quantity: 0.08,
+      nowMs: 130000,
+    );
+    expect(openHvRes.executed, isTrue);
+    expect(coordinator.highVolatilityPortfolio.openPositions.length, equals(1));
+    expect(coordinator.cryptoPortfolio.openPositions, isEmpty); // Isolated!
+    expect(coordinator.cryptoPortfolio.availableCashUsdt, closeTo(cryptoCashBefore, 0.0001));
+    expect(coordinator.cryptoPortfolio.accountEquityUsdt, closeTo(cryptoEqBefore, 0.0001));
+
+    final closeHvRes = await manager.closeIsolatedPaperPosition(
+      portfolioId: PortfolioId.highVolatility,
+      positionId: openHvRes.position!.id,
+      exitPrice: 215.0,
+      nowMs: 135000,
+    );
+    expect(closeHvRes.closed, isTrue);
+    expect(coordinator.highVolatilityPortfolio.closedTrades.length, equals(1));
+    expect(coordinator.cryptoPortfolio.closedTrades.length, equals(cryptoTradesBefore)); // Isolated!
+    expect(
+      coordinator.highVolatilityPortfolio.learningContext.evaluatedClosedTradesCount,
+      equals(1),
+    );
+    expect(
+      coordinator.cryptoPortfolio.learningContext.evaluatedClosedTradesCount,
+      equals(2),
+    );
+
+    // Re-lock High-Volatility back to default research-only mode
+    await manager.setHighVolatilityExecutionApproval(
+      approvedAndVerified: false,
+      nowMs: 136000,
+    );
+
+    // Test 8: Risk supervisors are isolated & stop-loss is never moved closer when minQty exceeds permitted $1 risk
+    final cryptoSup = manager.riskSupervisorFor(PortfolioId.crypto);
+    final highVolSup = manager.riskSupervisorFor(PortfolioId.highVolatility);
+    cryptoSup.emergencyKillSwitchActive = true;
+    cryptoSup.consecutiveLosses = 3;
+    expect(highVolSup.emergencyKillSwitchActive, isFalse);
+    expect(highVolSup.consecutiveLosses, equals(0));
+    cryptoSup.emergencyKillSwitchActive = false;
+    cryptoSup.consecutiveLosses = 0;
+
+    // Verify minQuantity exceeding $1.00 risk is rejected without moving stopLossPrice closer
+    final largeMinQtySpec = const VerifiedInstrumentSpecification(
+      symbol: 'BTCLARGE',
+      canonicalPair: 'B-BTCLARGE_USDT',
+      providerId: 'COINDCX_SPOT',
+      baseCurrency: 'BTC',
+      quoteCurrency: 'USDT',
+      category: PortfolioAssetCategory.standardCryptoSpot,
+      contractSize: 1.0,
+      minQuantity: 0.01, // At $90,000 and $2,000 stop distance, risk is $20 > $1 limit!
+      maxQuantity: 10.0,
+      quantityStep: 0.01,
+      tickSize: 0.01,
+      tickValue: 0.01,
+      minNotional: 10.0,
+      takerFeeRate: 0.001,
+      supportedOrderTypes: ['market_order'],
+      isProviderConnected: true,
+      isSpecificationVerified: true,
+      isExecutionAuthorized: true,
+      statusNote: 'Large min quantity test',
+    );
+    final minQtyRiskCheck = manager.vetAndSizePortfolioOrder(
+      portfolioId: PortfolioId.crypto,
+      instrumentSpec: largeMinQtySpec,
+      entryPrice: 90000.0,
+      stopLossPrice: 88000.0,
+      spreadPct: 0.05,
+      atr14: 500.0,
+      isDataFresh: true,
+      nowMs: 140000,
+    );
+    expect(minQtyRiskCheck.approved, isFalse);
+    expect(minQtyRiskCheck.stopLossPrice, closeTo(88000.0, 0.001)); // Never moved closer!
+    expect(minQtyRiskCheck.rejectionReason, contains('MIN_QUANTITY_EXCEEDS_PERMITTED_RISK'));
+
+    // Test 5 & 12: Portfolio switching updates active portfolio getters accurately
+    coordinator.selectPortfolio(PortfolioId.crypto);
+    expect(coordinator.selectedPortfolioId, equals(PortfolioId.crypto));
+    expect(coordinator.activeEquityUsdt, closeTo(coordinator.cryptoPortfolio.accountEquityUsdt, 0.001));
+
+    coordinator.selectPortfolio(PortfolioId.highVolatility);
+    expect(coordinator.selectedPortfolioId, equals(PortfolioId.highVolatility));
+    expect(coordinator.activeEquityUsdt, closeTo(coordinator.highVolatilityPortfolio.accountEquityUsdt, 0.001));
+    expect(coordinator.activePortfolio.isResearchOnlyMode, isTrue);
 
     coordinator.dispose();
     await db.close();

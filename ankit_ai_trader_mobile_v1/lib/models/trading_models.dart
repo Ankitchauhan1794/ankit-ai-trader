@@ -763,6 +763,7 @@ class PendingEntrySignal {
 
 class PaperPosition {
   final String id;
+  final String portfolioId;
   final String symbol;
   final double entryPrice;
   final double quantity;
@@ -774,6 +775,7 @@ class PaperPosition {
 
   const PaperPosition({
     required this.id,
+    this.portfolioId = 'CRYPTO',
     required this.symbol,
     required this.entryPrice,
     required this.quantity,
@@ -794,6 +796,7 @@ class PaperPosition {
 
   Map<String, dynamic> toMap() => {
         'id': id,
+        'portfolioId': portfolioId,
         'symbol': symbol,
         'entryPrice': entryPrice,
         'quantity': quantity,
@@ -806,6 +809,7 @@ class PaperPosition {
 
   factory PaperPosition.fromMap(Map<String, dynamic> map) => PaperPosition(
         id: map['id'] as String,
+        portfolioId: (map['portfolioId'] as String?) ?? 'CRYPTO',
         symbol: map['symbol'] as String,
         entryPrice: (map['entryPrice'] as num).toDouble(),
         quantity: (map['quantity'] as num).toDouble(),
@@ -819,6 +823,7 @@ class PaperPosition {
 
 class SimulatedOrder {
   final String id;
+  final String portfolioId;
   final String symbol;
   final String side;
   final double requestedPrice;
@@ -832,6 +837,7 @@ class SimulatedOrder {
 
   const SimulatedOrder({
     required this.id,
+    this.portfolioId = 'CRYPTO',
     required this.symbol,
     required this.side,
     required this.requestedPrice,
@@ -846,6 +852,7 @@ class SimulatedOrder {
 
   Map<String, dynamic> toMap() => {
         'id': id,
+        'portfolioId': portfolioId,
         'symbol': symbol,
         'side': side,
         'requestedPrice': requestedPrice,
@@ -860,6 +867,7 @@ class SimulatedOrder {
 
   factory SimulatedOrder.fromMap(Map<String, dynamic> map) => SimulatedOrder(
         id: map['id'] as String,
+        portfolioId: (map['portfolioId'] as String?) ?? 'CRYPTO',
         symbol: map['symbol'] as String,
         side: map['side'] as String,
         requestedPrice: (map['requestedPrice'] as num).toDouble(),
@@ -875,6 +883,7 @@ class SimulatedOrder {
 
 class ClosedPaperTrade {
   final String id;
+  final String portfolioId;
   final String symbol;
   final double entryPrice;
   final double exitPrice;
@@ -889,6 +898,7 @@ class ClosedPaperTrade {
 
   const ClosedPaperTrade({
     required this.id,
+    this.portfolioId = 'CRYPTO',
     required this.symbol,
     required this.entryPrice,
     required this.exitPrice,
@@ -904,6 +914,7 @@ class ClosedPaperTrade {
 
   Map<String, dynamic> toMap() => {
         'id': id,
+        'portfolioId': portfolioId,
         'symbol': symbol,
         'entryPrice': entryPrice,
         'exitPrice': exitPrice,
@@ -919,6 +930,7 @@ class ClosedPaperTrade {
 
   factory ClosedPaperTrade.fromMap(Map<String, dynamic> map) => ClosedPaperTrade(
         id: map['id'] as String,
+        portfolioId: (map['portfolioId'] as String?) ?? 'CRYPTO',
         symbol: map['symbol'] as String,
         entryPrice: (map['entryPrice'] as num).toDouble(),
         exitPrice: (map['exitPrice'] as num).toDouble(),
@@ -1002,9 +1014,11 @@ class DiagnosticEvent {
 class EquityPoint {
   final int timestampMs;
   final double equityUsdt;
+  final String portfolioId;
 
   const EquityPoint({
     required this.timestampMs,
     required this.equityUsdt,
+    this.portfolioId = 'CRYPTO',
   });
 }

@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import '../models/dual_portfolio_models.dart';
 import '../models/trading_models.dart';
+import 'dual_portfolio_service.dart';
 import 'autonomous_intelligence_and_ops.dart';
 import 'coindcx_market_service.dart';
 import 'execution_and_risk_hub.dart';
@@ -197,6 +199,7 @@ class TradingCoordinator extends ChangeNotifier {
       ledger: eventLedger,
       riskSupervisor: riskSupervisor,
     );
+    dualPortfolioManager = DualPortfolioManager(persistence: this.persistence);
   }
 
   bool get isPaused =>
@@ -367,6 +370,98 @@ class TradingCoordinator extends ChangeNotifier {
     notifyListeners();
   }
 
+  PortfolioId get selectedPortfolioId =>
+      dualPortfolioManager.selectedPortfolioId;
+
+  PortfolioAccountSnapshot get activePortfolio =>
+      dualPortfolioManager.activePortfolioSnapshot;
+
+  PortfolioAccountSnapshot get cryptoPortfolio =>
+      dualPortfolioManager.snapshotFor(PortfolioId.crypto);
+
+  PortfolioAccountSnapshot get highVolatilityPortfolio =>
+      dualPortfolioManager.snapshotFor(PortfolioId.highVolatility);
+
+  void selectPortfolio(PortfolioId id) {
+    dualPortfolioManager.selectPortfolio(id);
+    notifyListeners();
+  }
+
+  bool get isHighVolatilitySelected =>
+      selectedPortfolioId == PortfolioId.highVolatility;
+
+  double get activeEquityUsdt => isHighVolatilitySelected
+      ? highVolatilityPortfolio.accountEquityUsdt
+      : accountEquityUsdt;
+
+  double get activeAvailableCashUsdt => isHighVolatilitySelected
+      ? highVolatilityPortfolio.availableCashUsdt
+      : availableCashUsdt;
+
+  double get activeStartOfDayEquityUsdt => isHighVolatilitySelected
+      ? highVolatilityPortfolio.startOfDayEquityUsdt
+      : startOfDayEquityUsdt;
+
+  double get activeDailyPnlUsdt => isHighVolatilitySelected
+      ? highVolatilityPortfolio.dailyPnlUsdt
+      : dailyPnlUsdt;
+
+  double get activeOverallPnlUsdt => isHighVolatilitySelected
+      ? highVolatilityPortfolio.overallPnlUsdt
+      : overallPnlUsdt;
+
+  double get activeDrawdownUsdt => isHighVolatilitySelected
+      ? highVolatilityPortfolio.currentDrawdownUsdt
+      : currentDrawdownUsdt;
+
+  double get activeUsedMarginUsdt => isHighVolatilitySelected
+      ? highVolatilityPortfolio.usedMarginUsdt
+      : usedMarginUsdt;
+
+  double get activeFreeMarginUsdt => isHighVolatilitySelected
+      ? highVolatilityPortfolio.freeMarginUsdt
+      : freeMarginUsdt;
+
+  double get activeRemainingDailyRiskUsdt => isHighVolatilitySelected
+      ? highVolatilityPortfolio.remainingDailyRiskBudgetUsdt
+      : remainingDailyRiskBudgetUsdt;
+
+  double get activeRemainingDrawdownUsdt => isHighVolatilitySelected
+      ? highVolatilityPortfolio.remainingDrawdownBudgetUsdt
+      : remainingDrawdownBudgetUsdt;
+
+  List<PaperPosition> get activeOpenPositions => isHighVolatilitySelected
+      ? highVolatilityPortfolio.openPositions
+      : openPositions;
+
+  List<ClosedPaperTrade> get activeClosedTrades => isHighVolatilitySelected
+      ? highVolatilityPortfolio.closedTrades
+      : closedTrades;
+
+  List<EquityPoint> get activeEquityCurve => isHighVolatilitySelected
+      ? highVolatilityPortfolio.equityCurve
+      : equityCurve;
+
+  List<HighVolatilityClassificationResult>
+      get highVolatilityMarketClassifications {
+    final results = <HighVolatilityClassificationResult>[
+      dualPortfolioManager.classifier.classifyPreciousMetal('XAUUSD'),
+      dualPortfolioManager.classifier.classifyPreciousMetal('XAGUSD'),
+    ];
+    final now = _nowMs();
+    for (final m in marketCatalogue.allMarkets.take(15)) {
+      results.add(
+        dualPortfolioManager.classifier.classifyCryptoMarket(
+          market: m,
+          closedCandles: const [],
+          nowMs: now,
+          portfolioExecutionApproved: highVolatilityPortfolio.executionEnabled,
+        ),
+      );
+    }
+    return results;
+  }
+
   void setShowOnlyFavouriteMarkets(bool value) {
     showOnlyFavouriteMarkets = value;
     notifyListeners();
@@ -388,7 +483,8 @@ class TradingCoordinator extends ChangeNotifier {
   }
 
   List<EquityPoint> get filteredEquityCurve {
-    if (equityCurve.isEmpty) return const [];
+    final srcCurve = activeEquityCurve;
+    if (srcCurve.isEmpty) return const [];
     final now = _nowMs();
     int? cutoffMs;
     switch (selectedEquityTimeframe) {
@@ -404,10 +500,10 @@ class TradingCoordinator extends ChangeNotifier {
       default:
         cutoffMs = null;
     }
-    if (cutoffMs == null) return equityCurve;
+    if (cutoffMs == null) return srcCurve;
     final filtered =
-        equityCurve.where((p) => p.timestampMs >= cutoffMs!).toList();
-    return filtered.isNotEmpty ? filtered : equityCurve;
+        srcCurve.where((p) => p.timestampMs >= cutoffMs!).toList();
+    return filtered.isNotEmpty ? filtered : srcCurve;
   }
 
   double get usedMarginUsdt => openPositions.fold<double>(
@@ -436,7 +532,7 @@ class TradingCoordinator extends ChangeNotifier {
       (accountEquityUsdt - 90.0).clamp(0.0, 10.0);
 
   List<ClosedPaperTrade> get filteredClosedTrades {
-    return closedTrades.where((t) {
+    return activeClosedTrades.where((t) {
       if (closedTradesOutcomeFilter == 'WINNING' && t.realizedPnlUsdt < 0) {
         return false;
       }
@@ -452,31 +548,32 @@ class TradingCoordinator extends ChangeNotifier {
   }
 
   Set<String> get tradedPairSymbols =>
-      closedTrades.map((t) => t.symbol).toSet();
+      activeClosedTrades.map((t) => t.symbol).toSet();
 
   double computeRealizedPnlForWindowMs(int windowMs) {
     final cutoff = _nowMs() - windowMs;
-    return closedTrades
+    return activeClosedTrades
         .where((t) => t.closedAtMs >= cutoff)
         .fold<double>(0.0, (acc, t) => acc + t.realizedPnlUsdt);
   }
 
   Map<String, double> get realizedPnlByPair {
     final map = <String, double>{};
-    for (final t in closedTrades) {
+    for (final t in activeClosedTrades) {
       map[t.symbol] = (map[t.symbol] ?? 0.0) + t.realizedPnlUsdt;
     }
     return map;
   }
 
   ({int avgMinutes, int minMinutes, int maxMinutes}) get tradeDurationStats {
-    if (closedTrades.isEmpty) {
+    final srcTrades = activeClosedTrades;
+    if (srcTrades.isEmpty) {
       return (avgMinutes: 0, minMinutes: 0, maxMinutes: 0);
     }
     int sumMin = 0;
     int minM = 99999999;
     int maxM = 0;
-    for (final t in closedTrades) {
+    for (final t in srcTrades) {
       final durMin =
           ((t.closedAtMs - t.openedAtMs).abs() / 60000.0).round();
       sumMin += durMin;
@@ -484,7 +581,7 @@ class TradingCoordinator extends ChangeNotifier {
       if (durMin > maxM) maxM = durMin;
     }
     return (
-      avgMinutes: (sumMin / closedTrades.length).round(),
+      avgMinutes: (sumMin / srcTrades.length).round(),
       minMinutes: minM == 99999999 ? 0 : minM,
       maxMinutes: maxM,
     );
@@ -786,6 +883,7 @@ class TradingCoordinator extends ChangeNotifier {
     equityCurve = List.from(snap.equityCurve);
     recentEvents = List.from(snap.recentEvents);
     recoveryLogs = List.from(snap.recoveryLogs);
+    dualPortfolioManager.syncCryptoPortfolioFromEngineSnapshot(snap);
 
     if (closedTrades.isNotEmpty) {
       latestRobustnessReport = quantValidator.evaluateClosedTrades(

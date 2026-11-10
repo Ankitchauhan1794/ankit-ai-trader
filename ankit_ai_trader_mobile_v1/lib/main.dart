@@ -2,7 +2,9 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'models/dual_portfolio_models.dart';
 import 'models/trading_models.dart';
+import 'services/dual_portfolio_service.dart';
 import 'screens/dashboard_screen.dart';
 import 'services/authoritative_engine.dart';
 import 'services/autonomous_intelligence_and_ops.dart';
@@ -288,10 +290,17 @@ class _DashboardPageState extends State<DashboardPage>
           const SizedBox(width: 4),
         ],
       ),
-      body: RefreshIndicator(
-        onRefresh: () =>
-            _coordinator.refreshStateFromDatabase(isInitialLoad: false),
-        child: pages[_selectedTabIndex],
+      body: Column(
+        children: [
+          _buildPortfolioSelectorBar(),
+          Expanded(
+            child: RefreshIndicator(
+              onRefresh: () =>
+                  _coordinator.refreshStateFromDatabase(isInitialLoad: false),
+              child: pages[_selectedTabIndex],
+            ),
+          ),
+        ],
       ),
       bottomNavigationBar: NavigationBar(
         backgroundColor: const Color(0xFF0B101B),
@@ -338,16 +347,159 @@ class _DashboardPageState extends State<DashboardPage>
   // 1. HOME DASHBOARD (Matches 01_home_dashboard_mockup.png + Sections 4 & 10)
   // Note: Start/Pause/Stop controls are kept in Settings per Section 4 & 9.
   // ===========================================================================
-  Widget _buildHomeTab() {
-    final dailyPnl = _coordinator.dailyPnlUsdt;
-    final dailyPct = _coordinator.startOfDayEquityUsdt > 0
-        ? (dailyPnl / _coordinator.startOfDayEquityUsdt) * 100.0
-        : 0.0;
-    final overallPnl = _coordinator.overallPnlUsdt;
-    final overallPct = overallPnl; // Base capital is $100.00
-    final dd = _coordinator.currentDrawdownUsdt;
+  Widget _buildPortfolioSelectorBar() {
+    final isCrypto = _coordinator.selectedPortfolioId == PortfolioId.crypto;
+    final activeSnap = _coordinator.activePortfolio;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: const BoxDecoration(
+        color: Color(0xFF0E1422),
+        border: Border(
+          bottom: BorderSide(color: Color(0xFF1E293B), width: 1),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: InkWell(
+                  key: const ValueKey('select_crypto_portfolio'),
+                  onTap: () => _coordinator.selectPortfolio(PortfolioId.crypto),
+                  borderRadius: BorderRadius.circular(8),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 7,
+                    ),
+                    decoration: BoxDecoration(
+                      color: isCrypto
+                          ? const Color(0xFF0D2E1E)
+                          : const Color(0xFF161F30),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(
+                        color: isCrypto
+                            ? _greenProfit
+                            : const Color(0xFF283B5B),
+                      ),
+                    ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Flexible(
+                          child: Text(
+                            'CRYPTO PORTFOLIO',
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ),
+                        Text(
+                          '\$${_coordinator.cryptoPortfolio.accountEquityUsdt.toStringAsFixed(2)}',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.bold,
+                            color: isCrypto ? _greenProfit : Colors.white70,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: InkWell(
+                  key: const ValueKey('select_high_vol_portfolio'),
+                  onTap: () =>
+                      _coordinator.selectPortfolio(PortfolioId.highVolatility),
+                  borderRadius: BorderRadius.circular(8),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 7,
+                    ),
+                    decoration: BoxDecoration(
+                      color: !isCrypto
+                          ? const Color(0xFF2B2110)
+                          : const Color(0xFF161F30),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(
+                        color: !isCrypto
+                            ? _orangeWarn
+                            : const Color(0xFF283B5B),
+                      ),
+                    ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Flexible(
+                          child: Text(
+                            'HIGH-VOLATILITY PORTFOLIO',
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ),
+                        Text(
+                          '\$${_coordinator.highVolatilityPortfolio.accountEquityUsdt.toStringAsFixed(2)}',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.bold,
+                            color: !isCrypto ? _orangeWarn : Colors.white70,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          if (activeSnap.isResearchOnlyMode) ...[
+            const SizedBox(height: 6),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              decoration: BoxDecoration(
+                color: const Color(0xFF2B1D0E),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: _orangeWarn.withOpacity(0.5)),
+              ),
+              child: const Text(
+                'RESEARCH-ONLY MODE: High-Volatility & Precious Metals (XAUUSD / XAGUSD) execution is disabled until provider & specifications are verified.',
+                style: TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.amberAccent,
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
 
-    final closed = _coordinator.closedTrades;
+  Widget _buildHomeTab() {
+    final dailyPnl = _coordinator.activeDailyPnlUsdt;
+    final startDayEq = _coordinator.activeStartOfDayEquityUsdt;
+    final dailyPct = startDayEq > 0
+        ? (dailyPnl / startDayEq) * 100.0
+        : 0.0;
+    final overallPnl = _coordinator.activeOverallPnlUsdt;
+    final overallPct = overallPnl; // Base capital is $100.00
+    final dd = _coordinator.activeDrawdownUsdt;
+
+    final closed = _coordinator.activeClosedTrades;
     final totalTrades = closed.length;
     final wins = closed.where((t) => t.realizedPnlUsdt >= 0).length;
     final losses = totalTrades - wins;
@@ -409,7 +561,7 @@ class _DashboardPageState extends State<DashboardPage>
                           ),
                           const SizedBox(height: 2),
                           Text(
-                            '\$${_coordinator.accountEquityUsdt.toStringAsFixed(2)}',
+                            '\$${_coordinator.activeEquityUsdt.toStringAsFixed(2)}',
                             style: const TextStyle(
                               fontSize: 24,
                               fontWeight: FontWeight.bold,
@@ -418,7 +570,7 @@ class _DashboardPageState extends State<DashboardPage>
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            'Balance: \$100.00  |  Available: \$${_coordinator.availableCashUsdt.toStringAsFixed(2)}',
+                            'Balance: \$${_coordinator.activePortfolio.startingBalanceUsdt.toStringAsFixed(2)}  |  Available: \$${_coordinator.activeAvailableCashUsdt.toStringAsFixed(2)}',
                             style: const TextStyle(
                               fontSize: 11,
                               color: Colors.white70,
@@ -426,7 +578,7 @@ class _DashboardPageState extends State<DashboardPage>
                           ),
                           const SizedBox(height: 2),
                           Text(
-                            'Used Margin: \$${_coordinator.usedMarginUsdt.toStringAsFixed(2)}  |  Free Margin: \$${_coordinator.freeMarginUsdt.toStringAsFixed(2)}',
+                            'Used Margin: \$${_coordinator.activeUsedMarginUsdt.toStringAsFixed(2)}  |  Free Margin: \$${_coordinator.activeFreeMarginUsdt.toStringAsFixed(2)}  |  ${_coordinator.activePortfolio.displayName}',
                             style: const TextStyle(
                               fontSize: 10,
                               color: _mutedSlate,
@@ -722,9 +874,11 @@ class _DashboardPageState extends State<DashboardPage>
 
   /// Section 10: Informative Risk Information Display using current engine configuration.
   Widget _buildRiskInformationDisplayCard() {
-    final openRisk = _coordinator.currentOpenPositionRiskUsdt;
-    final remDaily = _coordinator.remainingDailyRiskBudgetUsdt;
-    final remDd = _coordinator.remainingDrawdownBudgetUsdt;
+    final openRisk = _coordinator.isHighVolatilitySelected
+        ? 0.0
+        : _coordinator.currentOpenPositionRiskUsdt;
+    final remDaily = _coordinator.activeRemainingDailyRiskUsdt;
+    final remDd = _coordinator.activeRemainingDrawdownUsdt;
     final isLocked = _coordinator.maxDrawdownLocked ||
         _coordinator.lockedDailyLossUtcDate != null ||
         _coordinator.engineState.isRiskLock;
@@ -785,9 +939,18 @@ class _DashboardPageState extends State<DashboardPage>
               remDd > 3.0 ? _greenProfit : _orangeWarn,
             ),
             _diagRow(
-              'Max Concurrent Open Positions',
-              '${_coordinator.openPositions.length} / 1',
+              'Configured Max Open Positions (Capacity <= 5)',
+              '${_coordinator.activeOpenPositions.length} / ${_coordinator.activePortfolio.configuredMaxOpenPositions} (Arch Max: ${_coordinator.activePortfolio.architecturalMaxPositionCapacity})',
               Colors.white,
+            ),
+            _diagRow(
+              'Portfolio Execution Mode',
+              _coordinator.activePortfolio.isResearchOnlyMode
+                  ? 'RESEARCH-ONLY (Execution Disabled)'
+                  : 'PAPER TRADING ACTIVE (Live Locked)',
+              _coordinator.activePortfolio.isResearchOnlyMode
+                  ? _orangeWarn
+                  : _greenProfit,
             ),
             _diagRow(
               'Combined Open-Position Risk',
@@ -803,10 +966,87 @@ class _DashboardPageState extends State<DashboardPage>
   // ===========================================================================
   // 2. MARKETS SCREEN (Section 5: Dynamic Watchlist, Favourites, Search & Detail Sheet)
   // ===========================================================================
+  Widget _buildHighVolatilityAndMetalsCard() {
+    final classifications = _coordinator.highVolatilityMarketClassifications;
+    const criteria = HighVolatilityClassificationCriteria();
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'HIGH-VOLATILITY & PRECIOUS METALS WATCHLIST (RESEARCH-ONLY)',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              'Classification Criteria: ATR(14) ${criteria.minAtrPct.toStringAsFixed(2)}%–${criteria.maxAtrPct.toStringAsFixed(2)}% | Realized Vol >= ${criteria.minRealizedVolatilityPct.toStringAsFixed(2)}% | Spread <= ${criteria.maxSpreadBps.toStringAsFixed(0)} bps | Min ${criteria.minClosedCandlesRequired} Closed Candles',
+              style: const TextStyle(fontSize: 10, color: _mutedSlate),
+            ),
+            const SizedBox(height: 8),
+            ...classifications.take(6).map((c) {
+              final isMetal =
+                  c.category == PortfolioAssetCategory.preciousMetalSpotCfd;
+              return Container(
+                margin: const EdgeInsets.only(bottom: 6),
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: _surfaceSubtle,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text(
+                          isMetal
+                              ? '${c.symbol} (Precious Metal)'
+                              : '${c.symbol} (${c.pair})',
+                          style: const TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 12,
+                          ),
+                        ),
+                        Text(
+                          c.isExecutionAuthorized
+                              ? 'PAPER ELIGIBLE'
+                              : 'RESEARCH-ONLY',
+                          style: TextStyle(
+                            fontSize: 10,
+                            fontWeight: FontWeight.bold,
+                            color: c.isExecutionAuthorized
+                                ? _greenProfit
+                                : _orangeWarn,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      c.classificationReason,
+                      style: const TextStyle(fontSize: 10, color: Colors.white70),
+                    ),
+                  ],
+                ),
+              );
+            }),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildMarketsTab() {
     return ListView(
       padding: const EdgeInsets.all(12),
       children: [
+        if (_coordinator.isHighVolatilitySelected) ...[
+          _buildHighVolatilityAndMetalsCard(),
+          const SizedBox(height: 12),
+        ],
         _buildMarketCatalogueSummaryAndFiltersCard(),
         const SizedBox(height: 12),
         _buildDiscoveredMarketCatalogueListCard(),
@@ -1156,6 +1396,7 @@ class _DashboardPageState extends State<DashboardPage>
   // ===========================================================================
   Widget _buildAiLabTab() {
     final activeStrat = _coordinator.strategyRegistry.activeStrategy;
+    final learningCtx = _coordinator.activePortfolio.learningContext;
     final expStrats = _coordinator.strategyRegistry.experimentalStrategies;
     final costEst = _coordinator.agentOrchestrator.estimateCouncilRunCost();
     final hypotheses =
@@ -1175,8 +1416,8 @@ class _DashboardPageState extends State<DashboardPage>
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    const Text(
-                      'ENGINE EXECUTION MODE & AI STATUS',
+                    Text(
+                      'ENGINE & LEARNING CONTEXT (${learningCtx.portfolioId.displayName})',
                       style: TextStyle(
                         fontWeight: FontWeight.bold,
                         fontSize: 13,
@@ -2783,7 +3024,7 @@ class _DashboardPageState extends State<DashboardPage>
   }
 
   Widget _buildOpenPositionsCard({bool showHeaderLinkToTrades = false}) {
-    final positions = _coordinator.openPositions;
+    final positions = _coordinator.activeOpenPositions;
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     final stratName = _coordinator.strategyRegistry.activeStrategy.name;
 

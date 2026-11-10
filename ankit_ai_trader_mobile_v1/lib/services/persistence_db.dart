@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
+import '../models/dual_portfolio_models.dart';
 import '../models/trading_models.dart';
 
 class PersistedEngineSnapshot {
@@ -79,7 +80,7 @@ class PersistedEngineSnapshot {
 
 class PersistenceDatabase {
   static const String dbFileName = 'ankit_ai_trader_phase1.db';
-  static const int currentSchemaVersion = 4;
+  static const int currentSchemaVersion = 5;
 
   Database? _db;
   final Map<String, String> _inMemoryKv = {};
@@ -91,6 +92,7 @@ class PersistenceDatabase {
   final Set<String> _inMemoryProcessedKeys = {};
   final Map<String, Map<String, dynamic>> _inMemoryLocks = {};
   final Map<String, CoinDcxMarketRecord> _inMemoryDiscoveredMarkets = {};
+  final Map<PortfolioId, PortfolioAccountSnapshot> _inMemoryPortfolioSnapshots = {};
   final bool useInMemoryFallback;
 
   PersistenceDatabase({this.useInMemoryFallback = false});
@@ -123,6 +125,7 @@ class PersistenceDatabase {
     await db.execute('''
       CREATE TABLE IF NOT EXISTS open_positions (
         id TEXT PRIMARY KEY,
+        portfolioId TEXT NOT NULL DEFAULT 'CRYPTO',
         symbol TEXT NOT NULL,
         entryPrice REAL NOT NULL,
         quantity REAL NOT NULL,
@@ -136,6 +139,7 @@ class PersistenceDatabase {
     await db.execute('''
       CREATE TABLE IF NOT EXISTS orders (
         id TEXT PRIMARY KEY,
+        portfolioId TEXT NOT NULL DEFAULT 'CRYPTO',
         symbol TEXT NOT NULL,
         side TEXT NOT NULL,
         requestedPrice REAL NOT NULL,
@@ -151,6 +155,7 @@ class PersistenceDatabase {
     await db.execute('''
       CREATE TABLE IF NOT EXISTS closed_trades (
         id TEXT PRIMARY KEY,
+        portfolioId TEXT NOT NULL DEFAULT 'CRYPTO',
         symbol TEXT NOT NULL,
         entryPrice REAL NOT NULL,
         exitPrice REAL NOT NULL,
@@ -173,6 +178,7 @@ class PersistenceDatabase {
     await db.execute('''
       CREATE TABLE IF NOT EXISTS equity_snapshots (
         timestampMs INTEGER PRIMARY KEY,
+        portfolioId TEXT NOT NULL DEFAULT 'CRYPTO',
         equityUsdt REAL NOT NULL,
         availableCashUsdt REAL NOT NULL
       )
@@ -194,6 +200,8 @@ class PersistenceDatabase {
       )
     ''');
     await _createDiscoveredMarketsTable(db);
+    await _createPortfolioAccountsTable(db);
+    await _migrateAndSeedPortfoliosOnDb(db);
   }
 
   Future<void> _createDiscoveredMarketsTable(Database db) async {
@@ -230,11 +238,146 @@ class PersistenceDatabase {
     ''');
   }
 
+  Future<void> _createPortfolioAccountsTable(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS portfolio_accounts (
+        portfolioId TEXT PRIMARY KEY,
+        displayName TEXT NOT NULL,
+        startingBalanceUsdt REAL NOT NULL,
+        availableCashUsdt REAL NOT NULL,
+        accountEquityUsdt REAL NOT NULL,
+        startOfDayEquityUsdt REAL NOT NULL,
+        realizedPnlUsdt REAL NOT NULL DEFAULT 0.0,
+        maxDrawdownLocked INTEGER NOT NULL DEFAULT 0,
+        lockedDailyLossUtcDate TEXT,
+        lastStopLossClosedAtMs INTEGER,
+        consecutiveLosses INTEGER NOT NULL DEFAULT 0,
+        executionEnabled INTEGER NOT NULL DEFAULT 0,
+        isResearchOnly INTEGER NOT NULL DEFAULT 1,
+        activeStrategyId TEXT NOT NULL,
+        maxOpenPositions INTEGER NOT NULL DEFAULT 1,
+        updatedAtMs INTEGER NOT NULL
+      )
+    ''');
+  }
+
+  /// Section 10: Backward-compatible migration assigning all existing records to CRYPTO
+  /// without resetting balances or deleting history, and creating HIGH_VOLATILITY separately.
+  Future<void> _migrateAndSeedPortfoliosOnDb(Database db) async {
+    for (final table in [
+      'open_positions',
+      'orders',
+      'closed_trades',
+      'equity_snapshots',
+    ]) {
+      try {
+        await db.execute(
+          "ALTER TABLE $table ADD COLUMN portfolioId TEXT NOT NULL DEFAULT 'CRYPTO'",
+        );
+      } catch (_) {
+        // Column already exists
+      }
+    }
+
+    // Read existing Crypto account values from engine_kv_state if present
+    double cryptoCash = 100.0;
+    double cryptoEquity = 100.0;
+    double cryptoStartDay = 100.0;
+    int cryptoMaxDdLocked = 0;
+    String? cryptoLockedDate;
+    int? cryptoLastSlMs;
+
+    try {
+      final kvRows = await db.query('engine_kv_state');
+      final kv = <String, String>{
+        for (final r in kvRows) r['key'] as String: r['value'] as String,
+      };
+      double parseD(String k, double fb) {
+        final raw = kv[k];
+        if (raw == null) return fb;
+        try {
+          return (jsonDecode(raw) as num).toDouble();
+        } catch (_) {
+          return double.tryParse(raw) ?? fb;
+        }
+      }
+
+      cryptoCash = parseD('availableCashUsdt', 100.0);
+      cryptoEquity = parseD('accountEquityUsdt', 100.0);
+      cryptoStartDay = parseD('startOfDayEquityUsdt', 100.0);
+      cryptoMaxDdLocked = kv['maxDrawdownLocked'] == 'true' ? 1 : 0;
+      if (kv['lockedDailyLossUtcDate'] != null &&
+          kv['lockedDailyLossUtcDate'] != 'null') {
+        try {
+          cryptoLockedDate =
+              jsonDecode(kv['lockedDailyLossUtcDate']!)?.toString();
+        } catch (_) {
+          cryptoLockedDate = kv['lockedDailyLossUtcDate'];
+        }
+      }
+      if (kv['lastStopLossClosedAtMs'] != null &&
+          kv['lastStopLossClosedAtMs'] != 'null') {
+        cryptoLastSlMs = int.tryParse(kv['lastStopLossClosedAtMs']!);
+      }
+    } catch (_) {}
+
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    await db.insert(
+      'portfolio_accounts',
+      {
+        'portfolioId': PortfolioId.crypto.dbKey,
+        'displayName': PortfolioId.crypto.displayName,
+        'startingBalanceUsdt': 100.0,
+        'availableCashUsdt': cryptoCash,
+        'accountEquityUsdt': cryptoEquity,
+        'startOfDayEquityUsdt': cryptoStartDay,
+        'realizedPnlUsdt': cryptoEquity - 100.0,
+        'maxDrawdownLocked': cryptoMaxDdLocked,
+        'lockedDailyLossUtcDate': cryptoLockedDate,
+        'lastStopLossClosedAtMs': cryptoLastSlMs,
+        'consecutiveLosses': 0,
+        'executionEnabled': 1,
+        'isResearchOnly': 0,
+        'activeStrategyId': 'EMA_20_50_RSI_ATR_V1',
+        'maxOpenPositions': 1,
+        'updatedAtMs': nowMs,
+      },
+      conflictAlgorithm: ConflictAlgorithm.ignore,
+    );
+
+    await db.insert(
+      'portfolio_accounts',
+      {
+        'portfolioId': PortfolioId.highVolatility.dbKey,
+        'displayName': PortfolioId.highVolatility.displayName,
+        'startingBalanceUsdt': 100.0,
+        'availableCashUsdt': 100.0,
+        'accountEquityUsdt': 100.0,
+        'startOfDayEquityUsdt': 100.0,
+        'realizedPnlUsdt': 0.0,
+        'maxDrawdownLocked': 0,
+        'lockedDailyLossUtcDate': null,
+        'lastStopLossClosedAtMs': null,
+        'consecutiveLosses': 0,
+        'executionEnabled': 0,
+        'isResearchOnly': 1,
+        'activeStrategyId': 'HIGH_VOL_RESEARCH_CANDIDATE_V1',
+        'maxOpenPositions': 1,
+        'updatedAtMs': nowMs,
+      },
+      conflictAlgorithm: ConflictAlgorithm.ignore,
+    );
+  }
+
   /// Backward-compatible migration: preserves all existing tables, $100 account, open positions, orders & trade history.
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
     await _onCreate(db, newVersion);
     if (oldVersion < 4) {
       await _createDiscoveredMarketsTable(db);
+    }
+    if (oldVersion < 5) {
+      await _createPortfolioAccountsTable(db);
+      await _migrateAndSeedPortfoliosOnDb(db);
     }
   }
 
@@ -663,7 +806,7 @@ class PersistenceDatabase {
     if (db == null) return;
 
     await db.transaction((txn) async {
-      await txn.delete('open_positions');
+      await txn.delete('open_positions', where: "portfolioId = ?", whereArgs: ['CRYPTO']);
       for (final pos in openPositions) {
         await txn.insert(
           'open_positions',
@@ -723,20 +866,16 @@ class PersistenceDatabase {
       for (final r in kvRows) {
         kv[r['key'] as String] = r['value'] as String;
       }
-      final posRows =
-          await db.query('open_positions', orderBy: 'openedAtMs DESC');
+      final posRows = await db.query('open_positions', where: "portfolioId = ?", whereArgs: ['CRYPTO'], orderBy: 'openedAtMs DESC');
       openPos = posRows.map((r) => PaperPosition.fromMap(r)).toList();
 
-      final ordRows =
-          await db.query('orders', orderBy: 'executedAtMs DESC', limit: 100);
+      final ordRows = await db.query('orders', where: "portfolioId = ?", whereArgs: ['CRYPTO'], orderBy: 'executedAtMs DESC', limit: 100);
       ordList = ordRows.map((r) => SimulatedOrder.fromMap(r)).toList();
 
-      final trdRows = await db.query('closed_trades',
-          orderBy: 'closedAtMs DESC', limit: 100);
+      final trdRows = await db.query('closed_trades', where: "portfolioId = ?", whereArgs: ['CRYPTO'], orderBy: 'closedAtMs DESC', limit: 100);
       trdList = trdRows.map((r) => ClosedPaperTrade.fromMap(r)).toList();
 
-      final eqRows = await db.query('equity_snapshots',
-          orderBy: 'timestampMs DESC', limit: 120);
+      final eqRows = await db.query('equity_snapshots', where: "portfolioId = ?", whereArgs: ['CRYPTO'], orderBy: 'timestampMs DESC', limit: 120);
       eqCurve = eqRows.reversed
           .map((r) => EquityPoint(
                 timestampMs: (r['timestampMs'] as num).toInt(),
@@ -903,6 +1042,171 @@ class PersistenceDatabase {
       recoveryLogs: parseStringList('recoveryLogs'),
       scanDiagnostics: await loadScanCycleDiagnostics(),
     );
+  }
+
+  /// Section 3 & 10: Save an isolated PortfolioAccountSnapshot without affecting the other portfolio.
+  Future<void> savePortfolioAccountSnapshot(
+    PortfolioAccountSnapshot snapshot,
+  ) async {
+    _inMemoryPortfolioSnapshots[snapshot.portfolioId] = snapshot;
+    final db = await database;
+    if (db == null) return;
+
+    await db.transaction((txn) async {
+      await txn.insert(
+        'portfolio_accounts',
+        snapshot.toDbRow(),
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      await txn.delete(
+        'open_positions',
+        where: 'portfolioId = ?',
+        whereArgs: [snapshot.portfolioId.dbKey],
+      );
+      for (final pos in snapshot.openPositions) {
+        final map = pos.toMap();
+        map['portfolioId'] = snapshot.portfolioId.dbKey;
+        await txn.insert(
+          'open_positions',
+          map,
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+      }
+      for (final ord in snapshot.orders.take(100)) {
+        final map = ord.toMap();
+        map['portfolioId'] = snapshot.portfolioId.dbKey;
+        await txn.insert(
+          'orders',
+          map,
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+      }
+      for (final trd in snapshot.closedTrades.take(100)) {
+        final map = trd.toMap();
+        map['portfolioId'] = snapshot.portfolioId.dbKey;
+        await txn.insert(
+          'closed_trades',
+          map,
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+      }
+    });
+  }
+
+  /// Section 3 & 10: Load an isolated PortfolioAccountSnapshot from SQLite (or in-memory fallback).
+  Future<PortfolioAccountSnapshot?> loadPortfolioAccountSnapshot(
+    PortfolioId portfolioId,
+  ) async {
+    final db = await database;
+    if (db == null) {
+      return _inMemoryPortfolioSnapshots[portfolioId];
+    }
+
+    final rows = await db.query(
+      'portfolio_accounts',
+      where: 'portfolioId = ?',
+      whereArgs: [portfolioId.dbKey],
+      limit: 1,
+    );
+    if (rows.isEmpty) {
+      return _inMemoryPortfolioSnapshots[portfolioId];
+    }
+
+    final r = rows.first;
+    final posRows = await db.query(
+      'open_positions',
+      where: 'portfolioId = ?',
+      whereArgs: [portfolioId.dbKey],
+      orderBy: 'openedAtMs DESC',
+    );
+    final ordRows = await db.query(
+      'orders',
+      where: 'portfolioId = ?',
+      whereArgs: [portfolioId.dbKey],
+      orderBy: 'executedAtMs DESC',
+      limit: 100,
+    );
+    final trdRows = await db.query(
+      'closed_trades',
+      where: 'portfolioId = ?',
+      whereArgs: [portfolioId.dbKey],
+      orderBy: 'closedAtMs DESC',
+      limit: 100,
+    );
+    final eqRows = await db.query(
+      'equity_snapshots',
+      where: 'portfolioId = ?',
+      whereArgs: [portfolioId.dbKey],
+      orderBy: 'timestampMs DESC',
+      limit: 120,
+    );
+
+    final openPos = posRows.map((m) => PaperPosition.fromMap(m)).toList();
+    final orders = ordRows.map((m) => SimulatedOrder.fromMap(m)).toList();
+    final closedTrades =
+        trdRows.map((m) => ClosedPaperTrade.fromMap(m)).toList();
+    final eqCurve = eqRows.reversed
+        .map(
+          (m) => EquityPoint(
+            timestampMs: (m['timestampMs'] as num).toInt(),
+            equityUsdt: (m['equityUsdt'] as num).toDouble(),
+            portfolioId: portfolioId.dbKey,
+          ),
+        )
+        .toList();
+
+    final wins = closedTrades.where((t) => t.realizedPnlUsdt >= 0).length;
+    final losses = closedTrades.length - wins;
+    final realizedPnl =
+        (r['realizedPnlUsdt'] as num?)?.toDouble() ??
+        closedTrades.fold<double>(0.0, (acc, t) => acc + t.realizedPnlUsdt);
+    final isResearch = (r['isResearchOnly'] as num?)?.toInt() == 1;
+    final execEnabled = (r['executionEnabled'] as num?)?.toInt() == 1;
+    final stratId =
+        (r['activeStrategyId'] as String?) ??
+        (portfolioId == PortfolioId.crypto
+            ? 'EMA_20_50_RSI_ATR_V1'
+            : 'HIGH_VOL_RESEARCH_CANDIDATE_V1');
+
+    final loaded = PortfolioAccountSnapshot(
+      portfolioId: portfolioId,
+      displayName: (r['displayName'] as String?) ?? portfolioId.displayName,
+      startingBalanceUsdt:
+          (r['startingBalanceUsdt'] as num?)?.toDouble() ?? 100.0,
+      availableCashUsdt: (r['availableCashUsdt'] as num?)?.toDouble() ?? 100.0,
+      accountEquityUsdt: (r['accountEquityUsdt'] as num?)?.toDouble() ?? 100.0,
+      startOfDayEquityUsdt:
+          (r['startOfDayEquityUsdt'] as num?)?.toDouble() ?? 100.0,
+      realizedPnlUsdt: realizedPnl,
+      maxDrawdownLocked: (r['maxDrawdownLocked'] as num?)?.toInt() == 1,
+      lockedDailyLossUtcDate: r['lockedDailyLossUtcDate'] as String?,
+      lastStopLossClosedAtMs: (r['lastStopLossClosedAtMs'] as num?)?.toInt(),
+      consecutiveLosses: (r['consecutiveLosses'] as num?)?.toInt() ?? 0,
+      executionEnabled: execEnabled,
+      isResearchOnlyMode: isResearch,
+      liveTradingLocked: true,
+      activeStrategyId: stratId,
+      configuredMaxOpenPositions:
+          (r['maxOpenPositions'] as num?)?.toInt() ?? 1,
+      openPositions: openPos,
+      orders: orders,
+      closedTrades: closedTrades,
+      equityCurve: eqCurve,
+      learningContext: PortfolioLearningContext(
+        portfolioId: portfolioId,
+        activeStrategyId: stratId,
+        evaluatedClosedTradesCount: closedTrades.length,
+        observedWinningTrades: wins,
+        observedLosingTrades: losses,
+        cumulativeRealizedPnlUsdt: realizedPnl,
+      ),
+      statusSummary: isResearch
+          ? 'RESEARCH-ONLY MODE • High-Vol Crypto & Metals (XAUUSD/XAGUSD) • Execution Disabled Until Provider Verified'
+          : 'Active Paper Portfolio • CoinDCX Spot • \$100.00 Preserved Account',
+      updatedAtMs: (r['updatedAtMs'] as num?)?.toInt() ?? 0,
+    );
+    _inMemoryPortfolioSnapshots[portfolioId] = loaded;
+    return loaded;
   }
 
   Future<void> close() async {
