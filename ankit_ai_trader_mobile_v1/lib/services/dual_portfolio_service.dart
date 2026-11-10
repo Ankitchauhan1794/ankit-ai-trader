@@ -576,9 +576,8 @@ class DualPortfolioManager {
 
   /// Independent cash-flow ledgers per portfolio (Section 3)
   final Map<PortfolioId, CashFlowReconciliationLedger> _cashFlowLedgers = {
-    PortfolioId.crypto: CashFlowReconciliationLedger(initialCapitalUsd: 100.0),
-    PortfolioId.highVolatility:
-        CashFlowReconciliationLedger(initialCapitalUsd: 100.0),
+    PortfolioId.crypto: CashFlowReconciliationLedger(),
+    PortfolioId.highVolatility: CashFlowReconciliationLedger(),
   };
 
   /// Independent portfolio snapshots (Section 3)
