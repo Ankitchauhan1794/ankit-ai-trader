@@ -393,57 +393,35 @@ class TradingCoordinator extends ChangeNotifier {
   bool get isHighVolatilitySelected =>
       selectedPortfolioId == PortfolioId.highVolatility;
 
-  double get activeEquityUsdt => isHighVolatilitySelected
-      ? highVolatilityPortfolio.accountEquityUsdt
-      : accountEquityUsdt;
+  double get activeEquityUsdt => activePortfolio.accountEquityUsdt;
 
-  double get activeAvailableCashUsdt => isHighVolatilitySelected
-      ? highVolatilityPortfolio.availableCashUsdt
-      : availableCashUsdt;
+  double get activeAvailableCashUsdt => activePortfolio.availableCashUsdt;
 
-  double get activeStartOfDayEquityUsdt => isHighVolatilitySelected
-      ? highVolatilityPortfolio.startOfDayEquityUsdt
-      : startOfDayEquityUsdt;
+  double get activeStartOfDayEquityUsdt => activePortfolio.startOfDayEquityUsdt;
 
-  double get activeDailyPnlUsdt => isHighVolatilitySelected
-      ? highVolatilityPortfolio.dailyPnlUsdt
-      : dailyPnlUsdt;
+  double get activeDailyPnlUsdt => activePortfolio.dailyPnlUsdt;
 
-  double get activeOverallPnlUsdt => isHighVolatilitySelected
-      ? highVolatilityPortfolio.overallPnlUsdt
-      : overallPnlUsdt;
+  double get activeOverallPnlUsdt => activePortfolio.overallPnlUsdt;
 
-  double get activeDrawdownUsdt => isHighVolatilitySelected
-      ? highVolatilityPortfolio.currentDrawdownUsdt
-      : currentDrawdownUsdt;
+  double get activeDrawdownUsdt => activePortfolio.currentDrawdownUsdt;
 
-  double get activeUsedMarginUsdt => isHighVolatilitySelected
-      ? highVolatilityPortfolio.usedMarginUsdt
-      : usedMarginUsdt;
+  double get activeUsedMarginUsdt => activePortfolio.usedMarginUsdt;
 
-  double get activeFreeMarginUsdt => isHighVolatilitySelected
-      ? highVolatilityPortfolio.freeMarginUsdt
-      : freeMarginUsdt;
+  double get activeFreeMarginUsdt => activePortfolio.freeMarginUsdt;
 
-  double get activeRemainingDailyRiskUsdt => isHighVolatilitySelected
-      ? highVolatilityPortfolio.remainingDailyRiskBudgetUsdt
-      : remainingDailyRiskBudgetUsdt;
+  double get activeRemainingDailyRiskUsdt =>
+      activePortfolio.remainingDailyRiskBudgetUsdt;
 
-  double get activeRemainingDrawdownUsdt => isHighVolatilitySelected
-      ? highVolatilityPortfolio.remainingDrawdownBudgetUsdt
-      : remainingDrawdownBudgetUsdt;
+  double get activeRemainingDrawdownUsdt =>
+      activePortfolio.remainingDrawdownBudgetUsdt;
 
-  List<PaperPosition> get activeOpenPositions => isHighVolatilitySelected
-      ? highVolatilityPortfolio.openPositions
-      : openPositions;
+  List<PaperPosition> get activeOpenPositions => activePortfolio.openPositions;
 
-  List<ClosedPaperTrade> get activeClosedTrades => isHighVolatilitySelected
-      ? highVolatilityPortfolio.closedTrades
-      : closedTrades;
+  List<ClosedPaperTrade> get activeClosedTrades => activePortfolio.closedTrades;
 
-  List<EquityPoint> get activeEquityCurve => isHighVolatilitySelected
-      ? highVolatilityPortfolio.equityCurve
-      : equityCurve;
+  List<EquityPoint> get activeEquityCurve => activePortfolio.equityCurve.isNotEmpty
+      ? activePortfolio.equityCurve
+      : (isHighVolatilitySelected ? const [] : equityCurve);
 
   List<HighVolatilityClassificationResult>
       get highVolatilityMarketClassifications {
