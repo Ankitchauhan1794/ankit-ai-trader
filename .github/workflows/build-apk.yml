@@ -1,0 +1,71 @@
+name: Build Ankit AI Trader APK
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    branches:
+      - '**'
+  workflow_dispatch:
+
+jobs:
+  build-android-apk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ankit_ai_trader_mobile_v1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ensure Gradle 8.10.2 wrapper & clean unused WatchdogWorker
+        run: |
+          rm -f android/app/src/main/kotlin/com/ankit/aitrader/WatchdogWorker.kt
+          mkdir -p android/gradle/wrapper
+          sed -i 's|gradle-[0-9.]*-all.zip|gradle-8.10.2-all.zip|g; s|gradle-[0-9.]*-bin.zip|gradle-8.10.2-all.zip|g' android/gradle/wrapper/gradle-wrapper.properties || true
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Set up Flutter 3.27.4
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.27.4'
+          channel: 'stable'
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Run automated unit & integration tests (Stages 1 to 47)
+        run: flutter test test/stages_1_to_20_test.dart
+
+      - name: Build Release APK (with Maven/GitHub 504 network retry guard)
+        run: |
+          for attempt in 1 2 3; do
+            echo "Building Release APK (attempt $attempt/3)..."
+            if flutter build apk --release; then
+              echo "Release APK built successfully on attempt $attempt!"
+              exit 0
+            fi
+            echo "Attempt $attempt hit a transient artifact download timeout; retrying in 10s..."
+            sleep 10
+          done
+          exit 1
+
+      - name: Package APK for download
+        run: |
+          cp build/app/outputs/flutter-apk/app-release.apk ../Ankit_AI_Trader.apk
+
+      - name: Upload Final Downloadable APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ankit_AI_Trader_APK
+          path: Ankit_AI_Trader.apk
+          retention-days: 90
