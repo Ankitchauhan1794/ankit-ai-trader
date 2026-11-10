@@ -97,6 +97,7 @@ class TradingCoordinator extends ChangeNotifier {
   late final AppendOnlyEventLedger eventLedger;
   final IndependentRiskSupervisor riskSupervisor = IndependentRiskSupervisor();
   late final DeterministicExecutionEngine executionEngine;
+  late final DualPortfolioManager dualPortfolioManager;
   final StrategyRegistry strategyRegistry = StrategyRegistry();
   final QuantResearchValidator quantValidator = const QuantResearchValidator();
   final VpsAgentOrchestrator agentOrchestrator =
@@ -188,6 +189,7 @@ class TradingCoordinator extends ChangeNotifier {
     PersistenceDatabase? persistence,
     CoinDcxMarketService? marketService,
     EngineCommandBridge? commandBridge,
+    DualPortfolioManager? dualPortfolioManager,
     int Function()? nowMsProvider,
   })  : persistence = persistence ?? PersistenceDatabase(),
         marketService = marketService ?? CoinDcxMarketService(persistence: persistence),
@@ -199,7 +201,8 @@ class TradingCoordinator extends ChangeNotifier {
       ledger: eventLedger,
       riskSupervisor: riskSupervisor,
     );
-    dualPortfolioManager = DualPortfolioManager(persistence: this.persistence);
+    this.dualPortfolioManager =
+        dualPortfolioManager ?? DualPortfolioManager(persistence: this.persistence);
   }
 
   bool get isPaused =>
