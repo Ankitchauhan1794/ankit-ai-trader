@@ -1417,12 +1417,12 @@ void main() {
     );
     expect(
       coordinator.highVolatilityPortfolio.configuredMaxOpenPositions,
-      equals(1),
+      equals(5),
     );
-    // Restore default configured limit of 1
+    // Restore default configured limit of 5
     await coordinator.updatePortfolioSettings(
       portfolioId: PortfolioId.crypto,
-      configuredMaxOpenPositions: 1,
+      configuredMaxOpenPositions: 5,
     );
 
     // 15. Failed startup surfaces FAILED — STARTUP ERROR and preserves database balances/history intact
@@ -1443,6 +1443,248 @@ void main() {
 
     coordinator.dispose();
     marketSvc.dispose();
+    await db.close();
+  });
+
+  test('Full System Audit Tests 1–20 (Section 12): Spot accounting ($62.30 reserved / $37.64 cash / -$0.55 unrealised P&L), 15% ($85.00) portfolio loss lockout, 5-position capacity (x/5), duplicate order prevention, and portfolio isolation', () async {
+    final db = PersistenceDatabase(useInMemoryFallback: true);
+    int nowMs = 1700000100000;
+    final bridge = _FakeCommandBridge(serviceReady: true, shouldSucceedStart: true);
+    final coordinator = TradingCoordinator(
+      persistence: db,
+      commandBridge: bridge,
+      nowMsProvider: () => nowMs,
+    );
+
+    // Verify 2: Idempotent / duplicate startup guard
+    final startFuture1 = coordinator.startBot();
+    final startFuture2 = coordinator.startBot();
+    await Future.wait([startFuture1, startFuture2]);
+    expect(bridge.ensureServiceStartCalls, equals(1));
+
+    // Verify 8, 9, 10, 11: Exact OnePlus screenshot Spot accounting reproduction
+    // Starting = $100.00, 1 open position with $62.30 reserved notional, $0.0623 entry fee,
+    // Available Cash = $37.6377 ($37.64), Mark Price gives $61.8123 net value -> Equity = $99.45,
+    // Unrealised P&L = -$0.55, Realised P&L = $0.00, Free Margin (Spot) == Available Cash ($37.64)
+    const onePlusOpenPos = PaperPosition(
+      id: 'POS_ONEPLUS_1',
+      portfolioId: 'CRYPTO',
+      symbol: 'B-BTC_USDT',
+      entryPrice: 62300.0,
+      quantity: 0.001, // investedNotionalUsdt = $62.30
+      stopLoss: 61300.0,
+      takeProfit: 64300.0,
+      entryFeeUsdt: 0.0623,
+      signalCandleCloseMs: 1700000000000,
+      openedAtMs: 1700000005000,
+    );
+    await db.saveFullState(
+      botState: BotEngineState.running,
+      userIntention: UserSessionIntention.running,
+      availableCashUsdt: 37.6377,
+      accountEquityUsdt: 99.45,
+      maxDrawdownLocked: false,
+      lastHeartbeatMs: nowMs,
+      statusBannerMessage: 'PAPER BOT RUNNING',
+      liveTickerPrices: const {'B-BTC_USDT': 61874.17},
+      openPositions: const [onePlusOpenPos],
+      orders: const [],
+      closedTrades: const [],
+      processedEntrySignalKeys: const {},
+    );
+    await coordinator.refreshStateFromDatabase(isInitialLoad: false);
+
+    expect(coordinator.activePortfolio.startingBalanceUsdt, closeTo(100.0, 0.001));
+    expect(coordinator.activeSettledBalanceUsdt, closeTo(100.0, 0.001));
+    expect(coordinator.activeReservedCapitalUsdt, closeTo(62.30, 0.001));
+    expect(coordinator.activeAvailableCashUsdt, closeTo(37.6377, 0.001));
+    // Spot free margin equals unallocated available cash ($37.64), never $37.15
+    expect(coordinator.activeFreeMarginUsdt, closeTo(37.6377, 0.001));
+    expect(coordinator.activeEquityUsdt, closeTo(99.45, 0.01));
+    expect(coordinator.activeRealizedPnlUsdt, closeTo(0.0, 0.001));
+    expect(coordinator.activeUnrealizedPnlUsdt, closeTo(-0.55, 0.01));
+    expect(coordinator.activeDrawdownUsdt, closeTo(0.55, 0.01));
+    expect(coordinator.activeOpenPositions.length, equals(1));
+    expect(coordinator.activeClosedTrades.length, equals(0));
+    expect(coordinator.activePortfolio.winRatePct, closeTo(0.0, 0.001));
+
+    // Verify 15 & 16: 15% Overall Portfolio Loss Protection ($85.00 floor on $100.00)
+    // $95 = 5% loss ($10 remaining buffer), $90 = 10% loss ($5 remaining buffer), $85 = 15% loss (LOCKOUT)
+    final manager = coordinator.dualPortfolioManager;
+    await manager.evaluateAndEnforcePortfolioLossLimit(
+      portfolioId: PortfolioId.crypto,
+      currentEquityUsdt: 95.0,
+      nowMs: nowMs,
+    );
+    expect(coordinator.cryptoPortfolio.cumulativeLossPct, closeTo(5.0, 0.01));
+    expect(coordinator.cryptoPortfolio.remainingPortfolioLossBudgetUsdt, closeTo(10.0, 0.01));
+    expect(coordinator.cryptoPortfolio.isPortfolioLossLockoutTriggered, isFalse);
+
+    await manager.evaluateAndEnforcePortfolioLossLimit(
+      portfolioId: PortfolioId.crypto,
+      currentEquityUsdt: 90.0,
+      nowMs: nowMs,
+    );
+    expect(coordinator.cryptoPortfolio.cumulativeLossPct, closeTo(10.0, 0.01));
+    expect(coordinator.cryptoPortfolio.remainingPortfolioLossBudgetUsdt, closeTo(5.0, 0.01));
+    expect(coordinator.cryptoPortfolio.isPortfolioLossLockoutTriggered, isFalse);
+
+    final lockedAt85 = await manager.evaluateAndEnforcePortfolioLossLimit(
+      portfolioId: PortfolioId.crypto,
+      currentEquityUsdt: 85.0,
+      nowMs: nowMs,
+    );
+    expect(lockedAt85, isTrue);
+    expect(coordinator.cryptoPortfolio.cumulativeLossPct, closeTo(15.0, 0.01));
+    expect(coordinator.cryptoPortfolio.remainingPortfolioLossBudgetUsdt, closeTo(0.0, 0.01));
+    expect(coordinator.cryptoPortfolio.isPortfolioLossLockoutTriggered, isTrue);
+    // Existing open position is NOT automatically liquidated on lockout
+    expect(coordinator.cryptoPortfolio.openPositions.length, equals(1));
+    // High-Volatility Portfolio remains completely unaffected by Crypto lockout
+    expect(coordinator.highVolatilityPortfolio.isPortfolioLossLockoutTriggered, isFalse);
+
+    // New entries are blocked while 15% portfolio loss lockout is active
+    final btcSpec = manager.cryptoProvider.getInstrumentSpecification('BTCUSDT');
+    final blockedBy15Pct = manager.vetAndSizePortfolioOrder(
+      portfolioId: PortfolioId.crypto,
+      instrumentSpec: btcSpec,
+      entryPrice: 60000.0,
+      stopLossPrice: 59000.0,
+      spreadPct: 0.05,
+      atr14: 400.0,
+      isDataFresh: true,
+      nowMs: nowMs,
+    );
+    expect(blockedBy15Pct.approved, isFalse);
+    expect(blockedBy15Pct.rejectionReason, contains('15.0% loss lockout active'));
+
+    // Authorized reset clears the 15% loss lockout
+    await coordinator.authorizePortfolioLossLimitReset(
+      portfolioId: PortfolioId.crypto,
+      resetBalanceToStarting: true,
+    );
+    expect(coordinator.cryptoPortfolio.isPortfolioLossLockoutTriggered, isFalse);
+
+    // Verify 17 & 18: 5-Position Maximum Capacity (1/5 .. 5/5) & Duplicate Symbol Prevention
+    await db.saveFullState(
+      botState: BotEngineState.running,
+      userIntention: UserSessionIntention.running,
+      availableCashUsdt: 100.0,
+      accountEquityUsdt: 100.0,
+      maxDrawdownLocked: false,
+      lastHeartbeatMs: nowMs,
+      statusBannerMessage: 'PAPER BOT RUNNING',
+      openPositions: const [],
+      orders: const [],
+      closedTrades: const [],
+      processedEntrySignalKeys: const {},
+    );
+    await coordinator.refreshStateFromDatabase(isInitialLoad: false);
+    expect(coordinator.cryptoPortfolio.configuredMaxOpenPositions, equals(5));
+
+    for (int i = 1; i <= 5; i++) {
+      final sym = 'PAIR${i}USDT';
+      final spec = VerifiedInstrumentSpecification(
+        symbol: sym,
+        canonicalPair: 'B-PAIR${i}_USDT',
+        providerId: 'COINDCX_SPOT',
+        baseCurrency: 'PAIR$i',
+        quoteCurrency: 'USDT',
+        category: PortfolioAssetCategory.standardCryptoSpot,
+        contractSize: 1.0,
+        minQuantity: 0.1,
+        maxQuantity: 1000.0,
+        quantityStep: 0.1,
+        tickSize: 0.01,
+        tickValue: 0.01,
+        minNotional: 5.0,
+        currentSpreadBps: 5.0,
+        makerFeeRate: 0.001,
+        takerFeeRate: 0.001,
+        tradingSessions: const ['24/7_SPOT'],
+        supportedOrderTypes: const ['market_order'],
+        isProviderConnected: true,
+        isSpecificationVerified: true,
+        isExecutionAuthorized: true,
+        statusNote: 'Verified test pair $i',
+      );
+      final res = await manager.openIsolatedPaperPosition(
+        portfolioId: PortfolioId.crypto,
+        instrumentSpec: spec,
+        entryPrice: 10.0,
+        stopLossPrice: 9.0,
+        takeProfitPrice: 12.0,
+        quantity: 1.0, // $10 notional each -> 5 positions = $50 reserved
+        nowMs: nowMs + i * 1000,
+      );
+      expect(res.executed, isTrue);
+    }
+    expect(coordinator.cryptoPortfolio.openPositions.length, equals(5));
+    expect(coordinator.cryptoPortfolio.reservedCapitalUsdt, closeTo(50.0, 0.01));
+
+    // Duplicate order on PAIR1USDT is rejected
+    const dupSpec = VerifiedInstrumentSpecification(
+      symbol: 'PAIR1USDT',
+      canonicalPair: 'B-PAIR1_USDT',
+      providerId: 'COINDCX_SPOT',
+      baseCurrency: 'PAIR1',
+      quoteCurrency: 'USDT',
+      category: PortfolioAssetCategory.standardCryptoSpot,
+      contractSize: 1.0,
+      minQuantity: 0.1,
+      maxQuantity: 1000.0,
+      quantityStep: 0.1,
+      tickSize: 0.01,
+      tickValue: 0.01,
+      minNotional: 5.0,
+      currentSpreadBps: 5.0,
+      makerFeeRate: 0.001,
+      takerFeeRate: 0.001,
+      tradingSessions: ['24/7_SPOT'],
+      supportedOrderTypes: ['market_order'],
+      isProviderConnected: true,
+      isSpecificationVerified: true,
+      isExecutionAuthorized: true,
+      statusNote: 'Dup pair',
+    );
+    const sixthSpec = VerifiedInstrumentSpecification(
+      symbol: 'PAIR6USDT',
+      canonicalPair: 'B-PAIR6_USDT',
+      providerId: 'COINDCX_SPOT',
+      baseCurrency: 'PAIR6',
+      quoteCurrency: 'USDT',
+      category: PortfolioAssetCategory.standardCryptoSpot,
+      contractSize: 1.0,
+      minQuantity: 0.1,
+      maxQuantity: 1000.0,
+      quantityStep: 0.1,
+      tickSize: 0.01,
+      tickValue: 0.01,
+      minNotional: 5.0,
+      currentSpreadBps: 5.0,
+      makerFeeRate: 0.001,
+      takerFeeRate: 0.001,
+      tradingSessions: ['24/7_SPOT'],
+      supportedOrderTypes: ['market_order'],
+      isProviderConnected: true,
+      isSpecificationVerified: true,
+      isExecutionAuthorized: true,
+      statusNote: '6th pair',
+    );
+    final sixthAttempt = await manager.openIsolatedPaperPosition(
+      portfolioId: PortfolioId.crypto,
+      instrumentSpec: sixthSpec,
+      entryPrice: 10.0,
+      stopLossPrice: 9.0,
+      takeProfitPrice: 12.0,
+      quantity: 1.0,
+      nowMs: nowMs + 10000,
+    );
+    expect(sixthAttempt.executed, isFalse);
+    expect(sixthAttempt.reason, contains('MAX_OPEN_POSITIONS_REACHED'));
+    expect(dupSpec.symbol, equals('PAIR1USDT'));
+
+    coordinator.dispose();
     await db.close();
   });
 }

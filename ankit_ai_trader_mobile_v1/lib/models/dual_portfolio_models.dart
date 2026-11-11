@@ -258,6 +258,8 @@ class PortfolioAccountSnapshot {
   final String activeStrategyId;
   final int configuredMaxOpenPositions;
   final int architecturalMaxPositionCapacity;
+  final double maxPortfolioLossPct;
+  final bool portfolioLossLockoutActive;
   final List<PaperPosition> openPositions;
   final List<SimulatedOrder> orders;
   final List<ClosedPaperTrade> closedTrades;
@@ -285,8 +287,10 @@ class PortfolioAccountSnapshot {
     required this.isResearchOnlyMode,
     this.liveTradingLocked = true,
     this.activeStrategyId = 'EMA_20_50_RSI_ATR_V1',
-    this.configuredMaxOpenPositions = 1,
+    this.configuredMaxOpenPositions = 5,
     this.architecturalMaxPositionCapacity = 5,
+    this.maxPortfolioLossPct = 15.0,
+    this.portfolioLossLockoutActive = false,
     this.openPositions = const [],
     this.orders = const [],
     this.closedTrades = const [],
@@ -297,6 +301,25 @@ class PortfolioAccountSnapshot {
     required this.statusSummary,
     this.updatedAtMs = 0,
   });
+
+  double get settledBalanceUsdt =>
+      startingBalanceUsdt +
+      totalDepositsUsdt -
+      totalWithdrawalsUsdt +
+      realizedPnlUsdt;
+
+  double get reservedCapitalUsdt => openPositions.fold<double>(
+        0.0,
+        (acc, p) => acc + p.investedNotionalUsdt,
+      );
+
+  double get openPositionEntryFeesUsdt => openPositions.fold<double>(
+        0.0,
+        (acc, p) => acc + p.entryFeeUsdt,
+      );
+
+  double get openPositionMarketValueUsdt =>
+      (accountEquityUsdt - availableCashUsdt).clamp(0.0, double.infinity);
 
   double get dailyPnlUsdt => accountEquityUsdt - startOfDayEquityUsdt;
 
@@ -309,13 +332,31 @@ class PortfolioAccountSnapshot {
   double get currentDrawdownUsdt =>
       (startingBalanceUsdt - accountEquityUsdt).clamp(0.0, startingBalanceUsdt);
 
-  double get usedMarginUsdt => openPositions.fold<double>(
-        0.0,
-        (acc, p) => acc + p.investedNotionalUsdt,
-      );
+  double get cumulativeLossPct => startingBalanceUsdt > 0
+      ? (currentDrawdownUsdt / startingBalanceUsdt) * 100.0
+      : 0.0;
 
-  double get freeMarginUsdt =>
-      (accountEquityUsdt - usedMarginUsdt).clamp(0.0, double.infinity);
+  double get maxPortfolioLossUsdt =>
+      startingBalanceUsdt * (maxPortfolioLossPct / 100.0);
+
+  double get portfolioLossFloorUsdt =>
+      (startingBalanceUsdt - maxPortfolioLossUsdt)
+          .clamp(0.0, startingBalanceUsdt);
+
+  double get remainingPortfolioLossBudgetUsdt =>
+      (accountEquityUsdt - portfolioLossFloorUsdt)
+          .clamp(0.0, maxPortfolioLossUsdt);
+
+  bool get isPortfolioLossLockoutTriggered =>
+      portfolioLossLockoutActive ||
+      maxDrawdownLocked ||
+      accountEquityUsdt <= portfolioLossFloorUsdt + 1e-9;
+
+  /// Spot trading compatibility alias: reserved capital in active spot positions.
+  double get usedMarginUsdt => reservedCapitalUsdt;
+
+  /// In Spot trading (no leverage), free unallocated buying power equals availableCashUsdt.
+  double get freeMarginUsdt => availableCashUsdt;
 
   double get remainingDailyRiskBudgetUsdt {
     final usedLoss =
@@ -351,6 +392,8 @@ class PortfolioAccountSnapshot {
     bool? isResearchOnlyMode,
     String? activeStrategyId,
     int? configuredMaxOpenPositions,
+    double? maxPortfolioLossPct,
+    bool? portfolioLossLockoutActive,
     List<PaperPosition>? openPositions,
     List<SimulatedOrder>? orders,
     List<ClosedPaperTrade>? closedTrades,
@@ -383,6 +426,9 @@ class PortfolioAccountSnapshot {
       configuredMaxOpenPositions:
           configuredMaxOpenPositions ?? this.configuredMaxOpenPositions,
       architecturalMaxPositionCapacity: architecturalMaxPositionCapacity,
+      maxPortfolioLossPct: maxPortfolioLossPct ?? this.maxPortfolioLossPct,
+      portfolioLossLockoutActive:
+          portfolioLossLockoutActive ?? this.portfolioLossLockoutActive,
       openPositions: openPositions ?? this.openPositions,
       orders: orders ?? this.orders,
       closedTrades: closedTrades ?? this.closedTrades,
@@ -411,6 +457,8 @@ class PortfolioAccountSnapshot {
         'isResearchOnly': isResearchOnlyMode ? 1 : 0,
         'activeStrategyId': activeStrategyId,
         'maxOpenPositions': configuredMaxOpenPositions,
+        'maxPortfolioLossPct': maxPortfolioLossPct,
+        'portfolioLossLockoutActive': portfolioLossLockoutActive ? 1 : 0,
         'updatedAtMs': updatedAtMs,
       };
 }

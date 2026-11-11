@@ -85,8 +85,13 @@ Future<void> backgroundServiceMain() async {
 
   try {
     await persistence.database;
+    await engine.loadPersistedStateIntoMemory();
     await channel.invokeMethod('acknowledgeEngineInitialized');
-    await engine.restoreSessionIfRunningIntended();
+    if (engine.userIntention == UserSessionIntention.running &&
+        !engine.maxDrawdownLocked &&
+        engine.lockedDailyLossUtcDate == null) {
+      await engine.startEngine();
+    }
   } catch (e) {
     try {
       await channel.invokeMethod('reportEngineFatalError', {
@@ -510,6 +515,23 @@ class _DashboardPageState extends State<DashboardPage>
               ),
             ],
           ),
+          const SizedBox(height: 6),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            decoration: BoxDecoration(
+              color: const Color(0xFF121A2B),
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: Text(
+              'Crypto Engine: ${_coordinator.cryptoEngineStatusLabel}  •  High-Vol Research: ${_coordinator.highVolatilityResearchStatusLabel}  •  High-Vol Execution: ${_coordinator.highVolatilityExecutionStatusLabel}',
+              style: const TextStyle(
+                fontSize: 9.5,
+                fontWeight: FontWeight.w600,
+                color: Colors.white70,
+              ),
+            ),
+          ),
           if (activeSnap.isResearchOnlyMode) ...[
             const SizedBox(height: 6),
             Container(
@@ -606,7 +628,7 @@ class _DashboardPageState extends State<DashboardPage>
                           ),
                           const SizedBox(height: 2),
                           Text(
-                            '\$${_coordinator.activeEquityUsdt.toStringAsFixed(2)}',
+                            _formatUnsignedUsdt(_coordinator.activeEquityUsdt),
                             style: const TextStyle(
                               fontSize: 24,
                               fontWeight: FontWeight.bold,
@@ -615,7 +637,7 @@ class _DashboardPageState extends State<DashboardPage>
                           ),
                           const SizedBox(height: 4),
                           Text(
-                            'Balance: \$${_coordinator.activePortfolio.startingBalanceUsdt.toStringAsFixed(2)}  |  Available: \$${_coordinator.activeAvailableCashUsdt.toStringAsFixed(2)}',
+                            'Starting: ${_formatUnsignedUsdt(_coordinator.activePortfolio.startingBalanceUsdt)}  |  Settled Balance: ${_formatUnsignedUsdt(_coordinator.activeSettledBalanceUsdt)}',
                             style: const TextStyle(
                               fontSize: 11,
                               color: Colors.white70,
@@ -623,7 +645,15 @@ class _DashboardPageState extends State<DashboardPage>
                           ),
                           const SizedBox(height: 2),
                           Text(
-                            'Used Margin: \$${_coordinator.activeUsedMarginUsdt.toStringAsFixed(2)}  |  Free Margin: \$${_coordinator.activeFreeMarginUsdt.toStringAsFixed(2)}  |  ${_coordinator.activePortfolio.displayName}',
+                            'Available Cash: ${_formatUnsignedUsdt(_coordinator.activeAvailableCashUsdt)}  |  Reserved (Spot): ${_formatUnsignedUsdt(_coordinator.activeReservedCapitalUsdt)}',
+                            style: const TextStyle(
+                              fontSize: 10.5,
+                              color: Colors.white70,
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            'Realised P&L: ${_formatSignedUsdt(_coordinator.activeRealizedPnlUsdt)}  |  Unrealised P&L: ${_formatSignedUsdt(_coordinator.activeUnrealizedPnlUsdt)}  |  Positions: ${_coordinator.activeOpenPositions.length}/${_coordinator.activeMaxOpenPositions}',
                             style: const TextStyle(
                               fontSize: 10,
                               color: _mutedSlate,
@@ -659,7 +689,7 @@ class _DashboardPageState extends State<DashboardPage>
                           const SizedBox(width: 6),
                           Expanded(
                             child: _metricTile(
-                              'Drawdown (Max \$10)',
+                              'Drawdown (Max 15% / \$15)',
                               _formatUnsignedUsdt(dd),
                               valueColor: _cleanZero(dd) >= 5.0
                                   ? _redLoss
@@ -871,14 +901,25 @@ class _DashboardPageState extends State<DashboardPage>
               remDaily > 0.5 ? _greenProfit : _orangeWarn,
             ),
             _diagRow(
-              'Account Drawdown Limit / Remaining',
-              '\$10.00 max (\$90.00 floor) / \$${remDd.toStringAsFixed(2)} remaining',
-              remDd > 3.0 ? _greenProfit : _orangeWarn,
+              'Overall Portfolio Loss Limit (${_coordinator.activeMaxPortfolioLossPct.toStringAsFixed(0)}%)',
+              '\$${_coordinator.activeMaxPortfolioLossUsdt.toStringAsFixed(2)} max (\$${_coordinator.activePortfolioLossFloorUsdt.toStringAsFixed(2)} floor) / \$${_coordinator.activeRemainingPortfolioLossBudgetUsdt.toStringAsFixed(2)} remaining',
+              _coordinator.activeIsPortfolioLossLocked
+                  ? _redLoss
+                  : (_coordinator.activeRemainingPortfolioLossBudgetUsdt > 4.0
+                      ? _greenProfit
+                      : _orangeWarn),
             ),
             _diagRow(
-              'Configured Max Open Positions (Capacity <= 5)',
-              '${_coordinator.activeOpenPositions.length} / ${_coordinator.activePortfolio.configuredMaxOpenPositions} (Arch Max: ${_coordinator.activePortfolio.architecturalMaxPositionCapacity})',
+              'Open Positions / Max Capacity',
+              '${_coordinator.activeOpenPositions.length} / ${_coordinator.activeMaxOpenPositions} (Max 5 per portfolio)',
               Colors.white,
+            ),
+            _diagRow(
+              'Portfolio Risk Lockout State',
+              _coordinator.activeIsPortfolioLossLocked
+                  ? 'LOCKED (15% Loss Limit Reached — Reset Required)'
+                  : 'UNLOCKED (Healthy)',
+              _coordinator.activeIsPortfolioLossLocked ? _redLoss : _greenProfit,
             ),
             _diagRow(
               'Portfolio Execution Mode',
@@ -1412,7 +1453,7 @@ class _DashboardPageState extends State<DashboardPage>
                       borderRadius: BorderRadius.circular(6),
                     ),
                     child: const Text(
-                      'Performance not yet established — no completed paper trades recorded for this portfolio.',
+                      'Performance not yet established.',
                       style: TextStyle(fontSize: 11, color: Colors.white70),
                     ),
                   ),
@@ -1466,10 +1507,29 @@ class _DashboardPageState extends State<DashboardPage>
                   Colors.white70,
                 ),
                 _diagRow(
+                  'Realised P&L (Completed Trades)',
+                  _formatSignedUsdt(_coordinator.activeRealizedPnlUsdt),
+                  _cleanZero(_coordinator.activeRealizedPnlUsdt) >= 0
+                      ? _greenProfit
+                      : _redLoss,
+                ),
+                _diagRow(
+                  'Unrealised P&L (Open Spot Positions)',
+                  _formatSignedUsdt(_coordinator.activeUnrealizedPnlUsdt),
+                  _cleanZero(_coordinator.activeUnrealizedPnlUsdt) >= 0
+                      ? _greenProfit
+                      : _redLoss,
+                ),
+                _diagRow(
+                  'Reserved Spot Capital / Available Cash',
+                  '${_formatUnsignedUsdt(_coordinator.activeReservedCapitalUsdt)} reserved / ${_formatUnsignedUsdt(_coordinator.activeAvailableCashUsdt)} cash',
+                  Colors.white70,
+                ),
+                _diagRow(
                   'Actual Paper Trades',
                   hasCompletedTrades
                       ? '${_coordinator.activeClosedTrades.length} completed trade(s)'
-                      : '0 completed (Performance not yet established)',
+                      : 'Performance not yet established.',
                   Colors.white,
                 ),
                 _diagRow(
@@ -1513,14 +1573,16 @@ class _DashboardPageState extends State<DashboardPage>
                   _cleanZero(currentDd) > 0 ? _orangeWarn : _greenProfit,
                 ),
                 _diagRow(
-                  'Approved Max Account Drawdown Limit',
-                  '\$10.00 USDT (10.0% of \$100.00 • \$90.00 Floor)',
+                  'Overall Portfolio Loss Protection (15%)',
+                  '\$${_coordinator.activeMaxPortfolioLossUsdt.toStringAsFixed(2)} max (15.0% of \$100.00 • \$${_coordinator.activePortfolioLossFloorUsdt.toStringAsFixed(2)} Floor)',
                   Colors.white,
                 ),
                 _diagRow(
-                  'Remaining Drawdown Risk Buffer',
-                  '${_formatUnsignedUsdt(remDd)} remaining',
-                  remDd > 3.0 ? _greenProfit : _orangeWarn,
+                  'Remaining 15% Loss Protection Buffer',
+                  '${_formatUnsignedUsdt(_coordinator.activeRemainingPortfolioLossBudgetUsdt)} remaining',
+                  _coordinator.activeRemainingPortfolioLossBudgetUsdt > 4.0
+                      ? _greenProfit
+                      : _orangeWarn,
                 ),
                 const SizedBox(height: 8),
                 SizedBox(
@@ -1621,12 +1683,19 @@ class _DashboardPageState extends State<DashboardPage>
                 ),
                 const SizedBox(height: 8),
                 _diagRow(
-                  'Foreground Service Status',
+                  'Current Engine State',
+                  _coordinator.engineState.startupStateMachineLabel,
+                  _coordinator.engineState == BotEngineState.running
+                      ? _greenProfit
+                      : _orangeWarn,
+                ),
+                _diagRow(
+                  'Foreground Service State',
                   _coordinator.serviceRunning ? 'RUNNING (Alive)' : 'STOPPED',
                   _coordinator.serviceRunning ? _greenProfit : _orangeWarn,
                 ),
                 _diagRow(
-                  'Background Dart Engine Status',
+                  'Background Dart Engine State',
                   _coordinator.dartEngineInitialized
                       ? 'READY (Initialized)'
                       : 'NOT INITIALIZED',
@@ -1635,27 +1704,37 @@ class _DashboardPageState extends State<DashboardPage>
                       : _orangeWarn,
                 ),
                 _diagRow(
-                  'Last Successful Heartbeat',
+                  'Last Heartbeat',
                   _coordinator.formatHeartbeatStatus(),
                   Colors.white70,
                 ),
                 _diagRow(
-                  'Last Successful Market-Data Update',
-                  _coordinator.lastMarketDataUpdateMs != null
+                  'Last Successful Trading Cycle',
+                  _coordinator.scanDiagnostics.lastSuccessfulScanMs != null
                       ? TradingCoordinator.formatUtcHhMmSs(
-                          _coordinator.lastMarketDataUpdateMs!,
+                          _coordinator.scanDiagnostics.lastSuccessfulScanMs!,
                         )
                       : 'None recorded',
                   Colors.white70,
                 ),
                 _diagRow(
-                  'Last Startup Attempt',
-                  _coordinator.lastStartupAttemptMs != null
-                      ? TradingCoordinator.formatUtcHhMmSs(
-                          _coordinator.lastStartupAttemptMs!,
-                        )
-                      : 'None recorded',
-                  Colors.white70,
+                  'Current Portfolio',
+                  '${_coordinator.activePortfolio.displayName} (${_coordinator.activePortfolio.isResearchOnlyMode ? "RESEARCH-ONLY" : "PAPER ACTIVE"} • ${_formatUnsignedUsdt(_coordinator.activeEquityUsdt)})',
+                  Colors.white,
+                ),
+                _diagRow(
+                  'Network State',
+                  _coordinator.internetConnected
+                      ? 'CONNECTED (Online)'
+                      : 'DISCONNECTED (Offline)',
+                  _coordinator.internetConnected ? _greenProfit : _redLoss,
+                ),
+                _diagRow(
+                  'Market-Data Freshness',
+                  _coordinator.marketDataFreshnessLabel,
+                  _coordinator.marketDataFreshnessLabel.startsWith('FRESH')
+                      ? _greenProfit
+                      : _orangeWarn,
                 ),
                 _diagRow(
                   'Last Startup Error',
@@ -1670,23 +1749,42 @@ class _DashboardPageState extends State<DashboardPage>
                   Colors.white70,
                 ),
                 _diagRow(
-                  'Last Background-Cycle Error',
-                  _coordinator.lastBackgroundCycleError ?? 'None',
-                  _coordinator.lastBackgroundCycleError != null
-                      ? _orangeWarn
-                      : _greenProfit,
+                  'Risk-Lockout State',
+                  _coordinator.activeIsPortfolioLossLocked
+                      ? 'LOCKED — 15% Portfolio Loss Limit Reached (\$${_coordinator.activePortfolioLossFloorUsdt.toStringAsFixed(2)} floor)'
+                      : (_coordinator.lockedDailyLossUtcDate != null
+                          ? 'LOCKED — Daily Loss Limit (\$2.00) Reached'
+                          : 'UNLOCKED (Healthy)'),
+                  _coordinator.activeIsPortfolioLossLocked ? _redLoss : _greenProfit,
                 ),
                 _diagRow(
-                  'Current Portfolio State',
-                  '${_coordinator.activePortfolio.displayName} (${_coordinator.activePortfolio.isResearchOnlyMode ? "RESEARCH-ONLY" : "PAPER ACTIVE"} • ${_formatUnsignedUsdt(_coordinator.activeEquityUsdt)})',
+                  'Open Positions / Maximum Positions',
+                  '${_coordinator.activeOpenPositions.length} / ${_coordinator.activeMaxOpenPositions} (Max 5 per portfolio)',
                   Colors.white,
                 ),
-                _diagRow(
-                  'Current Network Status',
-                  _coordinator.internetConnected
-                      ? 'CONNECTED (Online)'
-                      : 'DISCONNECTED (Offline)',
-                  _coordinator.internetConnected ? _greenProfit : _redLoss,
+                const SizedBox(height: 10),
+                Text(
+                  'MAX SIMULTANEOUS OPEN POSITIONS (${_coordinator.activePortfolio.displayName}): ${_coordinator.activeOpenPositions.length} / ${_coordinator.activeMaxOpenPositions}',
+                  style: const TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                    color: _mutedSlate,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Wrap(
+                  spacing: 6,
+                  children: [1, 2, 3, 4, 5].map((maxPos) {
+                    final sel = _coordinator.activeMaxOpenPositions == maxPos;
+                    return ChoiceChip(
+                      label: Text('$maxPos / 5', style: const TextStyle(fontSize: 10)),
+                      selected: sel,
+                      onSelected: (_) => _coordinator.updatePortfolioSettings(
+                        portfolioId: _coordinator.selectedPortfolioId,
+                        configuredMaxOpenPositions: maxPos,
+                      ),
+                    );
+                  }).toList(),
                 ),
               ],
             ),
@@ -1775,7 +1873,7 @@ class _DashboardPageState extends State<DashboardPage>
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 Text(
-                  'OPEN POSITIONS (${positions.length})',
+                  'OPEN POSITIONS (${positions.length} / ${_coordinator.activeMaxOpenPositions})',
                   style: const TextStyle(
                     fontSize: 11,
                     fontWeight: FontWeight.bold,
@@ -1809,23 +1907,37 @@ class _DashboardPageState extends State<DashboardPage>
                     pos.entryPrice;
                 final upnl = pos.unrealizedPnlUsdt(mark);
                 return Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 4),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  padding: const EdgeInsets.symmetric(vertical: 5),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(
-                        '${pos.symbol} • Qty ${pos.quantity}',
-                        style: const TextStyle(
-                          fontWeight: FontWeight.bold,
-                          fontSize: 12,
-                        ),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(
+                            '${pos.symbol} • Qty ${pos.quantity}',
+                            style: const TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 12,
+                            ),
+                          ),
+                          Text(
+                            'Unrealised: ${_formatSignedUsdt(upnl)}',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 12,
+                              color:
+                                  _cleanZero(upnl) >= 0 ? _greenProfit : _redLoss,
+                            ),
+                          ),
+                        ],
                       ),
+                      const SizedBox(height: 2),
                       Text(
-                        '${upnl >= 0 ? "+" : ""}\$${upnl.toStringAsFixed(2)}',
-                        style: TextStyle(
-                          fontWeight: FontWeight.bold,
-                          fontSize: 12,
-                          color: upnl >= 0 ? _greenProfit : _redLoss,
+                        'Entry: \$${pos.entryPrice.toStringAsFixed(2)} | Mark: \$${mark.toStringAsFixed(2)} | Reserved: \$${pos.investedNotionalUsdt.toStringAsFixed(2)} | Fee: \$${pos.entryFeeUsdt.toStringAsFixed(2)} | SL: \$${pos.stopLoss.toStringAsFixed(2)} | TP: \$${pos.takeProfit.toStringAsFixed(2)}',
+                        style: const TextStyle(
+                          fontSize: 10,
+                          color: Colors.white70,
                         ),
                       ),
                     ],

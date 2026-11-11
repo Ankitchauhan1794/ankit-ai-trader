@@ -1,48 +1,46 @@
-# Ankit AI Trader — Critical Engine Startup Failure Fix & Full App Audit (`CHANGES.md`)
+# Ankit AI Trader — Full System Audit, Spot Accounting Repair & Risk Management (`CHANGES.md`)
 
-## 1. Root-Cause Findings (`START -> RUNNING -> STOPPED`)
-1. **Compiled APK Native Channel Mismatch + Optimistic UI State Overwrite (`TradingCoordinator.startBot` & `MainActivity.kt`)**:
-   - In `Ankit_AI_Trader_APK (8).zip`, the compiled `classes.dex` registered `com.ankit.aitrader/background_engine` but did not register `com.ankit.aitrader/service` (`startOrEnsureService`, `dispatchEngineCommand`, `getServiceStatus`).
-   - When `START` was tapped, `TradingCoordinator.startBot()` saved `userIntention = running` to SQLite, optimistically set `engineState = BotEngineState.running` in memory only (without updating `engine_kv_state['botState']`, which remained `'stopped'`), and called `notifyListeners()`—causing the UI to briefly display `RUNNING`.
-   - `ensureServiceStartedAndReady()` then threw `MissingPluginException` and returned `false`. Within 4 seconds, `_uiStateRefreshTimer` invoked `refreshStateFromDatabase(isInitialLoad: false)`, which read `snap.botState == BotEngineState.stopped` from SQLite and reverted `engineState` back to `STOPPED`.
-2. **Headless `FlutterEngine` Cold-Start Race & Premature Command Drop (`TradingForegroundService.kt`)**:
-   - `initBackgroundFlutterEngine` set `isDartEngineReady = true` synchronously before `backgroundServiceMain()` finished booting or registered its `MethodChannel` handler (`acknowledgeEngineInitialized`), and set `isDartEngineReady = true` inside `catch`.
-   - `dispatchCommandToDartEngine` used a fixed `150ms` delay and returned `callback(true)` on `notImplemented()` and `error()`, causing `"START"` to be dropped during isolate cold-start while reporting success.
-   - `MainActivity.kt` in `dispatchEngineCommand` previously triggered both `startTradingService(cmd)` (intent extra) and `dispatchCommandToDartEngine(cmd)`, dispatching duplicate concurrent commands.
-3. **Periodic Timer Freeze After `waitingForFreshData` (`AuthoritativeTradingEngine._startPeriodicTimer`)**:
-   - `_startPeriodicTimer()` previously checked `if (!_disposed && state == BotEngineState.running)`. If the first cycle temporarily entered `BotEngineState.waitingForFreshData`, the 15-second periodic timer stopped firing permanently and froze heartbeats.
-4. **Unbatched 472-Pair Candle Scan Blocking `startEngine()` (`AuthoritativeTradingEngine.executeTradingCycle`)**:
-   - `executeTradingCycle()` iterated over all `472` eligible USDT pairs sequentially (`944` HTTP candle requests) inside `startEngine()`.
+## 1. Branch Verification
+- Active working branch: `feature/dual-portfolio-foundation` (non-main development branch).
+- `main` branch and private backup repository (`ankit-ai-trader-backup`) were never modified.
 
-## 2. Exact Fixes Implemented (Tasks 1–9)
-- **`android/app/src/main/kotlin/com/ankit/aitrader/TradingForegroundService.kt`**:
-  - Added `waitForServiceAndEngineReady()` and `invokeCommandWithRetry()` so `isDartEngineReady` is only set `true` upon receiving `"acknowledgeEngineInitialized"` from `backgroundServiceMain()`.
-  - Explicitly invoked `GeneratedPluginRegistrant.registerWith(created)` on the headless `FlutterEngine`.
-  - Eliminated false-positive `callback(true)` in `error()` and `notImplemented()`, added native error/shutdown reason tracking (`lastStartupError`, `lastShutdownReason`), and wired live notification updates and trade alert notifications.
-- **`android/app/src/main/kotlin/com/ankit/aitrader/MainActivity.kt`**:
-  - Updated `startOrEnsureService` to await `TradingForegroundService.waitForServiceAndEngineReady`.
-  - Updated `dispatchEngineCommand` to avoid duplicate intent-extra command dispatches and return the true Dart engine acknowledgement.
-  - Exposed `lastNativeError` and `lastNativeShutdownReason` in `getServiceStatus`.
-- **`lib/models/trading_models.dart`**:
-  - Added `BotEngineState.starting` and `BotEngineState.failedStartupError` and `startupStateMachineLabel` (`STOPPED`, `STARTING`, `RUNNING`, `RUNNING — WAITING FOR VALID MARKET DATA`, `PAUSED — NETWORK OR DATA ISSUE`, `PAUSED — SAFETY RESTRICTION`, `FAILED — STARTUP ERROR`).
-  - Updated `CoinDcxMarketRecord.isActiveStatus` to require `hasValidSpecifications`.
-- **`lib/services/persistence_db.dart`**:
-  - Added `lastStartupAttemptMs`, `lastStartupError`, `lastShutdownReason`, and `lastBackgroundCycleError` to `PersistedEngineSnapshot`, `saveFullState`, `loadFullState`, and `saveStartupDiagnostics`.
-- **`lib/services/authoritative_engine.dart`**:
-  - Persisted `BotEngineState.running` and fresh heartbeat immediately on `startEngine()` before running the first scan cycle.
-  - Updated `_startPeriodicTimer()` to continue polling across `running`, `waitingForFreshData`, `pausedStaleData`, and `reconnecting` whenever `userIntention == UserSessionIntention.running`.
-  - Added rotating liquidity-prioritized candle batching (`maxCandleEvaluationPairsPerCycle = 12`) for large live catalogues (`> 12` pairs) while evaluating 100% of pairs when `<= 12`.
-  - Isolated non-fatal cycle errors into `lastBackgroundCycleError` without terminating the engine.
-- **`lib/services/trading_coordinator.dart`**:
-  - Implemented strict `STOPPED -> STARTING -> RUNNING / FAILED — STARTUP ERROR` state machine in `startBot()` with `_isStartupInFlight` mutex and verified initial cycle persistence.
-  - Added `showOnlyEligibleMarkets` filter and portfolio-isolated `setPortfolioStrategy` / `updatePortfolioSettings` methods.
-- **`lib/services/dual_portfolio_service.dart` & `lib/models/dual_portfolio_models.dart`**:
-  - Added portfolio-isolated strategy descriptors (`availableStrategiesFor`, `activeStrategyDescriptorFor`), `setPortfolioStrategy`, and `updatePortfolioSettings`, preserving each portfolio's strategy and settings across SQLite syncs.
-- **`lib/main.dart` & `lib/screens/dashboard_screen.dart`**:
-  - Added `ENGINE STARTUP & RUNTIME DIAGNOSTICS` card in `Settings` displaying all 10 required diagnostic fields.
-  - Fixed `-$0.00` negative-zero formatting (`_formatSignedUsdt`, `_formatUnsignedUsdt`, `_formatSignedPct`) so values within `±0.005` display `$0.00`.
-  - Fixed responsive two-line layout in `_buildPortfolioSelectorBar()` so `HIGH-VOLATILITY PORTFOLIO` is never truncated.
-  - Added `✓ Eligible Only` filter chip and explicit view-mode indicator in `Markets`.
-  - Updated `Reports` and `AI Lab` to clearly distinguish actual paper trades (`Performance not yet established` when 0 trades), backtests, simulated research, strategy candidates, and current drawdown vs the approved `$10.00` (`$90.00` floor) limit.
-- **`test/stages_1_to_20_test.dart` (and `phase1_trading_test.dart`, `service_watchdog_test.dart`, `stage47_1_market_discovery_test.dart`)**:
-  - Added `Startup Audit & Full Lifecycle Tests 1–15 (Tasks 1–9)` covering startup readiness, no-trade `RUNNING` persistence across periodic UI refreshes, temporary API outage recovery, stale data/stop-loss/risk vetoes, `PAUSE`/`RESUME`/`STOP`, startup failure handling, and portfolio strategy/settings isolation.
+## 2. Root Causes Identified & Resolved
+1. **Spot vs. Leveraged Margin Accounting Discrepancy (`$37.64` Cash, `$62.30` Used Margin, `$37.15` Free Margin, `-$0.55` P&L, `0` Closed Trades)**:
+   - Forensic reconciliation of the OnePlus screenshot values proved that `CRYPTO PORTFOLIO` had 1 active spot position with `$62.30` invested notional (`entryPrice * quantity`) and `$0.0623` (`0.1%`) entry fee deducted from `$100.00` starting balance, leaving `$37.6377` (`$37.64`) available cash. With mark-to-market position value at `$61.81` (net of estimated `0.1%` exit fee), total equity was `$37.64 + $61.81 = $99.45` (`Unrealised P&L = -$0.55`, `Drawdown = $0.55`, `Realised P&L = $0.00` across `0` closed trades).
+   - **Bug A (CFD Free Margin Formula on Spot Account)**: `freeMarginUsdt` previously computed `accountEquityUsdt - usedMarginUsdt` (`$99.45 - $62.30 = $37.15`), falsely subtracting the `-$0.55` unrealised position loss from unallocated cash (`$37.64`) and displaying `Free Margin: $37.15` next to `Available: $37.64`. Fixed so Spot `freeMarginUsdt == availableCashUsdt` and replaced leveraged margin labels with `Available Cash` and `Reserved (Spot)`.
+   - **Bug B (Home Stat Strip Mixing Closed Trade Count with Unrealised P&L)**: The Home stat strip showed `Trades (W/L): 0 (0/0)` (closed trades only) next to `Total Profit: -$0.55` (which included unrealised P&L), without showing `Positions: 1/5` or separating `Realised P&L ($0.00)` from `Unrealised P&L (-$0.55)`. Fixed across `Home`, `Trades`, and `Reports`.
+   - **Bug C (Background Isolate Race & Legacy `portfolioId` Filtering on `open_positions`)**: `backgroundServiceMain()` previously invoked `acknowledgeEngineInitialized` before loading persisted SQLite state into `AuthoritativeTradingEngine`, allowing an early `"START"` command to overwrite `open_positions` in SQLite. Additionally, `TradingCoordinator._applySnapshotToFields()` previously updated `DualPortfolioManager` asynchronously rather than synchronously in the same frame. Fixed by calling `await engine.loadPersistedStateIntoMemory()` before `acknowledgeEngineInitialized`, querying `(portfolioId = 'CRYPTO' OR portfolioId IS NULL OR portfolioId = '')`, and calling `dualPortfolioManager.syncCryptoPortfolioInMemory(snap)` synchronously inside `_applySnapshotToFields()`.
+2. **Automatic Startup -> Shutdown (`START -> RUNNING -> STOPPED`)**:
+   - Fixed in `MainActivity.kt`, `TradingForegroundService.kt`, `TradingCoordinator.startBot()`, and `AuthoritativeTradingEngine` with a single idempotent startup pathway (`_isStartupInFlight` mutex), native readiness polling (`waitForServiceAndEngineReady`), command retry queue (`invokeCommandWithRetry`), immediate state/heartbeat persistence, continuous timer polling during `waitingForFreshData`, and rotating 12-pair candle batching.
+
+## 3. Risk Management & Portfolio Enhancements (Sections 5, 6, 7, 10, 11)
+- **15% Overall Portfolio Loss Protection (`$85.00` Floor on `$100.00`)**:
+  - Implemented configurable per-portfolio `maxPortfolioLossPct` (default `15.0%` / `$15.00` max cumulative loss / `$85.00` equity floor on `$100.00` starting balance) in `RiskConfig`, `IndependentRiskSupervisor`, `PortfolioAccountSnapshot`, `DualPortfolioManager`, and `PersistenceDatabase` (Schema v6).
+  - At `<= $85.00` equity (`15%` loss), triggers `portfolioLossLockoutActive = true`, blocks new entries, persists the lockout state in SQLite, preserves existing open positions without forced liquidation, and requires `authorizePortfolioLossLimitReset` before resuming.
+  - Preserved the existing `$2.00` (`2%`) daily loss limit and `$1.00` (`1%`) per-trade risk cap.
+- **Configurable Maximum 5 Open Positions (`x / 5`)**:
+  - Updated `RiskConfig`, `PortfolioAccountSnapshot`, `IndependentRiskSupervisor`, and `DualPortfolioManager` to support up to `5` simultaneous open positions per portfolio (`configuredMaxOpenPositions = 5`, configurable `1..5` in `Settings`), counting both open positions and pending orders and blocking duplicate symbols.
+- **Distinct Portfolio Execution & Research Status Indicators**:
+  - Added explicit status indicators distinguishing `Crypto Engine: RUNNING / STOPPED`, `High-Vol Research: ACTIVE / IDLE`, and `High-Vol Execution: DISABLED (Research-Only)`.
+
+## 4. Modified & Newly Created Files in Delta ZIP
+- `CHANGES.md`
+- `ankit_ai_trader_mobile_v1/android/app/src/main/AndroidManifest.xml`
+- `ankit_ai_trader_mobile_v1/android/app/src/main/kotlin/com/ankit/aitrader/MainActivity.kt`
+- `ankit_ai_trader_mobile_v1/android/app/src/main/kotlin/com/ankit/aitrader/TradingForegroundService.kt`
+- `ankit_ai_trader_mobile_v1/android/app/src/main/res/mipmap-*/ic_launcher.png` (5 density icons)
+- `ankit_ai_trader_mobile_v1/lib/main.dart`
+- `ankit_ai_trader_mobile_v1/lib/models/dual_portfolio_models.dart`
+- `ankit_ai_trader_mobile_v1/lib/models/trading_models.dart`
+- `ankit_ai_trader_mobile_v1/lib/screens/dashboard_screen.dart`
+- `ankit_ai_trader_mobile_v1/lib/services/authoritative_engine.dart`
+- `ankit_ai_trader_mobile_v1/lib/services/coindcx_market_service.dart`
+- `ankit_ai_trader_mobile_v1/lib/services/dual_portfolio_service.dart`
+- `ankit_ai_trader_mobile_v1/lib/services/execution_and_risk_hub.dart`
+- `ankit_ai_trader_mobile_v1/lib/services/persistence_db.dart`
+- `ankit_ai_trader_mobile_v1/lib/services/risk_manager.dart`
+- `ankit_ai_trader_mobile_v1/lib/services/trading_coordinator.dart`
+- `ankit_ai_trader_mobile_v1/test/stages_1_to_20_test.dart`
+- `ankit_ai_trader_mobile_v1/test/phase1_trading_test.dart`
+- `ankit_ai_trader_mobile_v1/test/service_watchdog_test.dart`
+- `ankit_ai_trader_mobile_v1/test/stage47_1_market_discovery_test.dart`

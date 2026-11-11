@@ -578,8 +578,10 @@ class DualPortfolioManager {
       isResearchOnlyMode: false,
       liveTradingLocked: true,
       activeStrategyId: 'EMA_20_50_RSI_ATR_V1',
-      configuredMaxOpenPositions: 1,
+      configuredMaxOpenPositions: 5,
       architecturalMaxPositionCapacity: maxArchitecturalSimultaneousPositions,
+      maxPortfolioLossPct: 15.0,
+      portfolioLossLockoutActive: false,
       learningContext: const PortfolioLearningContext(
         portfolioId: PortfolioId.crypto,
         activeStrategyId: 'EMA_20_50_RSI_ATR_V1',
@@ -601,8 +603,10 @@ class DualPortfolioManager {
       isResearchOnlyMode: true,
       liveTradingLocked: true,
       activeStrategyId: 'HIGH_VOL_RESEARCH_CANDIDATE_V1',
-      configuredMaxOpenPositions: 1,
+      configuredMaxOpenPositions: 5,
       architecturalMaxPositionCapacity: maxArchitecturalSimultaneousPositions,
+      maxPortfolioLossPct: 15.0,
+      portfolioLossLockoutActive: false,
       learningContext: const PortfolioLearningContext(
         portfolioId: PortfolioId.highVolatility,
         activeStrategyId: 'HIGH_VOL_RESEARCH_CANDIDATE_V1',
@@ -745,6 +749,7 @@ class DualPortfolioManager {
   Future<void> updatePortfolioSettings({
     required PortfolioId portfolioId,
     int? configuredMaxOpenPositions,
+    double? maxPortfolioLossPct,
     String? statusSummary,
     int? nowMs,
   }) async {
@@ -753,8 +758,16 @@ class DualPortfolioManager {
     final clampedMaxPos = configuredMaxOpenPositions != null
         ? configuredMaxOpenPositions.clamp(1, maxArchitecturalSimultaneousPositions)
         : cur.configuredMaxOpenPositions;
+    final clampedLossPct = maxPortfolioLossPct != null
+        ? maxPortfolioLossPct.clamp(1.0, 50.0)
+        : cur.maxPortfolioLossPct;
+    final sup = _riskSupervisors[portfolioId]!;
+    sup.maxOpenPositionsLimit = clampedMaxPos;
+    sup.maxPortfolioLossPct = clampedLossPct;
+
     final updated = cur.copyWith(
       configuredMaxOpenPositions: clampedMaxPos,
+      maxPortfolioLossPct: clampedLossPct,
       statusSummary: statusSummary ?? cur.statusSummary,
       updatedAtMs: ts,
     );
@@ -762,29 +775,78 @@ class DualPortfolioManager {
     await persistence.savePortfolioAccountSnapshot(updated);
   }
 
-  Future<void> syncCryptoPortfolioFromEngineSnapshot(
-    PersistedEngineSnapshot snap,
-  ) async {
-    final persistedCrypto = await persistence.loadPortfolioAccountSnapshot(
-      PortfolioId.crypto,
+  Future<bool> evaluateAndEnforcePortfolioLossLimit({
+    required PortfolioId portfolioId,
+    required double currentEquityUsdt,
+    int? nowMs,
+  }) async {
+    final cur = _snapshots[portfolioId]!;
+    final sup = _riskSupervisors[portfolioId]!;
+    final ts = nowMs ?? DateTime.now().millisecondsSinceEpoch;
+    final locked = sup.checkAndUpdatePortfolioLossLockout(
+      currentEquityUsdt,
+      startingBalanceUsdt: cur.startingBalanceUsdt,
     );
-    if (persistedCrypto != null) {
-      _snapshots[PortfolioId.crypto] = _snapshots[PortfolioId.crypto]!.copyWith(
-        activeStrategyId: persistedCrypto.activeStrategyId,
-        configuredMaxOpenPositions: persistedCrypto.configuredMaxOpenPositions,
-      );
-    }
+    final updated = cur.copyWith(
+      accountEquityUsdt: currentEquityUsdt,
+      maxDrawdownLocked: locked || cur.maxDrawdownLocked,
+      portfolioLossLockoutActive: locked || cur.portfolioLossLockoutActive,
+      statusSummary: locked
+          ? 'RISK LOCKOUT ACTIVE: ${cur.maxPortfolioLossPct.toStringAsFixed(1)}% Portfolio Loss Limit (\$${cur.portfolioLossFloorUsdt.toStringAsFixed(2)} floor) reached'
+          : cur.statusSummary,
+      updatedAtMs: ts,
+    );
+    _snapshots[portfolioId] = updated;
+    await persistence.savePortfolioAccountSnapshot(updated);
+    return updated.isPortfolioLossLockoutTriggered;
+  }
+
+  Future<void> authorizePortfolioLossLimitReset({
+    required PortfolioId portfolioId,
+    bool resetBalanceToStarting = false,
+    int? nowMs,
+  }) async {
+    final cur = _snapshots[portfolioId]!;
+    final sup = _riskSupervisors[portfolioId]!;
+    final ts = nowMs ?? DateTime.now().millisecondsSinceEpoch;
+    sup.authorizePortfolioLossReset();
+    final updated = cur.copyWith(
+      availableCashUsdt:
+          resetBalanceToStarting ? cur.startingBalanceUsdt : cur.availableCashUsdt,
+      accountEquityUsdt:
+          resetBalanceToStarting ? cur.startingBalanceUsdt : cur.accountEquityUsdt,
+      maxDrawdownLocked: false,
+      portfolioLossLockoutActive: false,
+      consecutiveLosses: 0,
+      statusSummary: cur.isResearchOnlyMode
+          ? 'RESEARCH-ONLY MODE • High-Vol Crypto & Metals (XAUUSD/XAGUSD) • Execution Disabled Until Provider Verified'
+          : 'Active Paper Portfolio • CoinDCX Spot • \$${(resetBalanceToStarting ? cur.startingBalanceUsdt : cur.accountEquityUsdt).toStringAsFixed(2)} Account',
+      updatedAtMs: ts,
+    );
+    _snapshots[portfolioId] = updated;
+    await persistence.savePortfolioAccountSnapshot(updated);
+  }
+
+  void syncCryptoPortfolioInMemory(PersistedEngineSnapshot snap) {
     final cryptoPositions = snap.openPositions
-        .where((p) => p.portfolioId == PortfolioId.crypto.dbKey)
+        .where((p) =>
+            p.portfolioId.isEmpty ||
+            p.portfolioId == PortfolioId.crypto.dbKey)
         .toList();
     final cryptoOrders = snap.orders
-        .where((o) => o.portfolioId == PortfolioId.crypto.dbKey)
+        .where((o) =>
+            o.portfolioId.isEmpty ||
+            o.portfolioId == PortfolioId.crypto.dbKey)
         .toList();
     final cryptoTrades = snap.closedTrades
-        .where((t) => t.portfolioId == PortfolioId.crypto.dbKey)
+        .where((t) =>
+            t.portfolioId.isEmpty ||
+            t.portfolioId == PortfolioId.crypto.dbKey)
         .toList();
     final cryptoCurve = snap.equityCurve
-        .where((e) => e.portfolioId == PortfolioId.crypto.dbKey)
+        .where((e) =>
+            e.portfolioId.isEmpty ||
+            e.portfolioId == PortfolioId.crypto.dbKey)
         .toList();
 
     final realizedPnl = cryptoTrades.fold<double>(
@@ -810,13 +872,23 @@ class DualPortfolioManager {
     final losses = cryptoTrades.length - wins;
 
     final currentCrypto = _snapshots[PortfolioId.crypto]!;
+    final floorUsdt = currentCrypto.portfolioLossFloorUsdt;
+    final isLossLocked = snap.maxDrawdownLocked ||
+        currentCrypto.portfolioLossLockoutActive ||
+        snap.accountEquityUsdt <= floorUsdt + 1e-9;
+    final sup = _riskSupervisors[PortfolioId.crypto]!;
+    sup.portfolioLossLockoutActive = isLossLocked;
+    sup.maxOpenPositionsLimit = currentCrypto.configuredMaxOpenPositions;
+    sup.maxPortfolioLossPct = currentCrypto.maxPortfolioLossPct;
+
     final updatedCrypto = currentCrypto.copyWith(
       availableCashUsdt: snap.availableCashUsdt,
       accountEquityUsdt: snap.accountEquityUsdt,
       startOfDayEquityUsdt: snap.startOfDayEquityUsdt,
       realizedPnlUsdt: realizedPnl,
       unrealizedPnlUsdt: unrealizedPnl,
-      maxDrawdownLocked: snap.maxDrawdownLocked,
+      maxDrawdownLocked: isLossLocked,
+      portfolioLossLockoutActive: isLossLocked,
       lockedDailyLossUtcDate: snap.lockedDailyLossUtcDate,
       lastStopLossClosedAtMs: snap.lastStopLossClosedAtMs,
       openPositions: cryptoPositions,
@@ -840,7 +912,26 @@ class DualPortfolioManager {
     );
 
     _snapshots[PortfolioId.crypto] = updatedCrypto;
-    await persistence.savePortfolioAccountSnapshot(updatedCrypto);
+  }
+
+  Future<void> syncCryptoPortfolioFromEngineSnapshot(
+    PersistedEngineSnapshot snap,
+  ) async {
+    final persistedCrypto = await persistence.loadPortfolioAccountSnapshot(
+      PortfolioId.crypto,
+    );
+    if (persistedCrypto != null) {
+      _snapshots[PortfolioId.crypto] = _snapshots[PortfolioId.crypto]!.copyWith(
+        activeStrategyId: persistedCrypto.activeStrategyId,
+        configuredMaxOpenPositions: persistedCrypto.configuredMaxOpenPositions,
+        maxPortfolioLossPct: persistedCrypto.maxPortfolioLossPct,
+        portfolioLossLockoutActive: persistedCrypto.portfolioLossLockoutActive,
+      );
+    }
+    syncCryptoPortfolioInMemory(snap);
+    await persistence.savePortfolioAccountSnapshot(
+      _snapshots[PortfolioId.crypto]!,
+    );
 
     final persistedHighVol = await persistence.loadPortfolioAccountSnapshot(
       PortfolioId.highVolatility,
@@ -882,6 +973,8 @@ class DualPortfolioManager {
 
     final snap = _snapshots[portfolioId]!;
     final supervisor = _riskSupervisors[portfolioId]!;
+    supervisor.maxOpenPositionsLimit = snap.configuredMaxOpenPositions;
+    supervisor.maxPortfolioLossPct = snap.maxPortfolioLossPct;
 
     if (snap.isResearchOnlyMode || !snap.executionEnabled) {
       return (
@@ -1024,6 +1117,33 @@ class DualPortfolioManager {
     }
 
     final supervisor = _riskSupervisors[portfolioId]!;
+    supervisor.maxOpenPositionsLimit = snap.configuredMaxOpenPositions;
+    supervisor.maxPortfolioLossPct = snap.maxPortfolioLossPct;
+    if (snap.isPortfolioLossLockoutTriggered) {
+      supervisor.portfolioLossLockoutActive = true;
+      return (
+        executed: false,
+        reason:
+            'PORTFOLIO_LOSS_LIMIT_15PCT_LOCKOUT: ${snap.displayName} is locked at ${snap.maxPortfolioLossPct.toStringAsFixed(1)}% loss limit (\$${snap.portfolioLossFloorUsdt.toStringAsFixed(2)} floor).',
+        position: null,
+      );
+    }
+    if (snap.openPositions.length >= snap.configuredMaxOpenPositions) {
+      return (
+        executed: false,
+        reason:
+            'MAX_OPEN_POSITIONS_REACHED: ${snap.openPositions.length}/${snap.configuredMaxOpenPositions} open positions already active in ${snap.displayName}.',
+        position: null,
+      );
+    }
+    if (snap.openPositions.any((p) => p.symbol == instrumentSpec.symbol)) {
+      return (
+        executed: false,
+        reason:
+            'DUPLICATE_SYMBOL_POSITION: ${instrumentSpec.symbol} already has an open position in ${snap.displayName}.',
+        position: null,
+      );
+    }
     final feeRate = instrumentSpec.takerFeeRate ?? 0.001;
     final vet = supervisor.vetOrderRequest(
       symbol: instrumentSpec.symbol,
@@ -1147,11 +1267,18 @@ class DualPortfolioManager {
     final newTrades = [closedTrade, ...snap.closedTrades];
     final wins = newTrades.where((t) => t.realizedPnlUsdt >= 0).length;
     final losses = newTrades.length - wins;
+    final lossLockTriggered = supervisor.checkAndUpdatePortfolioLossLockout(
+      newEquity,
+      startingBalanceUsdt: snap.startingBalanceUsdt,
+    );
 
     final updated = snap.copyWith(
       availableCashUsdt: newCash,
       accountEquityUsdt: newEquity,
       realizedPnlUsdt: newRealized,
+      maxDrawdownLocked: lossLockTriggered || snap.maxDrawdownLocked,
+      portfolioLossLockoutActive:
+          lossLockTriggered || snap.portfolioLossLockoutActive,
       consecutiveLosses: supervisor.consecutiveLosses,
       lastStopLossClosedAtMs:
           realizedPnl < 0 ? nowMs : snap.lastStopLossClosedAtMs,

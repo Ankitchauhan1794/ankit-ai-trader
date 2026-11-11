@@ -58,6 +58,7 @@ class AuthoritativeTradingEngine {
   Timer? _cycleTimer;
   bool _isCycleInFlight = false;
   bool _disposed = false;
+  bool _hasLoadedPersistedState = false;
   int _candleScanCursor = 0;
 
   AuthoritativeTradingEngine({
@@ -77,7 +78,7 @@ class AuthoritativeTradingEngine {
         _nowMs =
             nowMsProvider ?? (() => DateTime.now().millisecondsSinceEpoch);
 
-  Future<void> restoreSessionIfRunningIntended() async {
+  Future<void> loadPersistedStateIntoMemory() async {
     final snap = await persistence.loadFullState();
     state = snap.botState;
     userIntention = snap.userIntention;
@@ -108,6 +109,21 @@ class AuthoritativeTradingEngine {
     processedEntrySignalKeys = Set.from(snap.processedEntrySignalKeys);
     scanDiagnostics = snap.scanDiagnostics;
 
+    // Self-heal Spot accounting if cash and equity diverged while 0 positions are open
+    if (openPositions.isEmpty &&
+        (accountEquityUsdt - availableCashUsdt).abs() > 0.01) {
+      final realizedSum = closedTrades.fold<double>(
+        0.0,
+        (acc, t) => acc + t.realizedPnlUsdt,
+      );
+      availableCashUsdt = 100.0 + realizedSum;
+      accountEquityUsdt = availableCashUsdt;
+    }
+    _hasLoadedPersistedState = true;
+  }
+
+  Future<void> restoreSessionIfRunningIntended() async {
+    await loadPersistedStateIntoMemory();
     if (userIntention == UserSessionIntention.running &&
         !maxDrawdownLocked &&
         lockedDailyLossUtcDate == null) {
@@ -116,6 +132,9 @@ class AuthoritativeTradingEngine {
   }
 
   Future<bool> startEngine() async {
+    if (!_hasLoadedPersistedState) {
+      await loadPersistedStateIntoMemory();
+    }
     final now = _nowMs();
     lastStartupAttemptMs = now;
     lastStartupError = null;
@@ -123,12 +142,15 @@ class AuthoritativeTradingEngine {
     if (maxDrawdownLocked ||
         riskManager.shouldStopForMaxDrawdown(accountEquityUsdt)) {
       maxDrawdownLocked = true;
+      riskSupervisor.portfolioLossLockoutActive = true;
       state = BotEngineState.stoppedMaxDrawdownReached;
+      final floorStr =
+          riskManager.config.equityFloorUsdt.toStringAsFixed(2);
       lastStartupError =
-          'Cannot start: Maximum drawdown floor (\$90.00) reached.';
+          'Cannot start: 15% Portfolio Loss Limit (\$$floorStr floor) reached — authorized reset required.';
       lastShutdownReason = lastStartupError;
       statusBannerMessage =
-          'PAUSED_BY_RISK: Max drawdown floor (\$90.00) reached.';
+          'PAUSED_BY_RISK: 15% Portfolio Loss Limit (\$$floorStr floor) reached.';
       await _persistCurrentState(now);
       return false;
     }
@@ -455,9 +477,10 @@ class AuthoritativeTradingEngine {
       if (riskManager.shouldStopForMaxDrawdown(accountEquityUsdt)) {
         maxDrawdownLocked = true;
         state = BotEngineState.stoppedMaxDrawdownReached;
-        lastShutdownReason = 'Max drawdown floor (\$90.00) reached';
+        riskSupervisor.portfolioLossLockoutActive = true;
+        lastShutdownReason = '15% Portfolio Loss Limit (\$85.00 floor) reached';
         statusBannerMessage =
-            'PAUSED_BY_RISK: Max drawdown floor (\$90.00) reached.';
+            'PAUSED_BY_RISK: 15% Portfolio Loss Limit (\$85.00 floor) reached.';
         await _persistCurrentState(now);
         return;
       }
@@ -774,10 +797,10 @@ class AuthoritativeTradingEngine {
       if (state == BotEngineState.running) {
         if (acceptedOrders > 0) {
           statusBannerMessage =
-              'PAPER BOT RUNNING • Executed $acceptedOrders Order(s) • Open: ${openPositions.length}/1';
+              'PAPER BOT RUNNING • Executed $acceptedOrders Order(s) • Open: ${openPositions.length}/${riskManager.config.maxConcurrentOpenPositions}';
         } else {
           statusBannerMessage =
-              'PAPER BOT RUNNING • Scanned $evaluatedCount/${eligibleMarkets.length} Eligible Pairs (No valid entry signal) • Open: ${openPositions.length}/1';
+              'PAPER BOT RUNNING • Scanned $evaluatedCount/${eligibleMarkets.length} Eligible Pairs (No valid entry signal) • Open: ${openPositions.length}/${riskManager.config.maxConcurrentOpenPositions}';
         }
       }
 
@@ -785,7 +808,7 @@ class AuthoritativeTradingEngine {
       if (onNotificationUpdate != null) {
         await onNotificationUpdate!(
           'Ankit AI Trader (${state.dashboardLabel})',
-          'Equity: \$${accountEquityUsdt.toStringAsFixed(2)} | Open: ${openPositions.length}/1 | Eligible Pairs: ${eligibleMarkets.length}',
+          'Equity: \$${accountEquityUsdt.toStringAsFixed(2)} | Open: ${openPositions.length}/${riskManager.config.maxConcurrentOpenPositions} | Eligible Pairs: ${eligibleMarkets.length}',
         );
       }
     } catch (e) {

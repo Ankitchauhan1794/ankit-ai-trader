@@ -218,6 +218,9 @@ class IndependentRiskSupervisor {
   final int maxConsecutiveLosses;
   final double maxAllowedSpreadPct;
   final double maxAtrVolatilityPct;
+  double maxPortfolioLossPct;
+  int maxOpenPositionsLimit;
+  bool portfolioLossLockoutActive = false;
   bool emergencyKillSwitchActive = false;
   int consecutiveLosses = 0;
 
@@ -226,7 +229,31 @@ class IndependentRiskSupervisor {
     this.maxConsecutiveLosses = 3,
     this.maxAllowedSpreadPct = 0.35,
     this.maxAtrVolatilityPct = 6.0,
+    this.maxPortfolioLossPct = 15.0,
+    this.maxOpenPositionsLimit = 5,
   });
+
+  double computePortfolioLossFloorUsdt([double? startingBalance]) {
+    final base = startingBalance ?? config.initialCapitalUsdt;
+    return (base * (1.0 - (maxPortfolioLossPct / 100.0))).clamp(0.0, base);
+  }
+
+  bool checkAndUpdatePortfolioLossLockout(
+    double currentEquityUsdt, {
+    double? startingBalanceUsdt,
+  }) {
+    final floor = computePortfolioLossFloorUsdt(startingBalanceUsdt);
+    if (currentEquityUsdt <= floor + 1e-9) {
+      portfolioLossLockoutActive = true;
+    }
+    return portfolioLossLockoutActive;
+  }
+
+  void authorizePortfolioLossReset() {
+    portfolioLossLockoutActive = false;
+    emergencyKillSwitchActive = false;
+    consecutiveLosses = 0;
+  }
 
   ({bool approved, String? reason}) vetOrderRequest({
     required String symbol,
@@ -265,11 +292,13 @@ class IndependentRiskSupervisor {
             'RISK_SUPERVISOR_RECONCILIATION_LOCK: Earlier order status is unresolved/open',
       );
     }
-    if (currentEquityUsdt <= config.equityFloorUsdt + 1e-9) {
+    final lossFloor = computePortfolioLossFloorUsdt();
+    if (portfolioLossLockoutActive || currentEquityUsdt <= lossFloor + 1e-9) {
+      portfolioLossLockoutActive = true;
       return (
         approved: false,
         reason:
-            'RISK_SUPERVISOR_MAX_DRAWDOWN: Equity \$${currentEquityUsdt.toStringAsFixed(2)} <= \$${config.equityFloorUsdt.toStringAsFixed(2)} floor',
+            'RISK_SUPERVISOR_MAX_DRAWDOWN: Portfolio ${maxPortfolioLossPct.toStringAsFixed(1)}% loss lockout active (Equity \$${currentEquityUsdt.toStringAsFixed(2)} <= \$${lossFloor.toStringAsFixed(2)} floor)',
       );
     }
     if ((startOfDayEquityUsdt - currentEquityUsdt) >=
@@ -315,10 +344,22 @@ class IndependentRiskSupervisor {
         reason: 'RISK_SUPERVISOR_STOPLOSS_GUARD: Mandatory valid stop-loss missing',
       );
     }
-    if (openPositions.length >= config.maxConcurrentOpenPositions) {
+    final pendingCount =
+        activeOrders.where((o) => o.blocksNewSubmissions).length;
+    final effectiveMaxPos = maxOpenPositionsLimit;
+    if ((openPositions.length + pendingCount) >= effectiveMaxPos) {
       return (
         approved: false,
-        reason: 'RISK_SUPERVISOR_EXPOSURE_LIMIT: Max concurrent positions reached',
+        reason:
+            'RISK_SUPERVISOR_EXPOSURE_LIMIT: Max concurrent positions reached (${openPositions.length + pendingCount}/$effectiveMaxPos)',
+      );
+    }
+    if (openPositions.any((p) => p.symbol == symbol) ||
+        activeOrders.any((o) => o.symbol == symbol && o.blocksNewSubmissions)) {
+      return (
+        approved: false,
+        reason:
+            'RISK_SUPERVISOR_DUPLICATE_ORDER: Symbol $symbol already has an active position or pending order',
       );
     }
 

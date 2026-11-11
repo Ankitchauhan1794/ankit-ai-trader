@@ -88,7 +88,7 @@ class PersistedEngineSnapshot {
 
 class PersistenceDatabase {
   static const String dbFileName = 'ankit_ai_trader_phase1.db';
-  static const int currentSchemaVersion = 5;
+  static const int currentSchemaVersion = 6;
 
   Database? _db;
   final Map<String, String> _inMemoryKv = {};
@@ -263,7 +263,9 @@ class PersistenceDatabase {
         executionEnabled INTEGER NOT NULL DEFAULT 0,
         isResearchOnly INTEGER NOT NULL DEFAULT 1,
         activeStrategyId TEXT NOT NULL,
-        maxOpenPositions INTEGER NOT NULL DEFAULT 1,
+        maxOpenPositions INTEGER NOT NULL DEFAULT 5,
+        maxPortfolioLossPct REAL NOT NULL DEFAULT 15.0,
+        portfolioLossLockoutActive INTEGER NOT NULL DEFAULT 0,
         updatedAtMs INTEGER NOT NULL
       )
     ''');
@@ -281,7 +283,22 @@ class PersistenceDatabase {
           "ALTER TABLE $table ADD COLUMN portfolioId TEXT NOT NULL DEFAULT 'CRYPTO'",
         );
       } catch (_) {}
+      try {
+        await db.execute(
+          "UPDATE $table SET portfolioId = 'CRYPTO' WHERE portfolioId IS NULL OR portfolioId = ''",
+        );
+      } catch (_) {}
     }
+    try {
+      await db.execute(
+        "ALTER TABLE portfolio_accounts ADD COLUMN maxPortfolioLossPct REAL NOT NULL DEFAULT 15.0",
+      );
+    } catch (_) {}
+    try {
+      await db.execute(
+        "ALTER TABLE portfolio_accounts ADD COLUMN portfolioLossLockoutActive INTEGER NOT NULL DEFAULT 0",
+      );
+    } catch (_) {}
 
     double cryptoCash = 100.0;
     double cryptoEquity = 100.0;
@@ -342,7 +359,9 @@ class PersistenceDatabase {
         'executionEnabled': 1,
         'isResearchOnly': 0,
         'activeStrategyId': 'EMA_20_50_RSI_ATR_V1',
-        'maxOpenPositions': 1,
+        'maxOpenPositions': 5,
+        'maxPortfolioLossPct': 15.0,
+        'portfolioLossLockoutActive': cryptoMaxDdLocked,
         'updatedAtMs': nowMs,
       },
       conflictAlgorithm: ConflictAlgorithm.ignore,
@@ -365,7 +384,9 @@ class PersistenceDatabase {
         'executionEnabled': 0,
         'isResearchOnly': 1,
         'activeStrategyId': 'HIGH_VOL_RESEARCH_CANDIDATE_V1',
-        'maxOpenPositions': 1,
+        'maxOpenPositions': 5,
+        'maxPortfolioLossPct': 15.0,
+        'portfolioLossLockoutActive': 0,
         'updatedAtMs': nowMs,
       },
       conflictAlgorithm: ConflictAlgorithm.ignore,
@@ -377,7 +398,7 @@ class PersistenceDatabase {
     if (oldVersion < 4) {
       await _createDiscoveredMarketsTable(db);
     }
-    if (oldVersion < 5) {
+    if (oldVersion < 6) {
       await _createPortfolioAccountsTable(db);
       await _migrateAndSeedPortfoliosOnDb(db);
     }
@@ -877,16 +898,17 @@ class PersistenceDatabase {
       for (final r in kvRows) {
         kv[r['key'] as String] = r['value'] as String;
       }
-      final posRows = await db.query('open_positions', where: "portfolioId = ?", whereArgs: ['CRYPTO'], orderBy: 'openedAtMs DESC');
+      const cryptoWhere = "portfolioId = ? OR portfolioId IS NULL OR portfolioId = ''";
+      final posRows = await db.query('open_positions', where: cryptoWhere, whereArgs: ['CRYPTO'], orderBy: 'openedAtMs DESC');
       openPos = posRows.map((r) => PaperPosition.fromMap(r)).toList();
 
-      final ordRows = await db.query('orders', where: "portfolioId = ?", whereArgs: ['CRYPTO'], orderBy: 'executedAtMs DESC', limit: 100);
+      final ordRows = await db.query('orders', where: cryptoWhere, whereArgs: ['CRYPTO'], orderBy: 'executedAtMs DESC', limit: 100);
       ordList = ordRows.map((r) => SimulatedOrder.fromMap(r)).toList();
 
-      final trdRows = await db.query('closed_trades', where: "portfolioId = ?", whereArgs: ['CRYPTO'], orderBy: 'closedAtMs DESC', limit: 100);
+      final trdRows = await db.query('closed_trades', where: cryptoWhere, whereArgs: ['CRYPTO'], orderBy: 'closedAtMs DESC', limit: 100);
       trdList = trdRows.map((r) => ClosedPaperTrade.fromMap(r)).toList();
 
-      final eqRows = await db.query('equity_snapshots', where: "portfolioId = ?", whereArgs: ['CRYPTO'], orderBy: 'timestampMs DESC', limit: 120);
+      final eqRows = await db.query('equity_snapshots', where: cryptoWhere, whereArgs: ['CRYPTO'], orderBy: 'timestampMs DESC', limit: 120);
       eqCurve = eqRows.reversed
           .map((r) => EquityPoint(
                 timestampMs: (r['timestampMs'] as num).toInt(),
@@ -1167,29 +1189,32 @@ class PersistenceDatabase {
     }
 
     final r = rows.first;
+    final whereClause = portfolioId == PortfolioId.crypto
+        ? "portfolioId = ? OR portfolioId IS NULL OR portfolioId = ''"
+        : 'portfolioId = ?';
     final posRows = await db.query(
       'open_positions',
-      where: 'portfolioId = ?',
+      where: whereClause,
       whereArgs: [portfolioId.dbKey],
       orderBy: 'openedAtMs DESC',
     );
     final ordRows = await db.query(
       'orders',
-      where: 'portfolioId = ?',
+      where: whereClause,
       whereArgs: [portfolioId.dbKey],
       orderBy: 'executedAtMs DESC',
       limit: 100,
     );
     final trdRows = await db.query(
       'closed_trades',
-      where: 'portfolioId = ?',
+      where: whereClause,
       whereArgs: [portfolioId.dbKey],
       orderBy: 'closedAtMs DESC',
       limit: 100,
     );
     final eqRows = await db.query(
       'equity_snapshots',
-      where: 'portfolioId = ?',
+      where: whereClause,
       whereArgs: [portfolioId.dbKey],
       orderBy: 'timestampMs DESC',
       limit: 120,
@@ -1241,7 +1266,12 @@ class PersistenceDatabase {
       liveTradingLocked: true,
       activeStrategyId: stratId,
       configuredMaxOpenPositions:
-          (r['maxOpenPositions'] as num?)?.toInt() ?? 1,
+          (r['maxOpenPositions'] as num?)?.toInt() ?? 5,
+      maxPortfolioLossPct:
+          (r['maxPortfolioLossPct'] as num?)?.toDouble() ?? 15.0,
+      portfolioLossLockoutActive:
+          (r['portfolioLossLockoutActive'] as num?)?.toInt() == 1 ||
+              (r['maxDrawdownLocked'] as num?)?.toInt() == 1,
       openPositions: openPos,
       orders: orders,
       closedTrades: closedTrades,

@@ -393,14 +393,34 @@ class TradingCoordinator extends ChangeNotifier {
   Future<void> updatePortfolioSettings({
     required PortfolioId portfolioId,
     int? configuredMaxOpenPositions,
+    double? maxPortfolioLossPct,
     String? statusSummary,
   }) async {
     await dualPortfolioManager.updatePortfolioSettings(
       portfolioId: portfolioId,
       configuredMaxOpenPositions: configuredMaxOpenPositions,
+      maxPortfolioLossPct: maxPortfolioLossPct,
       statusSummary: statusSummary,
       nowMs: _nowMs(),
     );
+    notifyListeners();
+  }
+
+  Future<void> authorizePortfolioLossLimitReset({
+    required PortfolioId portfolioId,
+    bool resetBalanceToStarting = false,
+  }) async {
+    await dualPortfolioManager.authorizePortfolioLossLimitReset(
+      portfolioId: portfolioId,
+      resetBalanceToStarting: resetBalanceToStarting,
+      nowMs: _nowMs(),
+    );
+    if (portfolioId == PortfolioId.crypto) {
+      maxDrawdownLocked = false;
+      if (engineState == BotEngineState.stoppedMaxDrawdownReached) {
+        engineState = BotEngineState.stopped;
+      }
+    }
     notifyListeners();
   }
 
@@ -411,6 +431,14 @@ class TradingCoordinator extends ChangeNotifier {
 
   double get activeAvailableCashUsdt => activePortfolio.availableCashUsdt;
 
+  double get activeSettledBalanceUsdt => activePortfolio.settledBalanceUsdt;
+
+  double get activeReservedCapitalUsdt => activePortfolio.reservedCapitalUsdt;
+
+  double get activeRealizedPnlUsdt => activePortfolio.realizedPnlUsdt;
+
+  double get activeUnrealizedPnlUsdt => activePortfolio.unrealizedPnlUsdt;
+
   double get activeStartOfDayEquityUsdt => activePortfolio.startOfDayEquityUsdt;
 
   double get activeDailyPnlUsdt => activePortfolio.dailyPnlUsdt;
@@ -418,6 +446,23 @@ class TradingCoordinator extends ChangeNotifier {
   double get activeOverallPnlUsdt => activePortfolio.overallPnlUsdt;
 
   double get activeDrawdownUsdt => activePortfolio.currentDrawdownUsdt;
+
+  double get activeCumulativeLossPct => activePortfolio.cumulativeLossPct;
+
+  double get activeMaxPortfolioLossPct => activePortfolio.maxPortfolioLossPct;
+
+  double get activeMaxPortfolioLossUsdt => activePortfolio.maxPortfolioLossUsdt;
+
+  double get activePortfolioLossFloorUsdt =>
+      activePortfolio.portfolioLossFloorUsdt;
+
+  double get activeRemainingPortfolioLossBudgetUsdt =>
+      activePortfolio.remainingPortfolioLossBudgetUsdt;
+
+  bool get activeIsPortfolioLossLocked =>
+      activePortfolio.isPortfolioLossLockoutTriggered;
+
+  int get activeMaxOpenPositions => activePortfolio.configuredMaxOpenPositions;
 
   double get activeUsedMarginUsdt => activePortfolio.usedMarginUsdt;
 
@@ -428,6 +473,29 @@ class TradingCoordinator extends ChangeNotifier {
 
   double get activeRemainingDrawdownUsdt =>
       activePortfolio.remainingDrawdownBudgetUsdt;
+
+  String get cryptoEngineStatusLabel => engineState.startupStateMachineLabel;
+
+  String get highVolatilityResearchStatusLabel =>
+      (marketCatalogue.allMarkets.isNotEmpty ||
+              engineState == BotEngineState.running ||
+              engineState == BotEngineState.waitingForFreshData)
+          ? 'ACTIVE'
+          : 'IDLE';
+
+  String get highVolatilityExecutionStatusLabel =>
+      (highVolatilityPortfolio.executionEnabled &&
+              !highVolatilityPortfolio.isResearchOnlyMode)
+          ? 'ENABLED (Paper)'
+          : 'DISABLED (Research-Only)';
+
+  String get marketDataFreshnessLabel {
+    final ts = lastMarketDataUpdateMs;
+    if (ts == null) return 'WAITING FOR INITIAL FEED';
+    final ageSec = ((_nowMs() - ts).clamp(0, 1 << 30) / 1000).round();
+    if (ageSec <= 120) return 'FRESH (${ageSec}s ago)';
+    return 'STALE (${ageSec}s ago)';
+  }
 
   List<PaperPosition> get activeOpenPositions => activePortfolio.openPositions;
 
@@ -506,8 +574,8 @@ class TradingCoordinator extends ChangeNotifier {
         (acc, p) => acc + p.investedNotionalUsdt,
       );
 
-  double get freeMarginUsdt =>
-      (accountEquityUsdt - usedMarginUsdt).clamp(0.0, double.infinity);
+  /// In Spot trading (no leverage), free unallocated buying power equals availableCashUsdt.
+  double get freeMarginUsdt => availableCashUsdt;
 
   double get currentOpenPositionRiskUsdt => openPositions.fold<double>(
         0.0,
@@ -901,6 +969,57 @@ class TradingCoordinator extends ChangeNotifier {
     equityCurve = List.from(snap.equityCurve);
     recentEvents = List.from(snap.recentEvents);
     recoveryLogs = List.from(snap.recoveryLogs);
+    if (openPositions.isEmpty &&
+        (accountEquityUsdt - availableCashUsdt).abs() > 0.01) {
+      final realizedSum = closedTrades.fold<double>(
+        0.0,
+        (acc, t) => acc + t.realizedPnlUsdt,
+      );
+      availableCashUsdt = 100.0 + realizedSum;
+      accountEquityUsdt = availableCashUsdt;
+    }
+    dualPortfolioManager.syncCryptoPortfolioInMemory(
+      PersistedEngineSnapshot(
+        botState: engineState,
+        userIntention: userIntention,
+        availableCashUsdt: availableCashUsdt,
+        accountEquityUsdt: accountEquityUsdt,
+        startOfDayEquityUsdt: startOfDayEquityUsdt,
+        maxDrawdownLocked: maxDrawdownLocked,
+        lockedDailyLossUtcDate: lockedDailyLossUtcDate,
+        lastStopLossClosedAtMs: snap.lastStopLossClosedAtMs,
+        lastHeartbeatMs: lastHeartbeatMs,
+        lastMarketDataUpdateMs: lastMarketDataUpdateMs,
+        lastCandleUpdateMs: lastCandleUpdateMs,
+        runningSinceMs: snap.runningSinceMs,
+        totalActiveMs: snap.totalActiveMs,
+        serviceRestartCount: serviceRestartCount,
+        orderSeq: orderSeq,
+        autoResumeEnabled: autoResumeEnabled,
+        statusBannerMessage: statusBannerMessage,
+        lastError: lastError,
+        tradeAlertsEnabled: tradeAlertsEnabled,
+        liveTickerPrices: liveTickerPrices,
+        liveTickers: liveTickers,
+        closedCandlePrices: closedCandlePrices,
+        whyNoTradeForSymbol: whyNoTradeForSymbol,
+        openPositions: openPositions,
+        orders: orders,
+        closedTrades: closedTrades,
+        equityCurve: equityCurve,
+        recentEvents: recentEvents,
+        processedEntrySignalKeys: snap.processedEntrySignalKeys,
+        recoveryAttemptCount: recoveryAttemptCount,
+        recoveryStartedAtMs: snap.recoveryStartedAtMs,
+        nextRecoveryAllowedAtMs: snap.nextRecoveryAllowedAtMs,
+        recoveryLogs: recoveryLogs,
+        scanDiagnostics: scanDiagnostics,
+        lastStartupAttemptMs: lastStartupAttemptMs,
+        lastStartupError: lastStartupError,
+        lastShutdownReason: lastShutdownReason,
+        lastBackgroundCycleError: lastBackgroundCycleError,
+      ),
+    );
 
     if (closedTrades.isNotEmpty) {
       latestRobustnessReport = quantValidator.evaluateClosedTrades(
@@ -944,7 +1063,7 @@ class TradingCoordinator extends ChangeNotifier {
             ? BotEngineState.stoppedMaxDrawdownReached
             : BotEngineState.lockedDailyLossLimit;
         lastStartupError = maxDrawdownLocked
-            ? 'Blocked by maximum drawdown lock (\$90.00 floor reached)'
+            ? 'Blocked by 15% Portfolio Loss Limit lockout (\$${activePortfolioLossFloorUsdt.toStringAsFixed(2)} floor reached)'
             : 'Blocked by daily loss limit lock (\$2.00 reached)';
         lastShutdownReason = lastStartupError;
         statusBannerMessage =
@@ -1142,6 +1261,11 @@ class TradingCoordinator extends ChangeNotifier {
         processedEntrySignalKeys: const {},
       );
     }
+    await dualPortfolioManager.authorizePortfolioLossLimitReset(
+      portfolioId: PortfolioId.crypto,
+      resetBalanceToStarting: true,
+      nowMs: _nowMs(),
+    );
     await refreshStateFromDatabase();
   }
 

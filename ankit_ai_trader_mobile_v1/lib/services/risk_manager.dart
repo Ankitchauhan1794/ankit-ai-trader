@@ -5,6 +5,7 @@ class RiskConfig {
   final double initialCapitalUsdt;
   final double maxRiskPerTradeFraction;
   final double maxDailyLossUsdt;
+  final double maxPortfolioLossPct;
   final double maxTotalDrawdownUsdt;
   final double equityFloorUsdt;
   final int maxConcurrentOpenPositions;
@@ -16,13 +17,19 @@ class RiskConfig {
     this.initialCapitalUsdt = 100.0,
     this.maxRiskPerTradeFraction = 0.01,
     this.maxDailyLossUsdt = 2.0,
-    this.maxTotalDrawdownUsdt = 10.0,
-    this.equityFloorUsdt = 90.0,
-    this.maxConcurrentOpenPositions = 1,
+    this.maxPortfolioLossPct = 15.0,
+    this.maxTotalDrawdownUsdt = 15.0,
+    this.equityFloorUsdt = 85.0,
+    this.maxConcurrentOpenPositions = 5,
     this.stopLossAtrMultiplier = 1.5,
     this.takeProfitAtrMultiplier = 3.0,
     this.postStopLossCooldownMs = 30 * 60 * 1000,
   });
+
+  double computePortfolioLossFloorUsdt([double? startingBalance]) {
+    final base = startingBalance ?? initialCapitalUsdt;
+    return (base * (1.0 - (maxPortfolioLossPct / 100.0))).clamp(0.0, base);
+  }
 }
 
 class PositionSizingDecision {
@@ -58,7 +65,17 @@ class RiskManager {
     return '$y-$m-$d';
   }
 
-  bool shouldStopForMaxDrawdown(double currentEquityUsdt) {
+  bool shouldStopForMaxDrawdown(
+    double currentEquityUsdt, {
+    double? startingBalanceUsdt,
+    double? maxPortfolioLossPctOverride,
+  }) {
+    if (maxPortfolioLossPctOverride != null) {
+      final base = startingBalanceUsdt ?? config.initialCapitalUsdt;
+      final floor =
+          (base * (1.0 - (maxPortfolioLossPctOverride / 100.0))).clamp(0.0, base);
+      return currentEquityUsdt <= floor + 1e-9;
+    }
     return currentEquityUsdt <= config.equityFloorUsdt + 1e-9;
   }
 
@@ -90,11 +107,17 @@ class RiskManager {
     required int? lastStopLossClosedAtMs,
     required int nowMs,
     double feeRate = 0.001,
+    int? maxOpenPositionsOverride,
+    int pendingEntriesCount = 0,
+    double? maxPortfolioLossPctOverride,
   }) {
-    if (shouldStopForMaxDrawdown(currentEquityUsdt)) {
+    if (shouldStopForMaxDrawdown(
+      currentEquityUsdt,
+      maxPortfolioLossPctOverride: maxPortfolioLossPctOverride,
+    )) {
       return const PositionSizingDecision(
         approved: false,
-        rejectionReason: 'MAX_DRAWDOWN_FLOOR_REACHED',
+        rejectionReason: 'PORTFOLIO_LOSS_LIMIT_15PCT_REACHED',
       );
     }
     if (shouldLockDailyLoss(
@@ -115,7 +138,9 @@ class RiskManager {
         rejectionReason: 'POST_STOPLOSS_COOLDOWN_ACTIVE',
       );
     }
-    if (openPositions.length >= config.maxConcurrentOpenPositions) {
+    final maxAllowedPositions =
+        maxOpenPositionsOverride ?? config.maxConcurrentOpenPositions;
+    if ((openPositions.length + pendingEntriesCount) >= maxAllowedPositions) {
       return const PositionSizingDecision(
         approved: false,
         rejectionReason: 'MAX_OPEN_POSITIONS_REACHED',
