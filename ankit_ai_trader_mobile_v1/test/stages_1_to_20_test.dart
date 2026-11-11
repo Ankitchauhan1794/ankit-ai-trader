@@ -786,11 +786,17 @@ void main() {
         final is1h = url.contains('interval=1h');
         final dur = is1h ? 3600000 : 900000;
         final list = <Map<String, dynamic>>[];
+        double curPrice = url.contains('B-BTC_USDT') ? 88000.0 : 2900.0;
+        final step = url.contains('B-BTC_USDT') ? 25.0 : 1.5;
         for (int i = 65; i >= 1; i--) {
+          final idx = 65 - i;
           final openTime = nowMs - (i + 1) * dur;
-          final base = url.contains('B-BTC_USDT') ? 88000.0 : 2900.0;
-          final step = url.contains('B-BTC_USDT') ? 25.0 : 1.5;
-          final c = base + (65 - i) * step;
+          if (idx % 3 == 2) {
+            curPrice -= step * 0.95;
+          } else {
+            curPrice += step * 1.0;
+          }
+          final c = curPrice;
           list.add({
             'time': openTime,
             'open': c - step * 0.4,
