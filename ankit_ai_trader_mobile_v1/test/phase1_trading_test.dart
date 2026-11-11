@@ -1617,10 +1617,25 @@ void main() {
         quantity: 0.1, // 100.0 * 0.1 = 10.0 notional each -> 5 positions = 50.0 reserved
         nowMs: nowMs + i * 1000,
       );
-      expect(res.executed, isTrue);
+      expect(res.executed, isTrue, reason: 'Position $i failed: ${res.reason}');
+      if (i == 1) {
+        // Verify 18: Duplicate symbol attempt while capacity is 1/5 is rejected
+        final dupAttempt = await manager.openIsolatedPaperPosition(
+          portfolioId: PortfolioId.crypto,
+          instrumentSpec: spec,
+          entryPrice: 100.0,
+          stopLossPrice: 95.0,
+          takeProfitPrice: 110.0,
+          quantity: 0.1,
+          nowMs: nowMs + 1500,
+        );
+        expect(dupAttempt.executed, isFalse);
+        expect(dupAttempt.reason, contains('DUPLICATE_SYMBOL_POSITION'));
+      }
     }
     expect(coordinator.cryptoPortfolio.openPositions.length, equals(5));
     expect(coordinator.cryptoPortfolio.reservedCapitalUsdt, closeTo(50.0, 0.01));
+    expect(coordinator.cryptoPortfolio.accountEquityUsdt, closeTo(99.95, 0.01));
 
     // Duplicate order on PAIR1USDT is rejected
     const dupSpec = VerifiedInstrumentSpecification(

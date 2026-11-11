@@ -1207,12 +1207,17 @@ class DualPortfolioManager {
       reason: 'ISOLATED_PORTFOLIO_ENTRY (${portfolioId.dbKey})',
     );
 
+    final updatedOpenPositions = [pos, ...snap.openPositions];
+    final totalOpenNotional = updatedOpenPositions.fold<double>(
+      0.0,
+      (acc, p) => acc + p.investedNotionalUsdt,
+    );
     final newCash = snap.availableCashUsdt - notional - entryFee;
-    final newEquity = newCash + notional;
+    final newEquity = newCash + totalOpenNotional;
     final updated = snap.copyWith(
       availableCashUsdt: newCash,
       accountEquityUsdt: newEquity,
-      openPositions: [pos, ...snap.openPositions],
+      openPositions: updatedOpenPositions,
       orders: [order, ...snap.orders],
       equityCurve: [
         ...snap.equityCurve,
