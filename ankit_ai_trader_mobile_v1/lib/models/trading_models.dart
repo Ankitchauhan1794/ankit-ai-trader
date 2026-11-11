@@ -3,6 +3,7 @@ import 'dart:math' as math;
 
 enum BotEngineState {
   stopped,
+  starting,
   running,
   pausedNetworkLoss,
   reconnecting,
@@ -10,6 +11,7 @@ enum BotEngineState {
   pausedStaleData,
   pausedAfterRecoveryManualStartRequired,
   recoveryFailed,
+  failedStartupError,
   lockedDailyLossLimit,
   stoppedMaxDrawdownReached,
 }
@@ -18,6 +20,8 @@ extension BotEngineStateDisplay on BotEngineState {
   /// Part 2: Exact dashboard state label distinguishing all required states.
   String get dashboardLabel {
     switch (this) {
+      case BotEngineState.starting:
+        return 'STARTING';
       case BotEngineState.running:
         return 'RUNNING';
       case BotEngineState.pausedNetworkLoss:
@@ -34,8 +38,35 @@ extension BotEngineStateDisplay on BotEngineState {
         return 'PAUSED_BY_RISK';
       case BotEngineState.recoveryFailed:
         return 'RECOVERY_FAILED';
+      case BotEngineState.failedStartupError:
+        return 'FAILED — STARTUP ERROR';
       case BotEngineState.stopped:
         return 'STOPPED';
+    }
+  }
+
+  /// Task 2: Explicit Startup & Runtime State Machine display label.
+  String get startupStateMachineLabel {
+    switch (this) {
+      case BotEngineState.stopped:
+        return 'STOPPED';
+      case BotEngineState.starting:
+      case BotEngineState.reconnecting:
+        return 'STARTING';
+      case BotEngineState.running:
+        return 'RUNNING';
+      case BotEngineState.waitingForFreshData:
+        return 'RUNNING — WAITING FOR VALID MARKET DATA';
+      case BotEngineState.pausedNetworkLoss:
+      case BotEngineState.pausedStaleData:
+        return 'PAUSED — NETWORK OR DATA ISSUE';
+      case BotEngineState.lockedDailyLossLimit:
+      case BotEngineState.stoppedMaxDrawdownReached:
+      case BotEngineState.pausedAfterRecoveryManualStartRequired:
+        return 'PAUSED — SAFETY RESTRICTION';
+      case BotEngineState.failedStartupError:
+      case BotEngineState.recoveryFailed:
+        return 'FAILED — STARTUP ERROR';
     }
   }
 
@@ -48,6 +79,10 @@ extension BotEngineStateDisplay on BotEngineState {
   bool get isRiskLock =>
       this == BotEngineState.lockedDailyLossLimit ||
       this == BotEngineState.stoppedMaxDrawdownReached;
+
+  bool get isStartupFailure =>
+      this == BotEngineState.failedStartupError ||
+      this == BotEngineState.recoveryFailed;
 }
 
 /// Stage 3: Explicit user session intention persisted independently from runtime state.
@@ -391,7 +426,9 @@ class CoinDcxMarketRecord {
   int get quantityPrecision => targetCurrencyPrecision;
 
   bool get isActiveStatus =>
-      status.toLowerCase() == 'active' && isInActiveMarketsList;
+      status.toLowerCase() == 'active' &&
+      isInActiveMarketsList &&
+      hasValidSpecifications;
 
   bool get isEligibleForPaperTrading =>
       eligibilityStatus == MarketEligibilityStatus.eligibleForPaperTrading;

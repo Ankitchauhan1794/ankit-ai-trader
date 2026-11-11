@@ -1206,4 +1206,243 @@ void main() {
     coordinator.dispose();
     await db.close();
   });
+
+  test('Startup Audit & Full Lifecycle Tests 1–15 (Tasks 1–9): START state machine, no-trade RUNNING persistence across 4s UI refreshes, temporary API recovery, stale/SL/risk guards, PAUSE/RESUME/STOP, and isolated portfolio strategy/settings', () async {
+    int nowMs = 1700000000000;
+    bool failApi = false;
+
+    final mockClient = _MockHttpClient((req) async {
+      if (failApi) {
+        return http.Response('Service Unavailable', 503);
+      }
+      final url = req.url.toString();
+      if (url.contains('/exchange/v1/markets_details')) {
+        return http.Response(
+          jsonEncode([
+            {
+              'coindcx_name': 'BTCUSDT',
+              'symbol': 'BTCUSDT',
+              'pair': 'B-BTC_USDT',
+              'ecode': 'B',
+              'base_currency_short_name': 'USDT',
+              'target_currency_short_name': 'BTC',
+              'status': 'active',
+              'base_currency_precision': 2,
+              'target_currency_precision': 5,
+              'min_quantity': 0.0001,
+              'max_quantity': 100.0,
+              'step': 0.00001,
+              'min_notional': 5.0,
+              'min_price': 1000.0,
+              'max_price': 500000.0,
+              'order_types': ['market_order', 'limit_order'],
+            },
+          ]),
+          200,
+        );
+      }
+      if (url.contains('/exchange/v1/markets')) {
+        return http.Response(jsonEncode(['BTCUSDT']), 200);
+      }
+      if (url.contains('/exchange/ticker')) {
+        return http.Response(
+          jsonEncode([
+            {
+              'market': 'BTCUSDT',
+              'last_price': '90000.0',
+              'bid': '89995.0',
+              'ask': '90005.0',
+              'high': '91000.0',
+              'low': '89000.0',
+              'volume': '500000.0',
+              'change_24_hour': '1.2',
+              'timestamp': nowMs ~/ 1000,
+            },
+          ]),
+          200,
+        );
+      }
+      if (url.contains('/market_data/candles')) {
+        // Flat candles -> no BUY signal (tests Task 3: engine remains RUNNING when no trade opportunity exists)
+        final candles = List.generate(65, (i) {
+          final openMs = nowMs - ((70 - i) * 60 * 60 * 1000);
+          return {
+            'open': 90000.0,
+            'high': 90050.0,
+            'low': 89950.0,
+            'close': 90000.0,
+            'volume': 25.0,
+            'time': openMs,
+          };
+        });
+        return http.Response(jsonEncode(candles), 200);
+      }
+      return http.Response('[]', 200);
+    });
+
+    final db = PersistenceDatabase(useInMemoryFallback: true);
+    final marketSvc = CoinDcxMarketService(
+      httpClient: mockClient,
+      persistence: db,
+    );
+    final bridge = _FakeCommandBridge(serviceReady: false, shouldSucceedStart: true);
+    final coordinator = TradingCoordinator(
+      persistence: db,
+      marketService: marketSvc,
+      commandBridge: bridge,
+      nowMsProvider: () => nowMs,
+    );
+
+    // 1–5. START initializes service & engine, acknowledges START, runs first cycle, and stays RUNNING across UI refreshes even with 0 trades
+    await coordinator.startBot();
+    expect(bridge.ensureServiceStartCalls, equals(1));
+    expect(bridge.dispatchedCommands, contains('START'));
+    expect(coordinator.serviceRunning, isTrue);
+    expect(coordinator.dartEngineInitialized, isTrue);
+    expect(coordinator.engineState, equals(BotEngineState.running));
+    expect(coordinator.engineState.startupStateMachineLabel, equals('RUNNING'));
+    expect(coordinator.lastStartupAttemptMs, equals(nowMs));
+    expect(coordinator.lastStartupError, isNull);
+    expect(coordinator.openPositions, isEmpty);
+
+    // Simulate periodic 4-second UI state refreshes (regression check for START -> RUNNING -> STOPPED bug)
+    nowMs += 4000;
+    await coordinator.refreshStateFromDatabase(isInitialLoad: false);
+    expect(coordinator.engineState, equals(BotEngineState.running));
+    nowMs += 4000;
+    await coordinator.refreshStateFromDatabase(isInitialLoad: false);
+    expect(coordinator.engineState, equals(BotEngineState.running));
+
+    // 6. Temporary API failure transitions to waitingForFreshData without terminating service, then auto-recovers
+    final emptyDb = PersistenceDatabase(useInMemoryFallback: true);
+    failApi = true;
+    final emptyMarketSvc = CoinDcxMarketService(
+      httpClient: mockClient,
+      persistence: emptyDb,
+    );
+    final engine = AuthoritativeTradingEngine(
+      marketService: emptyMarketSvc,
+      persistence: emptyDb,
+      nowMsProvider: () => nowMs,
+    );
+    final startedWithOutage = await engine.startEngine();
+    expect(startedWithOutage, isTrue);
+    expect(engine.state, equals(BotEngineState.waitingForFreshData));
+    expect(
+      engine.state.startupStateMachineLabel,
+      equals('RUNNING — WAITING FOR VALID MARKET DATA'),
+    );
+
+    failApi = false;
+    nowMs += 15000;
+    await engine.executeTradingCycle(allowTradingExecution: true);
+    expect(engine.state, equals(BotEngineState.running));
+    engine.dispose();
+    await emptyDb.close();
+
+    // 7–9. Stale data, invalid stop-loss, and risk limits block unsafe orders without stopping engine
+    final manager = coordinator.dualPortfolioManager;
+    final btcSpec = manager.cryptoProvider.getInstrumentSpecification('BTCUSDT');
+    final staleOrderVet = manager.vetAndSizePortfolioOrder(
+      portfolioId: PortfolioId.crypto,
+      instrumentSpec: btcSpec,
+      entryPrice: 90000.0,
+      stopLossPrice: 88500.0,
+      spreadPct: 0.05,
+      atr14: 400.0,
+      isDataFresh: false,
+      nowMs: nowMs,
+    );
+    expect(staleOrderVet.approved, isFalse);
+    expect(staleOrderVet.rejectionReason, contains('STALE_DATA'));
+
+    final invalidSlVet = manager.vetAndSizePortfolioOrder(
+      portfolioId: PortfolioId.crypto,
+      instrumentSpec: btcSpec,
+      entryPrice: 90000.0,
+      stopLossPrice: 90500.0,
+      spreadPct: 0.05,
+      atr14: 400.0,
+      isDataFresh: true,
+      nowMs: nowMs,
+    );
+    expect(invalidSlVet.approved, isFalse);
+    expect(invalidSlVet.rejectionReason, contains('INVALID_STOP_LOSS'));
+    expect(coordinator.engineState, equals(BotEngineState.running));
+
+    // 10–11. PAUSE, RESUME (START), and STOP work cleanly
+    await coordinator.pauseBot();
+    expect(
+      coordinator.engineState,
+      equals(BotEngineState.pausedAfterRecoveryManualStartRequired),
+    );
+    expect(coordinator.userIntention, equals(UserSessionIntention.paused));
+    expect(coordinator.lastShutdownReason, equals('Paused by user'));
+
+    nowMs += 5000;
+    await coordinator.startBot();
+    expect(coordinator.engineState, equals(BotEngineState.running));
+    expect(coordinator.userIntention, equals(UserSessionIntention.running));
+
+    await coordinator.stopBot();
+    expect(coordinator.engineState, equals(BotEngineState.stopped));
+    expect(coordinator.userIntention, equals(UserSessionIntention.stopped));
+    expect(coordinator.lastShutdownReason, equals('Stopped by user'));
+
+    // 14. Both portfolios preserve independent strategy selections and settings
+    expect(
+      coordinator.cryptoPortfolio.activeStrategyId,
+      equals('EMA_20_50_RSI_ATR_V1'),
+    );
+    expect(
+      coordinator.highVolatilityPortfolio.activeStrategyId,
+      equals('HIGH_VOL_RESEARCH_CANDIDATE_V1'),
+    );
+    await coordinator.setPortfolioStrategy(
+      portfolioId: PortfolioId.crypto,
+      strategyId: 'EMA_25_60_RSI_CONSERVATIVE_V1',
+    );
+    await coordinator.updatePortfolioSettings(
+      portfolioId: PortfolioId.crypto,
+      configuredMaxOpenPositions: 2,
+    );
+    expect(
+      coordinator.cryptoPortfolio.activeStrategyId,
+      equals('EMA_25_60_RSI_CONSERVATIVE_V1'),
+    );
+    expect(coordinator.cryptoPortfolio.configuredMaxOpenPositions, equals(2));
+    expect(
+      coordinator.highVolatilityPortfolio.activeStrategyId,
+      equals('HIGH_VOL_RESEARCH_CANDIDATE_V1'),
+    );
+    expect(
+      coordinator.highVolatilityPortfolio.configuredMaxOpenPositions,
+      equals(1),
+    );
+    // Restore default configured limit of 1
+    await coordinator.updatePortfolioSettings(
+      portfolioId: PortfolioId.crypto,
+      configuredMaxOpenPositions: 1,
+    );
+
+    // 15. Failed startup surfaces FAILED — STARTUP ERROR and preserves database balances/history intact
+    bridge.shouldSucceedStart = false;
+    bridge.serviceReady = false;
+    await coordinator.startBot();
+    expect(coordinator.engineState, equals(BotEngineState.failedStartupError));
+    expect(
+      coordinator.engineState.startupStateMachineLabel,
+      equals('FAILED — STARTUP ERROR'),
+    );
+    expect(coordinator.lastStartupError, isNotNull);
+    expect(coordinator.cryptoPortfolio.accountEquityUsdt, closeTo(100.0, 0.001));
+    expect(
+      coordinator.highVolatilityPortfolio.accountEquityUsdt,
+      closeTo(100.0, 0.001),
+    );
+
+    coordinator.dispose();
+    marketSvc.dispose();
+    await db.close();
+  });
 }

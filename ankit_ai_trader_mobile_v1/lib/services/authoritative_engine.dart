@@ -21,6 +21,7 @@ class AuthoritativeTradingEngine {
   final String ownerId;
   final int Function() _nowMs;
   final bool verifyReachabilityBeforeNetworkPause;
+  final int maxCandleEvaluationPairsPerCycle;
   final Future<void> Function(String title, String text)? onNotificationUpdate;
   final Future<void> Function(TradeAlertPayload alert)? onTradeAlert;
 
@@ -38,6 +39,10 @@ class AuthoritativeTradingEngine {
   int? runningSinceMs;
   int totalActiveMs = 0;
   int orderSeq = 0;
+  int? lastStartupAttemptMs;
+  String? lastStartupError;
+  String? lastShutdownReason;
+  String? lastBackgroundCycleError;
   String statusBannerMessage = 'PAPER BOT STOPPED — PRESS START';
   Map<String, double> liveTickerPrices = {};
   Map<String, LiveMarketTicker> liveTickers = {};
@@ -53,6 +58,7 @@ class AuthoritativeTradingEngine {
   Timer? _cycleTimer;
   bool _isCycleInFlight = false;
   bool _disposed = false;
+  int _candleScanCursor = 0;
 
   AuthoritativeTradingEngine({
     required this.marketService,
@@ -64,6 +70,7 @@ class AuthoritativeTradingEngine {
     this.ownerId = 'bg_service_engine_1',
     int Function()? nowMsProvider,
     this.verifyReachabilityBeforeNetworkPause = false,
+    this.maxCandleEvaluationPairsPerCycle = 12,
     this.onNotificationUpdate,
     this.onTradeAlert,
   })  : riskSupervisor = riskSupervisor ?? IndependentRiskSupervisor(),
@@ -86,6 +93,10 @@ class AuthoritativeTradingEngine {
     runningSinceMs = snap.runningSinceMs;
     totalActiveMs = snap.totalActiveMs;
     orderSeq = snap.orderSeq;
+    lastStartupAttemptMs = snap.lastStartupAttemptMs;
+    lastStartupError = snap.lastStartupError;
+    lastShutdownReason = snap.lastShutdownReason;
+    lastBackgroundCycleError = snap.lastBackgroundCycleError;
     statusBannerMessage = snap.statusBannerMessage;
     liveTickerPrices = Map.from(snap.liveTickerPrices);
     liveTickers = Map.from(snap.liveTickers);
@@ -106,14 +117,53 @@ class AuthoritativeTradingEngine {
 
   Future<bool> startEngine() async {
     final now = _nowMs();
+    lastStartupAttemptMs = now;
+    lastStartupError = null;
+
+    if (maxDrawdownLocked ||
+        riskManager.shouldStopForMaxDrawdown(accountEquityUsdt)) {
+      maxDrawdownLocked = true;
+      state = BotEngineState.stoppedMaxDrawdownReached;
+      lastStartupError =
+          'Cannot start: Maximum drawdown floor (\$90.00) reached.';
+      lastShutdownReason = lastStartupError;
+      statusBannerMessage =
+          'PAUSED_BY_RISK: Max drawdown floor (\$90.00) reached.';
+      await _persistCurrentState(now);
+      return false;
+    }
+
+    final todayUtc = RiskManager.currentUtcDateString(now);
+    if (lockedDailyLossUtcDate == todayUtc ||
+        riskManager.shouldLockDailyLoss(
+          startOfDayEquityUsdt: startOfDayEquityUsdt,
+          currentEquityUsdt: accountEquityUsdt,
+        )) {
+      lockedDailyLossUtcDate = todayUtc;
+      state = BotEngineState.lockedDailyLossLimit;
+      lastStartupError =
+          'Cannot start: Daily loss limit (\$2.00) reached for $todayUtc.';
+      lastShutdownReason = lastStartupError;
+      statusBannerMessage =
+          'PAUSED_BY_RISK: Daily loss limit (\$2.00) reached.';
+      await _persistCurrentState(now);
+      return false;
+    }
+
     final locked = await persistence.acquireExecutionLock(
       lockName: lockName,
       ownerId: ownerId,
       nowMs: now,
     );
     if (!locked) {
-      statusBannerMessage =
-          'CANNOT START: Another authoritative engine instance holds the execution lock.';
+      lastStartupError =
+          'Another authoritative engine instance holds the execution lock.';
+      statusBannerMessage = 'CANNOT START: $lastStartupError';
+      await persistence.saveStartupDiagnostics(
+        lastStartupAttemptMs: now,
+        lastStartupError: lastStartupError,
+        statusBannerMessage: statusBannerMessage,
+      );
       return false;
     }
 
@@ -122,8 +172,18 @@ class AuthoritativeTradingEngine {
     state = BotEngineState.running;
     runningSinceMs ??= now;
     lastHeartbeatMs = now;
-    statusBannerMessage = 'PAPER BOT RUNNING — Multi-Pair CoinDCX Scanner Active';
+    lastShutdownReason = null;
+    statusBannerMessage =
+        'PAPER BOT RUNNING — Multi-Pair CoinDCX Scanner Active';
     await persistence.clearRecoveryState();
+    await persistence.saveStartupDiagnostics(
+      botState: BotEngineState.running,
+      userIntention: UserSessionIntention.running,
+      lastStartupAttemptMs: now,
+      clearStartupError: true,
+      clearShutdownReason: true,
+      statusBannerMessage: statusBannerMessage,
+    );
     await _persistCurrentState(now);
     await executeTradingCycle(allowTradingExecution: true);
     _startPeriodicTimer();
@@ -134,6 +194,7 @@ class AuthoritativeTradingEngine {
     userIntention = UserSessionIntention.paused;
     await persistence.saveUserIntention(UserSessionIntention.paused);
     state = BotEngineState.pausedAfterRecoveryManualStartRequired;
+    lastShutdownReason = reason;
     statusBannerMessage = 'PAUSED (PAUSED_BY_USER): $reason';
     await _persistCurrentState(_nowMs());
   }
@@ -144,6 +205,7 @@ class AuthoritativeTradingEngine {
     await persistence.saveUserIntention(UserSessionIntention.stopped);
     state = BotEngineState.stopped;
     runningSinceMs = null;
+    lastShutdownReason = reason;
     statusBannerMessage = 'PAPER BOT STOPPED — $reason';
     await _persistCurrentState(_nowMs());
     await persistence.releaseExecutionLock(lockName: lockName, ownerId: ownerId);
@@ -159,6 +221,9 @@ class AuthoritativeTradingEngine {
     maxDrawdownLocked = false;
     lockedDailyLossUtcDate = null;
     lastStopLossClosedAtMs = null;
+    lastStartupError = null;
+    lastBackgroundCycleError = null;
+    lastShutdownReason = 'Manual account reset to \$100.00 USDT';
     openPositions.clear();
     orders.clear();
     closedTrades.clear();
@@ -166,6 +231,14 @@ class AuthoritativeTradingEngine {
     whyNoTradeForSymbol.clear();
     statusBannerMessage = 'Paper account reset to \$100.00 USDT.';
     await persistence.clearRecoveryState();
+    await persistence.saveStartupDiagnostics(
+      botState: BotEngineState.stopped,
+      userIntention: UserSessionIntention.stopped,
+      clearStartupError: true,
+      clearBackgroundCycleError: true,
+      lastShutdownReason: lastShutdownReason,
+      statusBannerMessage: statusBannerMessage,
+    );
     await _persistCurrentState(_nowMs());
   }
 
@@ -178,7 +251,8 @@ class AuthoritativeTradingEngine {
           return; // False OS disconnect event; CoinDCX REST is still reachable!
         }
       }
-      if (state == BotEngineState.running) {
+      if (state == BotEngineState.running ||
+          state == BotEngineState.waitingForFreshData) {
         state = BotEngineState.pausedNetworkLoss;
         statusBannerMessage =
             'PAUSED (PAUSED_BY_NETWORK): Internet disconnected. Bot paused for safety.';
@@ -213,7 +287,13 @@ class AuthoritativeTradingEngine {
   void _startPeriodicTimer() {
     _cycleTimer?.cancel();
     _cycleTimer = Timer.periodic(const Duration(seconds: 15), (_) {
-      if (!_disposed && state == BotEngineState.running) {
+      final shouldPoll = !_disposed &&
+          userIntention == UserSessionIntention.running &&
+          (state == BotEngineState.running ||
+              state == BotEngineState.waitingForFreshData ||
+              state == BotEngineState.pausedStaleData ||
+              state == BotEngineState.reconnecting);
+      if (shouldPoll) {
         executeTradingCycle(allowTradingExecution: true);
       }
     });
@@ -266,19 +346,22 @@ class AuthoritativeTradingEngine {
       }
 
       if (catalogue.allMarkets.isEmpty && liveTickers.isEmpty) {
-        if (state == BotEngineState.running) {
+        if (state == BotEngineState.running ||
+            state == BotEngineState.starting) {
           state = BotEngineState.waitingForFreshData;
           statusBannerMessage =
-              'WAITING_FOR_FRESH_DATA: CoinDCX market feed unavailable';
+              'WAITING_FOR_FRESH_DATA: CoinDCX market feed unavailable — retrying automatically';
         }
         await _persistCurrentState(now);
         return;
       }
 
-      // Clear any stale network pause once data is flowing and userIntention is running
+      // Clear any stale network/data wait once data is flowing and userIntention is running
       if (userIntention == UserSessionIntention.running &&
           (state == BotEngineState.waitingForFreshData ||
-              state == BotEngineState.reconnecting)) {
+              state == BotEngineState.pausedStaleData ||
+              state == BotEngineState.reconnecting ||
+              state == BotEngineState.starting)) {
         state = BotEngineState.running;
         await persistence.clearRecoveryState();
       }
@@ -354,7 +437,6 @@ class AuthoritativeTradingEngine {
             }
           }
         } catch (e) {
-          // Single-pair candle error isolated safely
           skippedReasons[pos.symbol] = 'OPEN_POS_CANDLE_ERR: $e';
         }
       }
@@ -373,6 +455,7 @@ class AuthoritativeTradingEngine {
       if (riskManager.shouldStopForMaxDrawdown(accountEquityUsdt)) {
         maxDrawdownLocked = true;
         state = BotEngineState.stoppedMaxDrawdownReached;
+        lastShutdownReason = 'Max drawdown floor (\$90.00) reached';
         statusBannerMessage =
             'PAUSED_BY_RISK: Max drawdown floor (\$90.00) reached.';
         await _persistCurrentState(now);
@@ -384,16 +467,49 @@ class AuthoritativeTradingEngine {
       )) {
         lockedDailyLossUtcDate = RiskManager.currentUtcDateString(now);
         state = BotEngineState.lockedDailyLossLimit;
+        lastShutdownReason = 'Daily loss limit (\$2.00) reached';
         statusBannerMessage =
             'PAUSED_BY_RISK: Daily loss limit (\$2.00) reached.';
         await _persistCurrentState(now);
         return;
       }
 
-      // 4. Evaluate all eligible pairs and rank BUY candidates
+      // 4. Select candidate batch for closed-candle evaluation so large catalogues (e.g. 472 pairs)
+      // complete each cycle in ~1.5s without blocking startup or heartbeats.
+      List<CoinDcxMarketRecord> marketsToEvaluate;
+      if (eligibleMarkets.length <= maxCandleEvaluationPairsPerCycle) {
+        marketsToEvaluate = eligibleMarkets;
+      } else {
+        final sortedByLiquidity = List<CoinDcxMarketRecord>.from(eligibleMarkets)
+          ..sort((a, b) {
+            final volA = a.latestTicker?.volume24h ?? 0.0;
+            final volB = b.latestTicker?.volume24h ?? 0.0;
+            return volB.compareTo(volA);
+          });
+        final topCore = sortedByLiquidity.take(6).toList();
+        final remaining = sortedByLiquidity.skip(6).toList();
+        final rotatingBatch = <CoinDcxMarketRecord>[];
+        final rotatingQuota = math.max(1, maxCandleEvaluationPairsPerCycle - topCore.length);
+        if (remaining.isNotEmpty) {
+          for (int i = 0; i < math.min(rotatingQuota, remaining.length); i++) {
+            final idx = (_candleScanCursor + i) % remaining.length;
+            rotatingBatch.add(remaining[idx]);
+          }
+          _candleScanCursor = (_candleScanCursor + rotatingBatch.length) % remaining.length;
+        }
+        marketsToEvaluate = [...topCore, ...rotatingBatch];
+        final evaluatedKeys = marketsToEvaluate.map((m) => m.pair).toSet();
+        for (final m in eligibleMarkets) {
+          if (!evaluatedKeys.contains(m.pair)) {
+            skippedCount++;
+            skippedReasons[m.pair] = 'QUEUED_FOR_NEXT_ROTATION_BATCH';
+          }
+        }
+      }
+
       final buyOpportunities = <RankedSignalOpportunity>[];
 
-      for (final market in eligibleMarkets) {
+      for (final market in marketsToEvaluate) {
         final pairKey = market.pair;
         final ticker = market.latestTicker ??
             CoinDcxMarketService.matchTickerForMarket(
@@ -406,6 +522,12 @@ class AuthoritativeTradingEngine {
           skippedCount++;
           skippedReasons[pairKey] = 'MISSING_LIVE_TICKER';
           whyNoTradeForSymbol[pairKey] = 'SKIPPED: Missing live ticker';
+          continue;
+        }
+        if (!ticker.isFresh(now, maxAgeMs: 300000)) {
+          skippedCount++;
+          skippedReasons[pairKey] = 'STALE_LIVE_TICKER';
+          whyNoTradeForSymbol[pairKey] = 'SKIPPED: Stale live ticker data';
           continue;
         }
         liveTickerPrices[pairKey] = ticker.lastPrice;
@@ -531,6 +653,14 @@ class AuthoritativeTradingEngine {
             continue;
           }
 
+          if (sizing.stopLossPrice <= 0 || sizing.stopLossPrice >= estFill) {
+            rejectedSignals++;
+            rejectionReasons[pairKey] = 'MANDATORY_VALID_STOP_LOSS_MISSING';
+            whyNoTradeForSymbol[pairKey] =
+                'REJECTED: Mandatory valid stop-loss missing or invalid';
+            continue;
+          }
+
           final orderValid = opp.market.validateOrder(
             quantity: sizing.quantity,
             price: estFill,
@@ -555,7 +685,7 @@ class AuthoritativeTradingEngine {
             slippageRate: paperBroker.slippageRate,
             spreadPct: opp.ticker.spreadPct,
             atr14: opp.evaluation.atr14_15m,
-            isDataFresh: true,
+            isDataFresh: opp.ticker.isFresh(now, maxAgeMs: 300000),
             openPositions: openPositions,
             activeOrders: const [],
             lastStopLossClosedAtMs: lastStopLossClosedAtMs,
@@ -640,9 +770,15 @@ class AuthoritativeTradingEngine {
         recoveryStateLabel: 'NORMAL',
       );
 
+      lastBackgroundCycleError = null;
       if (state == BotEngineState.running) {
-        statusBannerMessage =
-            'PAPER BOT RUNNING • Scanned $evaluatedCount/${eligibleMarkets.length} Eligible Pairs • Open: ${openPositions.length}/1';
+        if (acceptedOrders > 0) {
+          statusBannerMessage =
+              'PAPER BOT RUNNING • Executed $acceptedOrders Order(s) • Open: ${openPositions.length}/1';
+        } else {
+          statusBannerMessage =
+              'PAPER BOT RUNNING • Scanned $evaluatedCount/${eligibleMarkets.length} Eligible Pairs (No valid entry signal) • Open: ${openPositions.length}/1';
+        }
       }
 
       await _persistCurrentState(now);
@@ -652,6 +788,15 @@ class AuthoritativeTradingEngine {
           'Equity: \$${accountEquityUsdt.toStringAsFixed(2)} | Open: ${openPositions.length}/1 | Eligible Pairs: ${eligibleMarkets.length}',
         );
       }
+    } catch (e) {
+      lastBackgroundCycleError = e.toString();
+      await persistence.saveStartupDiagnostics(
+        lastBackgroundCycleError: lastBackgroundCycleError,
+      );
+      await persistence.logDiagnosticEvent(
+        'CYCLE_ERROR',
+        'Non-fatal background cycle error isolated: $e',
+      );
     } finally {
       _isCycleInFlight = false;
     }
@@ -682,6 +827,10 @@ class AuthoritativeTradingEngine {
       closedTrades: closedTrades,
       processedEntrySignalKeys: processedEntrySignalKeys,
       scanDiagnostics: scanDiagnostics,
+      lastStartupAttemptMs: lastStartupAttemptMs,
+      lastStartupError: lastStartupError,
+      lastShutdownReason: lastShutdownReason,
+      lastBackgroundCycleError: lastBackgroundCycleError,
     );
   }
 

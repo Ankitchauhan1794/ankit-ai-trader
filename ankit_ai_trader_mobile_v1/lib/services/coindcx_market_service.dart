@@ -58,6 +58,15 @@ class MarketCatalogueSnapshot {
   int get eligibleMarketsCount =>
       allMarkets.where((m) => m.isEligibleForPaperTrading).length;
 
+  int get eligibleUsdtMarketsCount => allMarkets
+      .where((m) =>
+          m.isEligibleForPaperTrading &&
+          m.quoteCurrency.toUpperCase() == 'USDT')
+      .length;
+
+  int get rejectedMarketsCount =>
+      allMarkets.where((m) => !m.isEligibleForPaperTrading).length;
+
   int get newlyListedCount =>
       allMarkets.where((m) => m.isNewlyListed).length;
 
@@ -73,10 +82,14 @@ class MarketCatalogueSnapshot {
   List<CoinDcxMarketRecord> filterMarkets({
     String searchQuery = '',
     String quoteCurrencyFilter = 'ALL',
+    bool onlyEligible = false,
   }) {
     final qSearch = searchQuery.trim().toUpperCase();
     final qFilter = quoteCurrencyFilter.trim().toUpperCase();
     return allMarkets.where((m) {
+      if (onlyEligible && !m.isEligibleForPaperTrading) {
+        return false;
+      }
       if (qFilter != 'ALL') {
         if (qFilter == 'OTHER') {
           if (['USDT', 'INR', 'BTC', 'ETH']

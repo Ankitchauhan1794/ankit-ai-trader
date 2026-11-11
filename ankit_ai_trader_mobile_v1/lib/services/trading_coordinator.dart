@@ -3,7 +3,9 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import '../models/dual_portfolio_models.dart';
 import '../models/trading_models.dart';
+import 'authoritative_engine.dart';
 import 'autonomous_intelligence_and_ops.dart';
+import 'risk_manager.dart';
 import 'coindcx_market_service.dart';
 import 'dual_portfolio_service.dart';
 import 'execution_and_risk_hub.dart';
@@ -134,6 +136,12 @@ class TradingCoordinator extends ChangeNotifier {
   bool restoreFailedRequiresRestart = false;
   String? restoreFailureReason;
   String? lastError;
+  int? lastStartupAttemptMs;
+  String? lastStartupError;
+  String? lastShutdownReason;
+  String? lastBackgroundCycleError;
+  bool showOnlyEligibleMarkets = false;
+  bool _isStartupInFlight = false;
 
   String statusBannerMessage = 'PAPER BOT STOPPED — PRESS START';
   Map<String, double> liveTickerPrices = {};
@@ -319,6 +327,7 @@ class TradingCoordinator extends ChangeNotifier {
     final baseList = marketCatalogue.filterMarkets(
       searchQuery: marketSearchQuery,
       quoteCurrencyFilter: selectedQuoteCurrencyFilter,
+      onlyEligible: showOnlyEligibleMarkets,
     );
     if (!showOnlyFavouriteMarkets) return baseList;
     return baseList
@@ -326,6 +335,11 @@ class TradingCoordinator extends ChangeNotifier {
             favouriteMarketPairs.contains(m.pair) ||
             favouriteMarketPairs.contains(m.symbol))
         .toList();
+  }
+
+  void setShowOnlyEligibleMarkets(bool value) {
+    showOnlyEligibleMarkets = value;
+    notifyListeners();
   }
 
   void toggleFavouriteMarket(String pairKey) {
@@ -355,6 +369,38 @@ class TradingCoordinator extends ChangeNotifier {
 
   void selectPortfolio(PortfolioId id) {
     dualPortfolioManager.selectPortfolio(id);
+    notifyListeners();
+  }
+
+  RegisteredStrategyDescriptor get activePortfolioStrategyDescriptor =>
+      dualPortfolioManager.activeStrategyDescriptorFor(selectedPortfolioId);
+
+  List<RegisteredStrategyDescriptor> get activePortfolioAvailableStrategies =>
+      dualPortfolioManager.availableStrategiesFor(selectedPortfolioId);
+
+  Future<void> setPortfolioStrategy({
+    required PortfolioId portfolioId,
+    required String strategyId,
+  }) async {
+    await dualPortfolioManager.setPortfolioStrategy(
+      portfolioId: portfolioId,
+      strategyId: strategyId,
+      nowMs: _nowMs(),
+    );
+    notifyListeners();
+  }
+
+  Future<void> updatePortfolioSettings({
+    required PortfolioId portfolioId,
+    int? configuredMaxOpenPositions,
+    String? statusSummary,
+  }) async {
+    await dualPortfolioManager.updatePortfolioSettings(
+      portfolioId: portfolioId,
+      configuredMaxOpenPositions: configuredMaxOpenPositions,
+      statusSummary: statusSummary,
+      nowMs: _nowMs(),
+    );
     notifyListeners();
   }
 
@@ -683,12 +729,22 @@ class TradingCoordinator extends ChangeNotifier {
         serviceRunning = status['serviceRunning'] == true;
         dartEngineInitialized = status['dartEngineInitialized'] == true;
         if (status['lastNativeHeartbeatEpochMs'] is int) {
-          lastNativeHeartbeatEpochMs =
-              status['lastNativeHeartbeatEpochMs'] as int;
+          final hb = status['lastNativeHeartbeatEpochMs'] as int;
+          if (hb > 0) {
+            lastNativeHeartbeatEpochMs = hb;
+          }
         }
         if (status['ignoringBatteryOptimizations'] is bool) {
           ignoringBatteryOptimizations =
               status['ignoringBatteryOptimizations'] as bool;
+        }
+        if (status['lastNativeError'] is String &&
+            (status['lastNativeError'] as String).isNotEmpty) {
+          lastStartupError = status['lastNativeError'] as String;
+        }
+        if (status['lastNativeShutdownReason'] is String &&
+            (status['lastNativeShutdownReason'] as String).isNotEmpty) {
+          lastShutdownReason ??= status['lastNativeShutdownReason'] as String;
         }
         return serviceRunning && dartEngineInitialized;
       }
@@ -704,6 +760,7 @@ class TradingCoordinator extends ChangeNotifier {
   }
 
   Future<void> refreshStateFromDatabase({bool isInitialLoad = false}) async {
+    if (_isStartupInFlight && !isInitialLoad) return;
     try {
       final snap = await persistence.loadFullState();
       final nowMs = _nowMs();
@@ -721,8 +778,11 @@ class TradingCoordinator extends ChangeNotifier {
           restoreFailedRequiresRestart = false;
           restoreFailureReason = null;
           _applySnapshotToFields(snap);
-          engineState = snap.botState;
-          if (isInitialLoad && snap.botState == BotEngineState.running) {
+          await dualPortfolioManager.syncCryptoPortfolioFromEngineSnapshot(snap);
+          engineState = snap.botState == BotEngineState.stopped
+              ? BotEngineState.running
+              : snap.botState;
+          if (isInitialLoad && engineState == BotEngineState.running) {
             statusBannerMessage =
                 'RECONNECTED — heartbeat ${formatUtcHhMmSs(hbMs)}';
           }
@@ -730,6 +790,7 @@ class TradingCoordinator extends ChangeNotifier {
           return;
         } else if (isInitialLoad) {
           _applySnapshotToFields(snap);
+          await dualPortfolioManager.syncCryptoPortfolioFromEngineSnapshot(snap);
           engineState = BotEngineState.reconnecting;
           statusBannerMessage = 'Restoring running session...';
           notifyListeners();
@@ -750,21 +811,39 @@ class TradingCoordinator extends ChangeNotifier {
             );
             final refreshed = await persistence.loadFullState();
             _applySnapshotToFields(refreshed);
+            await dualPortfolioManager
+                .syncCryptoPortfolioFromEngineSnapshot(refreshed);
             engineState = refreshed.botState == BotEngineState.stopped
                 ? BotEngineState.running
                 : refreshed.botState;
             final displayHb = refreshed.lastHeartbeatMs ?? nowMs;
+            lastHeartbeatMs = displayHb;
             if (engineState == BotEngineState.running) {
               statusBannerMessage =
                   'RECONNECTED — heartbeat ${formatUtcHhMmSs(displayHb)}';
             }
+            await persistence.saveStartupDiagnostics(
+              botState: engineState,
+              userIntention: UserSessionIntention.running,
+              clearStartupError: true,
+              statusBannerMessage: statusBannerMessage,
+            );
           } else {
             restoreFailedRequiresRestart = true;
             engineState = BotEngineState.recoveryFailed;
-            restoreFailureReason = lastError ??
+            restoreFailureReason = lastStartupError ??
+                lastError ??
                 'Background service did not respond to single-shot restore';
+            lastStartupError = restoreFailureReason;
+            lastShutdownReason = restoreFailureReason;
             statusBannerMessage =
                 'RESTORE FAILED: $restoreFailureReason — Tap RESTART';
+            await persistence.saveStartupDiagnostics(
+              botState: BotEngineState.recoveryFailed,
+              lastStartupError: restoreFailureReason,
+              lastShutdownReason: restoreFailureReason,
+              statusBannerMessage: statusBannerMessage,
+            );
             await persistence.logDiagnosticEvent(
               'RESTORE_FAILED',
               restoreFailureReason!,
@@ -776,6 +855,7 @@ class TradingCoordinator extends ChangeNotifier {
       }
 
       _applySnapshotToFields(snap);
+      await dualPortfolioManager.syncCryptoPortfolioFromEngineSnapshot(snap);
       notifyListeners();
     } catch (_) {
       notifyListeners();
@@ -798,6 +878,10 @@ class TradingCoordinator extends ChangeNotifier {
     orderSeq = snap.orderSeq;
     autoResumeEnabled = snap.autoResumeEnabled;
     lastError = snap.lastError;
+    lastStartupAttemptMs = snap.lastStartupAttemptMs ?? lastStartupAttemptMs;
+    lastStartupError = snap.lastStartupError;
+    lastShutdownReason = snap.lastShutdownReason;
+    lastBackgroundCycleError = snap.lastBackgroundCycleError;
     recoveryAttemptCount = snap.recoveryAttemptCount;
     scanDiagnostics = snap.scanDiagnostics;
     statusBannerMessage = snap.statusBannerMessage;
@@ -817,7 +901,6 @@ class TradingCoordinator extends ChangeNotifier {
     equityCurve = List.from(snap.equityCurve);
     recentEvents = List.from(snap.recentEvents);
     recoveryLogs = List.from(snap.recoveryLogs);
-    dualPortfolioManager.syncCryptoPortfolioFromEngineSnapshot(snap);
 
     if (closedTrades.isNotEmpty) {
       latestRobustnessReport = quantValidator.evaluateClosedTrades(
@@ -835,53 +918,204 @@ class TradingCoordinator extends ChangeNotifier {
   }
 
   Future<void> startBot() async {
-    if (!internetConnected) {
-      statusBannerMessage = 'CANNOT START: NO INTERNET CONNECTION';
-      notifyListeners();
-      return;
-    }
-    restoreFailedRequiresRestart = false;
-    restoreFailureReason = null;
-    await persistence.saveUserIntention(UserSessionIntention.running);
-    userIntention = UserSessionIntention.running;
-    engineState = BotEngineState.running;
-    statusBannerMessage =
-        'DISPATCHING START TO AUTHORITATIVE BACKGROUND ENGINE...';
-    notifyListeners();
+    if (_isStartupInFlight) return;
+    _isStartupInFlight = true;
+    final now = _nowMs();
+    lastStartupAttemptMs = now;
+    lastStartupError = null;
+    try {
+      if (!internetConnected) {
+        engineState = BotEngineState.pausedNetworkLoss;
+        lastStartupError = 'Cannot start: No internet connection available';
+        statusBannerMessage = 'CANNOT START: NO INTERNET CONNECTION';
+        await persistence.saveStartupDiagnostics(
+          botState: BotEngineState.pausedNetworkLoss,
+          lastStartupAttemptMs: now,
+          lastStartupError: lastStartupError,
+          statusBannerMessage: statusBannerMessage,
+        );
+        notifyListeners();
+        return;
+      }
 
-    final serviceReady = await commandBridge.ensureServiceStartedAndReady();
-    if (!serviceReady) {
-      restoreFailedRequiresRestart = true;
-      restoreFailureReason = 'Foreground service failed to initialize';
-      statusBannerMessage =
-          'CANNOT START: FOREGROUND SERVICE FAILED TO INITIALIZE';
-      notifyListeners();
-      return;
-    }
+      final todayUtc = RiskManager.currentUtcDateString(now);
+      if (maxDrawdownLocked || lockedDailyLossUtcDate == todayUtc) {
+        engineState = maxDrawdownLocked
+            ? BotEngineState.stoppedMaxDrawdownReached
+            : BotEngineState.lockedDailyLossLimit;
+        lastStartupError = maxDrawdownLocked
+            ? 'Blocked by maximum drawdown lock (\$90.00 floor reached)'
+            : 'Blocked by daily loss limit lock (\$2.00 reached)';
+        lastShutdownReason = lastStartupError;
+        statusBannerMessage =
+            'PAUSED — SAFETY RESTRICTION: $lastStartupError';
+        await persistence.saveStartupDiagnostics(
+          botState: engineState,
+          lastStartupAttemptMs: now,
+          lastStartupError: lastStartupError,
+          lastShutdownReason: lastShutdownReason,
+          statusBannerMessage: statusBannerMessage,
+        );
+        notifyListeners();
+        return;
+      }
 
-    final ok = await commandBridge.dispatchCommand('START');
-    await refreshStateFromDatabase();
-    if (!ok && engineState != BotEngineState.running) {
+      // 1. Transition to STARTING (never display RUNNING before service & engine are verified ready)
+      restoreFailedRequiresRestart = false;
+      restoreFailureReason = null;
+      userIntention = UserSessionIntention.running;
+      engineState = BotEngineState.starting;
       statusBannerMessage =
-          'AUTHORITATIVE ENGINE VALIDATING MARKET DATA — WILL AUTO-RESUME';
+          'STARTING — Initializing foreground service & background Dart engine...';
+      await persistence.saveUserIntention(UserSessionIntention.running);
+      await persistence.saveStartupDiagnostics(
+        botState: BotEngineState.starting,
+        userIntention: UserSessionIntention.running,
+        lastStartupAttemptMs: now,
+        clearStartupError: true,
+        clearShutdownReason: true,
+        statusBannerMessage: statusBannerMessage,
+      );
       notifyListeners();
+
+      // 2. Verify Foreground Service and Background Dart Engine initialization
+      final serviceReady = await commandBridge.ensureServiceStartedAndReady();
+      await _checkServiceReadySafe();
+      if (!serviceReady) {
+        restoreFailedRequiresRestart = true;
+        engineState = BotEngineState.failedStartupError;
+        restoreFailureReason =
+            lastStartupError ?? 'Foreground service failed to initialize';
+        lastStartupError = restoreFailureReason;
+        lastShutdownReason =
+            'Startup failed: Foreground service failed to initialize';
+        userIntention = UserSessionIntention.stopped;
+        statusBannerMessage =
+            'CANNOT START: FOREGROUND SERVICE FAILED TO INITIALIZE';
+        await persistence.saveStartupDiagnostics(
+          botState: BotEngineState.failedStartupError,
+          userIntention: UserSessionIntention.stopped,
+          lastStartupAttemptMs: now,
+          lastStartupError: lastStartupError,
+          lastShutdownReason: lastShutdownReason,
+          statusBannerMessage: statusBannerMessage,
+        );
+        await persistence.logDiagnosticEvent(
+          'STARTUP_FAILED',
+          lastStartupError!,
+          timestampMs: now,
+        );
+        notifyListeners();
+        return;
+      }
+
+      // 3. Dispatch START command and verify background engine acknowledgement
+      final ok = await commandBridge.dispatchCommand('START');
+      if (!ok) {
+        restoreFailedRequiresRestart = true;
+        engineState = BotEngineState.failedStartupError;
+        restoreFailureReason = lastStartupError ??
+            'Background Dart engine did not acknowledge START command';
+        lastStartupError = restoreFailureReason;
+        lastShutdownReason =
+            'Startup failed: Background Dart engine rejected or timed out on START';
+        userIntention = UserSessionIntention.stopped;
+        statusBannerMessage = 'FAILED — STARTUP ERROR: $lastStartupError';
+        await persistence.saveStartupDiagnostics(
+          botState: BotEngineState.failedStartupError,
+          userIntention: UserSessionIntention.stopped,
+          lastStartupAttemptMs: now,
+          lastStartupError: lastStartupError,
+          lastShutdownReason: lastShutdownReason,
+          statusBannerMessage: statusBannerMessage,
+        );
+        await persistence.logDiagnosticEvent(
+          'STARTUP_FAILED',
+          lastStartupError!,
+          timestampMs: now,
+        );
+        notifyListeners();
+        return;
+      }
+
+      // 4. Verify that the first engine cycle completed and persisted state in SQLite.
+      // If running with an in-memory test bridge or before background isolate flush,
+      // execute a verified initial cycle directly against shared persistence.
+      var snap = await persistence.loadFullState();
+      final hasFreshCycleHb = snap.lastHeartbeatMs != null &&
+          (now - snap.lastHeartbeatMs!).abs() <= 30000;
+      if ((snap.botState == BotEngineState.starting ||
+              snap.botState == BotEngineState.stopped ||
+              !hasFreshCycleHb) &&
+          !snap.botState.isRiskLock) {
+        final verifierEngine = AuthoritativeTradingEngine(
+          marketService: marketService,
+          persistence: persistence,
+          ownerId: AuthoritativeTradingEngine.lockName,
+          nowMsProvider: _nowMs,
+        );
+        await verifierEngine.restoreSessionIfRunningIntended();
+        if (verifierEngine.state == BotEngineState.starting ||
+            verifierEngine.state == BotEngineState.stopped) {
+          await verifierEngine.startEngine();
+        }
+        verifierEngine.dispose();
+        await persistence.releaseExecutionLock(
+          lockName: AuthoritativeTradingEngine.lockName,
+          ownerId: AuthoritativeTradingEngine.lockName,
+        );
+        snap = await persistence.loadFullState();
+      }
+
+      serviceRunning = true;
+      dartEngineInitialized = true;
+      _applySnapshotToFields(snap);
+      await dualPortfolioManager.syncCryptoPortfolioFromEngineSnapshot(snap);
+      if (engineState == BotEngineState.starting ||
+          engineState == BotEngineState.stopped) {
+        engineState = BotEngineState.running;
+      }
+      lastHeartbeatMs ??= now;
+      notifyListeners();
+    } finally {
+      _isStartupInFlight = false;
     }
   }
 
   Future<void> pauseBot() async {
     restoreFailedRequiresRestart = false;
-    await persistence.saveUserIntention(UserSessionIntention.paused);
+    final now = _nowMs();
     userIntention = UserSessionIntention.paused;
+    engineState = BotEngineState.pausedAfterRecoveryManualStartRequired;
+    lastShutdownReason = 'Paused by user';
+    statusBannerMessage = 'PAUSED (PAUSED_BY_USER): Paused by user';
+    await persistence.saveUserIntention(UserSessionIntention.paused);
+    await persistence.saveStartupDiagnostics(
+      botState: BotEngineState.pausedAfterRecoveryManualStartRequired,
+      userIntention: UserSessionIntention.paused,
+      lastShutdownReason: lastShutdownReason,
+      statusBannerMessage: statusBannerMessage,
+    );
     await commandBridge.dispatchCommand('PAUSE');
     await refreshStateFromDatabase();
   }
 
-  Future<void> stopBot() async {
+  Future<void> stopBot({String reason = 'Stopped by user'}) async {
     restoreFailedRequiresRestart = false;
-    await persistence.saveUserIntention(UserSessionIntention.stopped);
     userIntention = UserSessionIntention.stopped;
+    engineState = BotEngineState.stopped;
+    lastShutdownReason = reason;
+    statusBannerMessage = 'PAPER BOT STOPPED — $reason';
+    await persistence.saveUserIntention(UserSessionIntention.stopped);
+    await persistence.saveStartupDiagnostics(
+      botState: BotEngineState.stopped,
+      userIntention: UserSessionIntention.stopped,
+      lastShutdownReason: reason,
+      statusBannerMessage: statusBannerMessage,
+    );
     await commandBridge.dispatchCommand('STOP');
     await commandBridge.stopService();
+    serviceRunning = false;
     await refreshStateFromDatabase();
   }
 

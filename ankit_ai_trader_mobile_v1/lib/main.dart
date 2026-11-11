@@ -150,6 +150,25 @@ class _DashboardPageState extends State<DashboardPage>
   static const Color _mutedSlate = Color(0xFF94A3B8);
   static const Color _surfaceSubtle = Color(0xFF161F30);
 
+  static double _cleanZero(double val) => val.abs() < 0.005 ? 0.0 : val;
+
+  static String _formatSignedUsdt(double rawValue) {
+    final v = _cleanZero(rawValue);
+    if (v == 0.0) return '\$0.00';
+    return '${v > 0 ? "+" : "-"}\$${v.abs().toStringAsFixed(2)}';
+  }
+
+  static String _formatUnsignedUsdt(double rawValue) {
+    final v = _cleanZero(rawValue);
+    return '\$${v.abs().toStringAsFixed(2)}';
+  }
+
+  static String _formatSignedPct(double rawPct) {
+    final v = _cleanZero(rawPct);
+    if (v == 0.0) return '0.00%';
+    return '${v > 0 ? "+" : "-"}${v.abs().toStringAsFixed(2)}%';
+  }
+
   late final TradingCoordinator _coordinator;
   late final bool _ownsCoordinator;
   int _selectedTabIndex = 0;
@@ -377,13 +396,15 @@ class _DashboardPageState extends State<DashboardPage>
                             : const Color(0xFF283B5B),
                       ),
                     ),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
                       children: [
-                        const Flexible(
+                        const FittedBox(
+                          fit: BoxFit.scaleDown,
+                          alignment: Alignment.centerLeft,
                           child: Text(
                             'CRYPTO PORTFOLIO',
-                            overflow: TextOverflow.ellipsis,
                             style: TextStyle(
                               fontSize: 11,
                               fontWeight: FontWeight.bold,
@@ -391,13 +412,28 @@ class _DashboardPageState extends State<DashboardPage>
                             ),
                           ),
                         ),
-                        Text(
-                          '\$${_coordinator.cryptoPortfolio.accountEquityUsdt.toStringAsFixed(2)}',
-                          style: TextStyle(
-                            fontSize: 11,
-                            fontWeight: FontWeight.bold,
-                            color: isCrypto ? _greenProfit : Colors.white70,
-                          ),
+                        const SizedBox(height: 2),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Text(
+                              'CoinDCX Spot',
+                              style: TextStyle(
+                                fontSize: 9.5,
+                                color: _mutedSlate,
+                              ),
+                            ),
+                            Text(
+                              _formatUnsignedUsdt(
+                                _coordinator.cryptoPortfolio.accountEquityUsdt,
+                              ),
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.bold,
+                                color: isCrypto ? _greenProfit : Colors.white70,
+                              ),
+                            ),
+                          ],
                         ),
                       ],
                     ),
@@ -427,13 +463,15 @@ class _DashboardPageState extends State<DashboardPage>
                             : const Color(0xFF283B5B),
                       ),
                     ),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
                       children: [
-                        const Flexible(
+                        const FittedBox(
+                          fit: BoxFit.scaleDown,
+                          alignment: Alignment.centerLeft,
                           child: Text(
                             'HIGH-VOLATILITY PORTFOLIO',
-                            overflow: TextOverflow.ellipsis,
                             style: TextStyle(
                               fontSize: 11,
                               fontWeight: FontWeight.bold,
@@ -441,13 +479,29 @@ class _DashboardPageState extends State<DashboardPage>
                             ),
                           ),
                         ),
-                        Text(
-                          '\$${_coordinator.highVolatilityPortfolio.accountEquityUsdt.toStringAsFixed(2)}',
-                          style: TextStyle(
-                            fontSize: 11,
-                            fontWeight: FontWeight.bold,
-                            color: !isCrypto ? _orangeWarn : Colors.white70,
-                          ),
+                        const SizedBox(height: 2),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Text(
+                              'Research-Only',
+                              style: TextStyle(
+                                fontSize: 9.5,
+                                color: Colors.amberAccent,
+                              ),
+                            ),
+                            Text(
+                              _formatUnsignedUsdt(
+                                _coordinator
+                                    .highVolatilityPortfolio.accountEquityUsdt,
+                              ),
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.bold,
+                                color: !isCrypto ? _orangeWarn : Colors.white70,
+                              ),
+                            ),
+                          ],
                         ),
                       ],
                     ),
@@ -586,28 +640,32 @@ class _DashboardPageState extends State<DashboardPage>
                           Expanded(
                             child: _metricTile(
                               'Daily P&L',
-                              '${dailyPnl >= 0 ? "+" : ""}\$${dailyPnl.toStringAsFixed(2)} (${dailyPct >= 0 ? "+" : ""}${dailyPct.toStringAsFixed(2)}%)',
-                              valueColor:
-                                  dailyPnl >= 0 ? _greenProfit : _redLoss,
+                              '${_formatSignedUsdt(dailyPnl)} (${_formatSignedPct(dailyPct)})',
+                              valueColor: _cleanZero(dailyPnl) >= 0
+                                  ? _greenProfit
+                                  : _redLoss,
                             ),
                           ),
                           const SizedBox(width: 6),
                           Expanded(
                             child: _metricTile(
                               'Overall P&L',
-                              '${overallPnl >= 0 ? "+" : ""}\$${overallPnl.toStringAsFixed(2)} (${overallPct >= 0 ? "+" : ""}${overallPct.toStringAsFixed(2)}%)',
-                              valueColor:
-                                  overallPnl >= 0 ? _greenProfit : _redLoss,
+                              '${_formatSignedUsdt(overallPnl)} (${_formatSignedPct(overallPct)})',
+                              valueColor: _cleanZero(overallPnl) >= 0
+                                  ? _greenProfit
+                                  : _redLoss,
                             ),
                           ),
                           const SizedBox(width: 6),
                           Expanded(
                             child: _metricTile(
                               'Drawdown (Max \$10)',
-                              '\$${dd.toStringAsFixed(2)}',
-                              valueColor: dd >= 5.0
+                              _formatUnsignedUsdt(dd),
+                              valueColor: _cleanZero(dd) >= 5.0
                                   ? _redLoss
-                                  : (dd > 0 ? _orangeWarn : _greenProfit),
+                                  : (_cleanZero(dd) > 0
+                                      ? _orangeWarn
+                                      : _greenProfit),
                             ),
                           ),
                         ],
@@ -653,8 +711,8 @@ class _DashboardPageState extends State<DashboardPage>
                   child: _statStripItem(
                     Icons.bar_chart,
                     'Total Profit',
-                    '${overallPnl >= 0 ? "+" : ""}\$${overallPnl.toStringAsFixed(2)}',
-                    overallPnl >= 0 ? _greenProfit : _redLoss,
+                    _formatSignedUsdt(overallPnl),
+                    _cleanZero(overallPnl) >= 0 ? _greenProfit : _redLoss,
                   ),
                 ),
               ],
@@ -948,8 +1006,20 @@ class _DashboardPageState extends State<DashboardPage>
                   ],
                 ),
                 Text(
-                  'Discovered: ${cat.totalDiscoveredCount} | Active: ${cat.activeMarketsCount} | Eligible: ${cat.eligibleMarketsCount}',
+                  'Discovered: ${cat.totalDiscoveredCount} | Active: ${cat.activeMarketsCount} | Eligible: ${cat.eligibleMarketsCount} (USDT: ${cat.eligibleUsdtMarketsCount}) | Excluded: ${cat.rejectedMarketsCount}',
                   style: const TextStyle(fontSize: 11, color: Colors.white70),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  _coordinator.showOnlyEligibleMarkets
+                      ? 'View Mode: Showing ONLY Eligible Paper-Trading Markets (Verified Liquidity, Spread <= 35 bps & Risk Rules)'
+                      : 'View Mode: Showing ALL Discovered Catalogue Markets (Both Eligible & Excluded — toggle "✓ Eligible Only" to filter)',
+                  style: TextStyle(
+                    fontSize: 10,
+                    color: _coordinator.showOnlyEligibleMarkets
+                        ? _greenProfit
+                        : _mutedSlate,
+                  ),
                 ),
                 const SizedBox(height: 8),
                 TextField(
@@ -975,6 +1045,15 @@ class _DashboardPageState extends State<DashboardPage>
                       label: const Text('★ Favs', style: TextStyle(fontSize: 11)),
                       selected: _coordinator.showOnlyFavouriteMarkets,
                       onSelected: _coordinator.setShowOnlyFavouriteMarkets,
+                    ),
+                    FilterChip(
+                      key: const ValueKey('filter_eligible_only_markets'),
+                      label: Text(
+                        '✓ Eligible Only (${cat.eligibleMarketsCount})',
+                        style: const TextStyle(fontSize: 11),
+                      ),
+                      selected: _coordinator.showOnlyEligibleMarkets,
+                      onSelected: _coordinator.setShowOnlyEligibleMarkets,
                     ),
                     ...quoteOptions.map((q) {
                       final sel =
@@ -1022,6 +1101,7 @@ class _DashboardPageState extends State<DashboardPage>
                     return ListTile(
                       dense: true,
                       contentPadding: EdgeInsets.zero,
+                      onTap: () => _showMarketDetailBottomSheet(m),
                       leading: IconButton(
                         icon: Icon(
                           isFav ? Icons.star : Icons.star_border,
@@ -1159,7 +1239,8 @@ class _DashboardPageState extends State<DashboardPage>
   }
 
   Widget _buildAiLabTab() {
-    final activeStrat = _coordinator.strategyRegistry.activeStrategy;
+    final activeStrat = _coordinator.activePortfolioStrategyDescriptor;
+    final availStrats = _coordinator.activePortfolioAvailableStrategies;
     final learningCtx = _coordinator.activePortfolio.learningContext;
     final costEst = _coordinator.agentOrchestrator.estimateCouncilRunCost();
     final hypotheses =
@@ -1183,13 +1264,25 @@ class _DashboardPageState extends State<DashboardPage>
                 ),
                 const SizedBox(height: 8),
                 _diagRow(
-                  'Active Strategy',
+                  'Active Strategy (${_coordinator.activePortfolio.portfolioId.shortLabel})',
                   '${activeStrat.name} (${activeStrat.version})',
                   _greenProfit,
                 ),
                 _diagRow(
+                  'Strategy Entry Rule',
+                  activeStrat.entryRuleSummary,
+                  Colors.white70,
+                ),
+                _diagRow(
                   'Evaluated Portfolio Trades',
-                  '${learningCtx.evaluatedClosedTradesCount} (${learningCtx.observedWinningTrades}W / ${learningCtx.observedLosingTrades}L)',
+                  learningCtx.evaluatedClosedTradesCount > 0
+                      ? '${learningCtx.evaluatedClosedTradesCount} (${learningCtx.observedWinningTrades}W / ${learningCtx.observedLosingTrades}L)'
+                      : '0 (Performance not yet established)',
+                  Colors.white,
+                ),
+                _diagRow(
+                  'Configured Max Open Positions',
+                  '${_coordinator.activePortfolio.configuredMaxOpenPositions} (Isolated per portfolio)',
                   Colors.white,
                 ),
                 _diagRow(
@@ -1205,11 +1298,52 @@ class _DashboardPageState extends State<DashboardPage>
                   Colors.white70,
                 ),
                 const SizedBox(height: 8),
+                const Text(
+                  'PORTFOLIO-ISOLATED STRATEGY SELECTION',
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                    color: _mutedSlate,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  children: availStrats.map((s) {
+                    final selected =
+                        _coordinator.activePortfolio.activeStrategyId == s.id;
+                    return ChoiceChip(
+                      key: ValueKey(
+                        'select_strat_${_coordinator.selectedPortfolioId.dbKey}_${s.id}',
+                      ),
+                      label: Text(
+                        s.name,
+                        style: const TextStyle(fontSize: 10),
+                      ),
+                      selected: selected,
+                      onSelected: (_) => _coordinator.setPortfolioStrategy(
+                        portfolioId: _coordinator.selectedPortfolioId,
+                        strategyId: s.id,
+                      ),
+                    );
+                  }).toList(),
+                ),
+                const SizedBox(height: 10),
+                const Text(
+                  'SANDBOX STRATEGY CANDIDATES (RESEARCH ONLY — NOT ACTIVE)',
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                    color: _mutedSlate,
+                  ),
+                ),
+                const SizedBox(height: 4),
                 ...hypotheses.map(
                   (h) => Padding(
                     padding: const EdgeInsets.only(bottom: 4),
                     child: Text(
-                      '• ${h.candidateId}: ${h.description}',
+                      '• ${h.candidateId} [SANDBOX CANDIDATE]: ${h.description}',
                       style: const TextStyle(fontSize: 11, color: Colors.white70),
                     ),
                   ),
@@ -1233,6 +1367,11 @@ class _DashboardPageState extends State<DashboardPage>
         _coordinator.computeRealizedPnlForWindowMs(30 * 24 * 60 * 60 * 1000);
     final totalPnl = _coordinator.activeOverallPnlUsdt;
     final durStats = _coordinator.tradeDurationStats;
+    final hasCompletedTrades = _coordinator.activeClosedTrades.isNotEmpty;
+    final currentDd = _coordinator.activeDrawdownUsdt;
+    final remDd = _coordinator.activeRemainingDrawdownUsdt;
+    final startBal = _coordinator.activePortfolio.startingBalanceUsdt;
+    final ddPct = startBal > 0 ? (_cleanZero(currentDd) / startBal) * 100.0 : 0.0;
 
     return ListView(
       padding: const EdgeInsets.all(12),
@@ -1243,42 +1382,77 @@ class _DashboardPageState extends State<DashboardPage>
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text(
-                  'FINANCIAL PERFORMANCE ANALYTICS',
-                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    const Text(
+                      'FINANCIAL PERFORMANCE ANALYTICS',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 13,
+                      ),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: _showCsvAccountingExportDialog,
+                      icon: const Icon(Icons.download_outlined, size: 15),
+                      label: const Text(
+                        'EXPORT CSV',
+                        style: TextStyle(fontSize: 11),
+                      ),
+                    ),
+                  ],
                 ),
+                if (!hasCompletedTrades) ...[
+                  const SizedBox(height: 8),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: _surfaceSubtle,
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: const Text(
+                      'Performance not yet established — no completed paper trades recorded for this portfolio.',
+                      style: TextStyle(fontSize: 11, color: Colors.white70),
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 10),
                 Row(
                   children: [
                     Expanded(
                       child: _metricTile(
                         'Daily (24H)',
-                        '${pnl24h >= 0 ? "+" : ""}\$${pnl24h.toStringAsFixed(2)}',
-                        valueColor: pnl24h >= 0 ? _greenProfit : _redLoss,
+                        _formatSignedUsdt(pnl24h),
+                        valueColor:
+                            _cleanZero(pnl24h) >= 0 ? _greenProfit : _redLoss,
                       ),
                     ),
                     const SizedBox(width: 6),
                     Expanded(
                       child: _metricTile(
                         'Weekly (7D)',
-                        '${pnl7d >= 0 ? "+" : ""}\$${pnl7d.toStringAsFixed(2)}',
-                        valueColor: pnl7d >= 0 ? _greenProfit : _redLoss,
+                        _formatSignedUsdt(pnl7d),
+                        valueColor:
+                            _cleanZero(pnl7d) >= 0 ? _greenProfit : _redLoss,
                       ),
                     ),
                     const SizedBox(width: 6),
                     Expanded(
                       child: _metricTile(
                         'Monthly (30D)',
-                        '${pnl30d >= 0 ? "+" : ""}\$${pnl30d.toStringAsFixed(2)}',
-                        valueColor: pnl30d >= 0 ? _greenProfit : _redLoss,
+                        _formatSignedUsdt(pnl30d),
+                        valueColor:
+                            _cleanZero(pnl30d) >= 0 ? _greenProfit : _redLoss,
                       ),
                     ),
                     const SizedBox(width: 6),
                     Expanded(
                       child: _metricTile(
                         'Total P&L',
-                        '${totalPnl >= 0 ? "+" : ""}\$${totalPnl.toStringAsFixed(2)}',
-                        valueColor: totalPnl >= 0 ? _greenProfit : _redLoss,
+                        _formatSignedUsdt(totalPnl),
+                        valueColor:
+                            _cleanZero(totalPnl) >= 0 ? _greenProfit : _redLoss,
                       ),
                     ),
                   ],
@@ -1286,9 +1460,31 @@ class _DashboardPageState extends State<DashboardPage>
                 const SizedBox(height: 10),
                 _diagRow(
                   'Trade Duration (Avg / Min / Max)',
-                  _coordinator.activeClosedTrades.isNotEmpty
+                  hasCompletedTrades
                       ? '${durStats.avgMinutes}m / ${durStats.minMinutes}m / ${durStats.maxMinutes}m'
                       : 'No completed trades yet',
+                  Colors.white70,
+                ),
+                _diagRow(
+                  'Actual Paper Trades',
+                  hasCompletedTrades
+                      ? '${_coordinator.activeClosedTrades.length} completed trade(s)'
+                      : '0 completed (Performance not yet established)',
+                  Colors.white,
+                ),
+                _diagRow(
+                  'Historical Backtest Results',
+                  _coordinator.latestBacktestReport != null
+                      ? '${_coordinator.latestBacktestReport!.totalTrades} simulated trades (Net ${_formatSignedUsdt(_coordinator.latestBacktestReport!.netPnlUsdt)})'
+                      : 'Not run in this session (Separate from paper account)',
+                  Colors.white70,
+                ),
+                _diagRow(
+                  'Walk-Forward & Out-of-Sample Data',
+                  _coordinator.activeClosedTrades.length >= 5
+                      ? (_coordinator.latestRobustnessReport?.summaryReason ??
+                          'Evaluated')
+                      : 'Unavailable (Requires >= 5 completed paper trades)',
                   Colors.white70,
                 ),
               ],
@@ -1309,6 +1505,22 @@ class _DashboardPageState extends State<DashboardPage>
                     fontWeight: FontWeight.bold,
                     color: _mutedSlate,
                   ),
+                ),
+                const SizedBox(height: 6),
+                _diagRow(
+                  'Current Portfolio Drawdown',
+                  '${_formatUnsignedUsdt(currentDd)} (${ddPct.toStringAsFixed(2)}%)',
+                  _cleanZero(currentDd) > 0 ? _orangeWarn : _greenProfit,
+                ),
+                _diagRow(
+                  'Approved Max Account Drawdown Limit',
+                  '\$10.00 USDT (10.0% of \$100.00 • \$90.00 Floor)',
+                  Colors.white,
+                ),
+                _diagRow(
+                  'Remaining Drawdown Risk Buffer',
+                  '${_formatUnsignedUsdt(remDd)} remaining',
+                  remDd > 3.0 ? _greenProfit : _orangeWarn,
                 ),
                 const SizedBox(height: 8),
                 SizedBox(
@@ -1349,6 +1561,22 @@ class _DashboardPageState extends State<DashboardPage>
                   'ENGINE CONTROLS (PAPER TRADING ONLY)',
                   style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
                 ),
+                const SizedBox(height: 6),
+                Text(
+                  'State: ${_coordinator.engineState.startupStateMachineLabel}',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                    color: _coordinator.engineState == BotEngineState.running
+                        ? _greenProfit
+                        : _orangeWarn,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  _coordinator.statusBannerMessage,
+                  style: const TextStyle(fontSize: 11, color: Colors.white70),
+                ),
                 const SizedBox(height: 10),
                 Wrap(
                   spacing: 8,
@@ -1365,16 +1593,100 @@ class _DashboardPageState extends State<DashboardPage>
                       label: const Text('PAUSE'),
                     ),
                     OutlinedButton.icon(
-                      onPressed: _coordinator.stopBot,
+                      onPressed: _confirmAndStopBot,
                       icon: const Icon(Icons.stop, size: 16),
                       label: const Text('STOP'),
                     ),
                     OutlinedButton.icon(
-                      onPressed: _coordinator.manualResetDrawdownAndAccount,
+                      onPressed: _confirmAndResetAccount,
                       icon: const Icon(Icons.refresh, size: 16),
                       label: const Text('RESET \$100'),
                     ),
                   ],
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'ENGINE STARTUP & RUNTIME DIAGNOSTICS',
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                ),
+                const SizedBox(height: 8),
+                _diagRow(
+                  'Foreground Service Status',
+                  _coordinator.serviceRunning ? 'RUNNING (Alive)' : 'STOPPED',
+                  _coordinator.serviceRunning ? _greenProfit : _orangeWarn,
+                ),
+                _diagRow(
+                  'Background Dart Engine Status',
+                  _coordinator.dartEngineInitialized
+                      ? 'READY (Initialized)'
+                      : 'NOT INITIALIZED',
+                  _coordinator.dartEngineInitialized
+                      ? _greenProfit
+                      : _orangeWarn,
+                ),
+                _diagRow(
+                  'Last Successful Heartbeat',
+                  _coordinator.formatHeartbeatStatus(),
+                  Colors.white70,
+                ),
+                _diagRow(
+                  'Last Successful Market-Data Update',
+                  _coordinator.lastMarketDataUpdateMs != null
+                      ? TradingCoordinator.formatUtcHhMmSs(
+                          _coordinator.lastMarketDataUpdateMs!,
+                        )
+                      : 'None recorded',
+                  Colors.white70,
+                ),
+                _diagRow(
+                  'Last Startup Attempt',
+                  _coordinator.lastStartupAttemptMs != null
+                      ? TradingCoordinator.formatUtcHhMmSs(
+                          _coordinator.lastStartupAttemptMs!,
+                        )
+                      : 'None recorded',
+                  Colors.white70,
+                ),
+                _diagRow(
+                  'Last Startup Error',
+                  _coordinator.lastStartupError ?? 'None',
+                  _coordinator.lastStartupError != null
+                      ? _redLoss
+                      : _greenProfit,
+                ),
+                _diagRow(
+                  'Last Shutdown Reason',
+                  _coordinator.lastShutdownReason ?? 'None',
+                  Colors.white70,
+                ),
+                _diagRow(
+                  'Last Background-Cycle Error',
+                  _coordinator.lastBackgroundCycleError ?? 'None',
+                  _coordinator.lastBackgroundCycleError != null
+                      ? _orangeWarn
+                      : _greenProfit,
+                ),
+                _diagRow(
+                  'Current Portfolio State',
+                  '${_coordinator.activePortfolio.displayName} (${_coordinator.activePortfolio.isResearchOnlyMode ? "RESEARCH-ONLY" : "PAPER ACTIVE"} • ${_formatUnsignedUsdt(_coordinator.activeEquityUsdt)})',
+                  Colors.white,
+                ),
+                _diagRow(
+                  'Current Network Status',
+                  _coordinator.internetConnected
+                      ? 'CONNECTED (Online)'
+                      : 'DISCONNECTED (Offline)',
+                  _coordinator.internetConnected ? _greenProfit : _redLoss,
                 ),
               ],
             ),
@@ -1751,6 +2063,344 @@ class _DashboardPageState extends State<DashboardPage>
       ),
     );
   }
+
+  void _showMarketDetailBottomSheet(CoinDcxMarketRecord market) {
+    String selectedInterval = '15m';
+    Future<List<Candle>>? candlesFuture = _coordinator.marketService
+        .fetchClosedCandles(
+          pair: market.pair.isNotEmpty ? market.pair : 'B-BTC_USDT',
+          interval: selectedInterval,
+          nowMs: DateTime.now().millisecondsSinceEpoch,
+          limit: 60,
+        );
+
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF101622),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setModalState) {
+            final t = market.latestTicker;
+            return DraggableScrollableSheet(
+              expand: false,
+              initialChildSize: 0.78,
+              minChildSize: 0.5,
+              maxChildSize: 0.94,
+              builder: (_, scrollCtrl) {
+                return ListView(
+                  controller: scrollCtrl,
+                  padding: const EdgeInsets.all(16),
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              '${market.symbol} (${market.pair})',
+                              style: const TextStyle(
+                                fontSize: 17,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            Text(
+                              'Exchange: ${market.exchangeName} (${market.ecode}) • Asset: ${market.targetCurrencyShortName} • Quote: ${market.baseCurrencyShortName}',
+                              style: const TextStyle(
+                                fontSize: 11,
+                                color: _mutedSlate,
+                              ),
+                            ),
+                          ],
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.close),
+                          onPressed: () => Navigator.of(ctx).pop(),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    if (t != null)
+                      Row(
+                        children: [
+                          Expanded(
+                            child: _metricTile(
+                              'Last Price',
+                              '${t.lastPrice.toStringAsFixed(market.pricePrecision.clamp(2, 8))} ${market.baseCurrencyShortName}',
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: _metricTile(
+                              '24h Change',
+                              '${t.change24hPct >= 0 ? "+" : ""}${t.change24hPct.toStringAsFixed(2)}%',
+                              valueColor: t.change24hPct >= 0
+                                  ? _greenProfit
+                                  : _redLoss,
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: _metricTile(
+                              'Spread',
+                              '${t.spreadBps.toStringAsFixed(1)} bps',
+                            ),
+                          ),
+                        ],
+                      ),
+                    const SizedBox(height: 12),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text(
+                          'CLOSED CANDLESTICK CHART',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.bold,
+                            color: _mutedSlate,
+                          ),
+                        ),
+                        Row(
+                          children: ['15m', '1h'].map((tf) {
+                            final active = selectedInterval == tf;
+                            return Padding(
+                              padding: const EdgeInsets.only(left: 6),
+                              child: ChoiceChip(
+                                label: Text(
+                                  tf,
+                                  style: const TextStyle(fontSize: 11),
+                                ),
+                                selected: active,
+                                onSelected: (_) {
+                                  setModalState(() {
+                                    selectedInterval = tf;
+                                    candlesFuture = _coordinator.marketService
+                                        .fetchClosedCandles(
+                                          pair: market.pair.isNotEmpty
+                                              ? market.pair
+                                              : 'B-BTC_USDT',
+                                          interval: selectedInterval,
+                                          nowMs: DateTime.now()
+                                              .millisecondsSinceEpoch,
+                                          limit: 60,
+                                        );
+                                  });
+                                },
+                              ),
+                            );
+                          }).toList(),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Container(
+                      height: 180,
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF0B101B),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: const Color(0xFF1E293B)),
+                      ),
+                      child: FutureBuilder<List<Candle>>(
+                        future: candlesFuture,
+                        builder: (ctx, snap) {
+                          if (snap.connectionState == ConnectionState.waiting) {
+                            return const Center(
+                              child: CircularProgressIndicator(),
+                            );
+                          }
+                          final candles = snap.data ?? const [];
+                          if (candles.isEmpty) {
+                            return const Center(
+                              child: Text(
+                                'No closed candles returned for this pair.',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.white54,
+                                ),
+                              ),
+                            );
+                          }
+                          return CustomPaint(
+                            painter: _CandlestickChartPainter(candles: candles),
+                            size: const Size(double.infinity, 160),
+                          );
+                        },
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    _diagRow(
+                      'Min Quantity / Step',
+                      '${market.minQuantity} / ${market.step} ${market.targetCurrencyShortName}',
+                      Colors.white70,
+                    ),
+                    _diagRow(
+                      'Min Notional',
+                      '${market.minNotional} ${market.baseCurrencyShortName}',
+                      Colors.white70,
+                    ),
+                    _diagRow(
+                      'Eligibility Status',
+                      '${market.eligibilityStatus.categoryLabel} (${market.eligibilityReason})',
+                      market.isEligibleForPaperTrading
+                          ? _greenProfit
+                          : _orangeWarn,
+                    ),
+                  ],
+                );
+              },
+            );
+          },
+        );
+      },
+    );
+  }
+
+  void _showCsvAccountingExportDialog() {
+    final summary = _coordinator.latestTaxAccountingSummary;
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF101622),
+        title: const Text('CSV Trade History & Tax Export'),
+        content: SingleChildScrollView(
+          child: SelectableText(
+            summary.csvExportPreview,
+            style: const TextStyle(fontSize: 11, fontFamily: 'monospace'),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: summary.csvExportPreview));
+              Navigator.of(ctx).pop();
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('CSV copied to clipboard.')),
+              );
+            },
+            child: const Text('COPY CSV'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('CLOSE'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _confirmAndStopBot() {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF101622),
+        title: const Text('Stop Paper Trading Bot?'),
+        content: const Text(
+          'This will stop scheduled multi-pair scanning and release the background execution lock. Existing positions and history are preserved.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('CANCEL'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              _coordinator.stopBot();
+            },
+            child: const Text('CONFIRM STOP'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _confirmAndResetAccount() {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF101622),
+        title: const Text('Reset Paper Account to \$100.00?'),
+        content: const Text(
+          'This will stop the bot, clear open positions and drawdown locks, and reset the Crypto Portfolio cash and equity to \$100.00 USDT.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('CANCEL'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              _coordinator.manualResetDrawdownAndAccount();
+            },
+            child: const Text('CONFIRM RESET'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _CandlestickChartPainter extends CustomPainter {
+  final List<Candle> candles;
+
+  const _CandlestickChartPainter({required this.candles});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (candles.isEmpty) return;
+    final visible = candles.length > 40
+        ? candles.sublist(candles.length - 40)
+        : candles;
+    final minLow = visible.map((c) => c.low).reduce(math.min);
+    final maxHigh = visible.map((c) => c.high).reduce(math.max);
+    final range = (maxHigh - minLow).abs() < 1e-8 ? 1.0 : (maxHigh - minLow);
+
+    final slotWidth = size.width / visible.length;
+    final bodyWidth = (slotWidth * 0.65).clamp(2.0, 10.0);
+
+    for (int i = 0; i < visible.length; i++) {
+      final c = visible[i];
+      final bull = c.close >= c.open;
+      final color =
+          bull ? const Color(0xFF00E676) : const Color(0xFFFF5252);
+      final cx = (i + 0.5) * slotWidth;
+
+      double toY(double px) {
+        final norm = (px - minLow) / range;
+        return size.height - (norm * (size.height - 12)) - 6;
+      }
+
+      final highY = toY(c.high);
+      final lowY = toY(c.low);
+      final openY = toY(c.open);
+      final closeY = toY(c.close);
+
+      final wickPaint = Paint()
+        ..color = color
+        ..strokeWidth = 1.1;
+      canvas.drawLine(Offset(cx, highY), Offset(cx, lowY), wickPaint);
+
+      final top = math.min(openY, closeY);
+      final bottom = math.max(openY, closeY);
+      final rect = Rect.fromLTRB(
+        cx - bodyWidth / 2,
+        top,
+        cx + bodyWidth / 2,
+        math.max(bottom, top + 1.5),
+      );
+      canvas.drawRect(rect, Paint()..color = color);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _CandlestickChartPainter oldDelegate) =>
+      oldDelegate.candles != candles;
 }
 
 class _EquityCurvePainter extends CustomPainter {

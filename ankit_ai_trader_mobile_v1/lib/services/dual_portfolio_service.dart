@@ -5,6 +5,7 @@ import 'autonomous_intelligence_and_ops.dart';
 import 'execution_and_risk_hub.dart';
 import 'indicator_engine.dart';
 import 'persistence_db.dart';
+import 'quant_research_lab.dart';
 import 'risk_manager.dart';
 import 'stage47_autonomous_governance.dart';
 
@@ -641,9 +642,138 @@ class DualPortfolioManager {
     selectedPortfolioId = id;
   }
 
+  static const List<RegisteredStrategyDescriptor> _cryptoPortfolioStrategies = [
+    RegisteredStrategyDescriptor(
+      id: 'EMA_20_50_RSI_ATR_V1',
+      name: 'EMA 20/50 + RSI 14 + ATR 14 Multi-Timeframe',
+      version: '1.0.0',
+      status: StrategyApprovalStatus.approvedChampion,
+      supportedSymbols: ['ALL_ELIGIBLE_COINDCX_SPOT'],
+    ),
+    RegisteredStrategyDescriptor(
+      id: 'EMA_25_60_RSI_CONSERVATIVE_V1',
+      name: 'EMA 25/60 + RSI 14 Conservative Spot Trend Filter',
+      version: '1.0.0',
+      status: StrategyApprovalStatus.approvedChampion,
+      supportedSymbols: ['ALL_ELIGIBLE_COINDCX_SPOT'],
+      entryRuleSummary: '1H EMA25>EMA60 + 15m EMA25>EMA60 + RSI(14) 52-66',
+      exitRuleSummary: 'SL = 1.5x ATR(14), TP = 3.0x ATR(14) or Bearish Cross',
+    ),
+  ];
+
+  static const List<RegisteredStrategyDescriptor> _highVolPortfolioStrategies = [
+    RegisteredStrategyDescriptor(
+      id: 'HIGH_VOL_RESEARCH_CANDIDATE_V1',
+      name: 'ATR Volatility Breakout & Regime Filter (Research)',
+      version: '1.0.0-research',
+      status: StrategyApprovalStatus.shadowPaper,
+      supportedSymbols: ['HIGH_VOL_CRYPTO_AND_PRECIOUS_METALS'],
+      entryRuleSummary: 'High-Vol ATR(14) 1.2%–6.0% + Realized Vol >= 0.85% + Trend Filter',
+      exitRuleSummary: 'Research-Only Validation (SL = 1.5x ATR, TP = 3.0x ATR)',
+    ),
+    RegisteredStrategyDescriptor(
+      id: 'EMA_20_50_RSI_ATR_V1',
+      name: 'EMA 20/50 + RSI 14 + ATR 14 Multi-Timeframe',
+      version: '1.0.0',
+      status: StrategyApprovalStatus.shadowPaper,
+      supportedSymbols: ['HIGH_VOL_CRYPTO_AND_PRECIOUS_METALS'],
+    ),
+  ];
+
+  List<RegisteredStrategyDescriptor> availableStrategiesFor(PortfolioId id) {
+    return id == PortfolioId.crypto
+        ? _cryptoPortfolioStrategies
+        : _highVolPortfolioStrategies;
+  }
+
+  RegisteredStrategyDescriptor activeStrategyDescriptorFor(PortfolioId id) {
+    final snap = _snapshots[id]!;
+    final avail = availableStrategiesFor(id);
+    for (final s in avail) {
+      if (s.id == snap.activeStrategyId) return s;
+    }
+    for (final s in [
+      ..._cryptoPortfolioStrategies,
+      ..._highVolPortfolioStrategies,
+    ]) {
+      if (s.id == snap.activeStrategyId) return s;
+    }
+    return RegisteredStrategyDescriptor(
+      id: snap.activeStrategyId,
+      name: snap.activeStrategyId,
+      version: '1.0.0',
+      status: snap.isResearchOnlyMode
+          ? StrategyApprovalStatus.shadowPaper
+          : StrategyApprovalStatus.approvedChampion,
+    );
+  }
+
+  Future<void> setPortfolioStrategy({
+    required PortfolioId portfolioId,
+    required String strategyId,
+    int? nowMs,
+  }) async {
+    final cur = _snapshots[portfolioId]!;
+    final ts = nowMs ?? DateTime.now().millisecondsSinceEpoch;
+    final updated = cur.copyWith(
+      activeStrategyId: strategyId,
+      learningContext: PortfolioLearningContext(
+        portfolioId: portfolioId,
+        activeStrategyId: strategyId,
+        activeStrategyVersion: cur.learningContext.activeStrategyVersion,
+        evaluatedClosedTradesCount: cur.learningContext.evaluatedClosedTradesCount,
+        observedWinningTrades: cur.learningContext.observedWinningTrades,
+        observedLosingTrades: cur.learningContext.observedLosingTrades,
+        cumulativeRealizedPnlUsdt: cur.learningContext.cumulativeRealizedPnlUsdt,
+        regimeObservationsCount: cur.learningContext.regimeObservationsCount,
+        symbolRealizedPnlMap: cur.learningContext.symbolRealizedPnlMap,
+        learningInsights: [
+          'Selected strategy $strategyId for ${portfolioId.displayName} (isolated from other portfolio).',
+          ...cur.learningContext.learningInsights.take(4),
+        ],
+        currentPipelineStage: cur.learningContext.currentPipelineStage,
+        autoStrategyTransferBlocked: true,
+        autoDeployOnSingleTradeBlocked: true,
+        preciousMetalsDataReady: cur.learningContext.preciousMetalsDataReady,
+      ),
+      updatedAtMs: ts,
+    );
+    _snapshots[portfolioId] = updated;
+    await persistence.savePortfolioAccountSnapshot(updated);
+  }
+
+  Future<void> updatePortfolioSettings({
+    required PortfolioId portfolioId,
+    int? configuredMaxOpenPositions,
+    String? statusSummary,
+    int? nowMs,
+  }) async {
+    final cur = _snapshots[portfolioId]!;
+    final ts = nowMs ?? DateTime.now().millisecondsSinceEpoch;
+    final clampedMaxPos = configuredMaxOpenPositions != null
+        ? configuredMaxOpenPositions.clamp(1, maxArchitecturalSimultaneousPositions)
+        : cur.configuredMaxOpenPositions;
+    final updated = cur.copyWith(
+      configuredMaxOpenPositions: clampedMaxPos,
+      statusSummary: statusSummary ?? cur.statusSummary,
+      updatedAtMs: ts,
+    );
+    _snapshots[portfolioId] = updated;
+    await persistence.savePortfolioAccountSnapshot(updated);
+  }
+
   Future<void> syncCryptoPortfolioFromEngineSnapshot(
     PersistedEngineSnapshot snap,
   ) async {
+    final persistedCrypto = await persistence.loadPortfolioAccountSnapshot(
+      PortfolioId.crypto,
+    );
+    if (persistedCrypto != null) {
+      _snapshots[PortfolioId.crypto] = _snapshots[PortfolioId.crypto]!.copyWith(
+        activeStrategyId: persistedCrypto.activeStrategyId,
+        configuredMaxOpenPositions: persistedCrypto.configuredMaxOpenPositions,
+      );
+    }
     final cryptoPositions = snap.openPositions
         .where((p) => p.portfolioId == PortfolioId.crypto.dbKey)
         .toList();

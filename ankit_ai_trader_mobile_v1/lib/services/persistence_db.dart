@@ -39,6 +39,10 @@ class PersistedEngineSnapshot {
   final int? nextRecoveryAllowedAtMs;
   final List<String> recoveryLogs;
   final ScanCycleDiagnosticsSnapshot scanDiagnostics;
+  final int? lastStartupAttemptMs;
+  final String? lastStartupError;
+  final String? lastShutdownReason;
+  final String? lastBackgroundCycleError;
 
   const PersistedEngineSnapshot({
     required this.botState,
@@ -75,6 +79,10 @@ class PersistedEngineSnapshot {
     this.nextRecoveryAllowedAtMs,
     this.recoveryLogs = const [],
     this.scanDiagnostics = const ScanCycleDiagnosticsSnapshot(),
+    this.lastStartupAttemptMs,
+    this.lastStartupError,
+    this.lastShutdownReason,
+    this.lastBackgroundCycleError,
   });
 }
 
@@ -731,6 +739,10 @@ class PersistenceDatabase {
     required List<ClosedPaperTrade> closedTrades,
     required Set<String> processedEntrySignalKeys,
     ScanCycleDiagnosticsSnapshot? scanDiagnostics,
+    int? lastStartupAttemptMs,
+    String? lastStartupError,
+    String? lastShutdownReason,
+    String? lastBackgroundCycleError,
   }) async {
     await putKv('botState', botState.name);
     if (userIntention != null) {
@@ -765,6 +777,18 @@ class PersistenceDatabase {
     await putKv('whyNoTradeForSymbol', jsonEncode(whyNoTradeForSymbol));
     if (scanDiagnostics != null) {
       await putKv('scanCycleDiagnostics', jsonEncode(scanDiagnostics.toMap()));
+    }
+    if (lastStartupAttemptMs != null) {
+      await putKv('lastStartupAttemptMs', jsonEncode(lastStartupAttemptMs));
+    }
+    if (lastStartupError != null) {
+      await putKv('lastStartupError', jsonEncode(lastStartupError));
+    }
+    if (lastShutdownReason != null) {
+      await putKv('lastShutdownReason', jsonEncode(lastShutdownReason));
+    }
+    if (lastBackgroundCycleError != null) {
+      await putKv('lastBackgroundCycleError', jsonEncode(lastBackgroundCycleError));
     }
 
     final nowMs = lastHeartbeatMs ?? DateTime.now().millisecondsSinceEpoch;
@@ -1028,7 +1052,52 @@ class PersistenceDatabase {
       nextRecoveryAllowedAtMs: parseIntOrNull('nextRecoveryAllowedAtMs'),
       recoveryLogs: parseStringList('recoveryLogs'),
       scanDiagnostics: await loadScanCycleDiagnostics(),
+      lastStartupAttemptMs: parseIntOrNull('lastStartupAttemptMs'),
+      lastStartupError: parseStringOrNull('lastStartupError'),
+      lastShutdownReason: parseStringOrNull('lastShutdownReason'),
+      lastBackgroundCycleError: parseStringOrNull('lastBackgroundCycleError'),
     );
+  }
+
+  Future<void> saveStartupDiagnostics({
+    BotEngineState? botState,
+    UserSessionIntention? userIntention,
+    int? lastStartupAttemptMs,
+    String? lastStartupError,
+    bool clearStartupError = false,
+    String? lastShutdownReason,
+    bool clearShutdownReason = false,
+    String? lastBackgroundCycleError,
+    bool clearBackgroundCycleError = false,
+    String? statusBannerMessage,
+  }) async {
+    if (botState != null) {
+      await putKv('botState', botState.name);
+    }
+    if (userIntention != null) {
+      await putKv('userIntention', userIntention.name);
+    }
+    if (lastStartupAttemptMs != null) {
+      await putKv('lastStartupAttemptMs', jsonEncode(lastStartupAttemptMs));
+    }
+    if (clearStartupError) {
+      await putKv('lastStartupError', jsonEncode(null));
+    } else if (lastStartupError != null) {
+      await putKv('lastStartupError', jsonEncode(lastStartupError));
+    }
+    if (clearShutdownReason) {
+      await putKv('lastShutdownReason', jsonEncode(null));
+    } else if (lastShutdownReason != null) {
+      await putKv('lastShutdownReason', jsonEncode(lastShutdownReason));
+    }
+    if (clearBackgroundCycleError) {
+      await putKv('lastBackgroundCycleError', jsonEncode(null));
+    } else if (lastBackgroundCycleError != null) {
+      await putKv('lastBackgroundCycleError', jsonEncode(lastBackgroundCycleError));
+    }
+    if (statusBannerMessage != null) {
+      await putKv('statusBannerMessage', statusBannerMessage);
+    }
   }
 
   Future<void> savePortfolioAccountSnapshot(
