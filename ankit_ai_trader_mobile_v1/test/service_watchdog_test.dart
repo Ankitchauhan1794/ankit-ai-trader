@@ -1446,7 +1446,7 @@ void main() {
     await db.close();
   });
 
-  test('Full System Audit Tests 1–20 (Section 12): Spot accounting ($62.30 reserved / $37.64 cash / -$0.55 unrealised P&L), 15% ($85.00) portfolio loss lockout, 5-position capacity (x/5), duplicate order prevention, and portfolio isolation', () async {
+  test('Full System Audit Tests 1–20 (Section 12): Spot accounting (\$62.30 reserved / \$37.64 cash / -\$0.55 unrealised P&L), 15% (\$85.00) portfolio loss lockout, 5-position capacity (x/5), duplicate order prevention, and portfolio isolation', () async {
     final db = PersistenceDatabase(useInMemoryFallback: true);
     int nowMs = 1700000100000;
     final bridge = _FakeCommandBridge(serviceReady: true, shouldSucceedStart: true);
@@ -1592,9 +1592,9 @@ void main() {
         quoteCurrency: 'USDT',
         category: PortfolioAssetCategory.standardCryptoSpot,
         contractSize: 1.0,
-        minQuantity: 0.1,
+        minQuantity: 0.01,
         maxQuantity: 1000.0,
-        quantityStep: 0.1,
+        quantityStep: 0.01,
         tickSize: 0.01,
         tickValue: 0.01,
         minNotional: 5.0,
@@ -1611,10 +1611,10 @@ void main() {
       final res = await manager.openIsolatedPaperPosition(
         portfolioId: PortfolioId.crypto,
         instrumentSpec: spec,
-        entryPrice: 10.0,
-        stopLossPrice: 9.0,
-        takeProfitPrice: 12.0,
-        quantity: 1.0, // $10 notional each -> 5 positions = $50 reserved
+        entryPrice: 100.0,
+        stopLossPrice: 95.0,
+        takeProfitPrice: 110.0,
+        quantity: 0.1, // 100.0 * 0.1 = 10.0 notional each -> 5 positions = 50.0 reserved
         nowMs: nowMs + i * 1000,
       );
       expect(res.executed, isTrue);

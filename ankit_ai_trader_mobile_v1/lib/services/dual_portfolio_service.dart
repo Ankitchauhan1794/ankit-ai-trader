@@ -986,6 +986,17 @@ class DualPortfolioManager {
       );
     }
 
+    if (snap.isPortfolioLossLockoutTriggered) {
+      supervisor.portfolioLossLockoutActive = true;
+      return (
+        approved: false,
+        approvedQuantity: 0.0,
+        stopLossPrice: stopLossPrice,
+        rejectionReason:
+            'PORTFOLIO_LOSS_LIMIT_15PCT_LOCKOUT: Portfolio ${snap.maxPortfolioLossPct.toStringAsFixed(1)}% loss lockout active (Equity \$${snap.accountEquityUsdt.toStringAsFixed(2)} <= \$${snap.portfolioLossFloorUsdt.toStringAsFixed(2)} floor).',
+      );
+    }
+
     if (!instrumentSpec.hasCompleteQuantitativeSpecs ||
         !instrumentSpec.isExecutionAuthorized) {
       return (
