@@ -326,13 +326,6 @@ class MarketPairMetadata {
   });
 }
 
-/// Stage 47.1 Section 5: Complete CoinDCX Spot Market Record.
-/// Preserves CoinDCX's exact official terminology from https://docs.coindcx.com/:
-/// - `baseCurrencyShortName` (`base_currency_short_name`): The price / quote currency (e.g., INR, USDT, BTC, ETH).
-/// - `targetCurrencyShortName` (`target_currency_short_name`): The quantity / traded asset (e.g., BTC, ETH, XTZ, TRX).
-/// - `baseCurrencyPrecision` (`base_currency_precision`): Decimal precision for price (`base_currency`).
-/// - `targetCurrencyPrecision` (`target_currency_precision`): Decimal precision for quantity (`target_currency`).
-/// - `pair`: Exact CoinDCX pair string `(ecode, target_currency_short_name, base_currency_short_name)` e.g. `B-BTC_USDT`, `I-BTC_INR`.
 class CoinDcxMarketRecord {
   final String exchangeName;
   final String coindcxName;
@@ -392,12 +385,8 @@ class CoinDcxMarketRecord {
     this.eligibilityReason = 'Discovered in CoinDCX catalogue',
   });
 
-  /// In CoinDCX terminology, `base_currency_short_name` is the quote/pricing currency (INR, USDT, BTC, ETH).
   String get quoteCurrency => baseCurrencyShortName;
-
-  /// In CoinDCX terminology, `target_currency_short_name` is the traded quantity asset.
   String get tradedAssetCurrency => targetCurrencyShortName;
-
   int get pricePrecision => baseCurrencyPrecision;
   int get quantityPrecision => targetCurrencyPrecision;
 
@@ -438,7 +427,6 @@ class CoinDcxMarketRecord {
     return true;
   }
 
-  /// Round quantity down to both `step` and `target_currency_precision` without floating-point underflow.
   double roundQuantityToPrecision(double rawQuantity) {
     if (rawQuantity <= 0 || step <= 0) return 0.0;
     final stepped = (((rawQuantity / step) + 1e-9).floorToDouble()) * step;
@@ -446,14 +434,12 @@ class CoinDcxMarketRecord {
     return ((stepped * factor + 1e-9).floorToDouble()) / factor;
   }
 
-  /// Round price to `base_currency_precision`.
   double roundPriceToPrecision(double rawPrice) {
     if (rawPrice <= 0) return 0.0;
     final factor = math.pow(10, baseCurrencyPrecision).toDouble();
     return (rawPrice * factor).roundToDouble() / factor;
   }
 
-  /// Validate a candidate order against this market's exact specifications.
   ({bool valid, String? reason}) validateOrder({
     required double quantity,
     required double price,

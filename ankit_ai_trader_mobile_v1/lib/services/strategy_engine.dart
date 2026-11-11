@@ -6,163 +6,158 @@ class StrategyConfig {
   final int slowEmaPeriod;
   final int rsiPeriod;
   final int atrPeriod;
-  final double rsiMinBullish;
-  final double rsiMaxBullish;
+  final double rsiBuyMin;
+  final double rsiBuyMax;
+  final double rsiSellThreshold;
 
   const StrategyConfig({
     this.fastEmaPeriod = 20,
     this.slowEmaPeriod = 50,
     this.rsiPeriod = 14,
     this.atrPeriod = 14,
-    this.rsiMinBullish = 50.0,
-    this.rsiMaxBullish = 65.0,
+    this.rsiBuyMin = 50.0,
+    this.rsiBuyMax = 68.0,
+    this.rsiSellThreshold = 42.0,
   });
 }
 
 class StrategyEngine {
-  final IndicatorEngine indicatorEngine;
   final StrategyConfig config;
+  final IndicatorEngine indicators;
 
   const StrategyEngine({
-    this.indicatorEngine = const IndicatorEngine(),
     this.config = const StrategyConfig(),
+    this.indicators = const IndicatorEngine(),
   });
 
-  StrategyEvaluationResult evaluateClosedCandles({
+  StrategyEvaluationResult evaluate({
     required String symbol,
     required List<Candle> closedCandles15m,
     required List<Candle> closedCandles1h,
+    required int nowMs,
   }) {
-    if (closedCandles15m.length < config.slowEmaPeriod + 2 ||
-        closedCandles1h.length < config.slowEmaPeriod + 1) {
-      final latestClose = closedCandles15m.isNotEmpty ? closedCandles15m.last.close : 0.0;
-      final latestCloseMs = closedCandles15m.isNotEmpty ? closedCandles15m.last.closeTimeMs : 0;
+    final closed15m =
+        closedCandles15m.where((c) => c.isClosedAt(nowMs)).toList();
+    final closed1h =
+        closedCandles1h.where((c) => c.isClosedAt(nowMs)).toList();
+
+    if (closed15m.length < config.slowEmaPeriod + 2 ||
+        closed1h.length < config.slowEmaPeriod) {
       return StrategyEvaluationResult(
         symbol: symbol,
         signal: StrategySignalType.none,
-        evaluatedCandleCloseMs: latestCloseMs,
-        closePrice: latestClose,
+        evaluatedCandleCloseMs:
+            closed15m.isNotEmpty ? closed15m.last.closeTimeMs : 0,
+        closePrice: closed15m.isNotEmpty ? closed15m.last.close : 0.0,
         ema20_15m: 0.0,
         ema50_15m: 0.0,
-        rsi14_15m: 0.0,
+        rsi14_15m: 50.0,
         atr14_15m: 0.0,
         ema20_1h: 0.0,
         ema50_1h: 0.0,
         higherTimeframeBullish: false,
-        reason: 'Why no trade: Indicators warming up (INSUFFICIENT CANDLE HISTORY FOR EMA 50)',
+        reason:
+            'WARMING_UP: Need >=${config.slowEmaPeriod + 2} closed 15m and >=${config.slowEmaPeriod} closed 1h candles',
       );
     }
 
-    final closes15m = closedCandles15m.map((c) => c.close).toList();
-    final closes1h = closedCandles1h.map((c) => c.close).toList();
+    final closes15m = closed15m.map((c) => c.close).toList();
+    final closes1h = closed1h.map((c) => c.close).toList();
 
-    final ema20Series15m = indicatorEngine.calculateEmaSeries(closes15m, config.fastEmaPeriod);
-    final ema50Series15m = indicatorEngine.calculateEmaSeries(closes15m, config.slowEmaPeriod);
-    final ema20Series1h = indicatorEngine.calculateEmaSeries(closes1h, config.fastEmaPeriod);
-    final ema50Series1h = indicatorEngine.calculateEmaSeries(closes1h, config.slowEmaPeriod);
+    final ema20Series15m =
+        indicators.calculateEmaSeries(closes15m, config.fastEmaPeriod);
+    final ema50Series15m =
+        indicators.calculateEmaSeries(closes15m, config.slowEmaPeriod);
+    final ema20Series1h =
+        indicators.calculateEmaSeries(closes1h, config.fastEmaPeriod);
+    final ema50Series1h =
+        indicators.calculateEmaSeries(closes1h, config.slowEmaPeriod);
 
-    final rsi14 = indicatorEngine.calculateRsi(closes15m, period: config.rsiPeriod) ?? 0.0;
-    final atr14 = indicatorEngine.calculateAtr(closedCandles15m, period: config.atrPeriod) ?? 0.0;
+    final rsi14 =
+        indicators.calculateRsi(closes15m, period: config.rsiPeriod) ?? 50.0;
+    final atr14 =
+        indicators.calculateAtr(closed15m, period: config.atrPeriod) ?? 0.0;
 
-    final n = closes15m.length - 1;
-    final curEma20 = ema20Series15m[n];
-    final curEma50 = ema50Series15m[n];
-    final prevEma20 = ema20Series15m[n - 1];
-    final prevEma50 = ema50Series15m[n - 1];
+    final ema20_15m = ema20Series15m.last;
+    final ema50_15m = ema50Series15m.last;
+    final prevEma20_15m = ema20Series15m[ema20Series15m.length - 2];
+    final prevEma50_15m = ema50Series15m[ema50Series15m.length - 2];
 
-    final curEma20_1h = ema20Series1h.last;
-    final curEma50_1h = ema50Series1h.last;
-    final higherBullish = curEma20_1h > curEma50_1h;
+    final ema20_1h = ema20Series1h.last;
+    final ema50_1h = ema50Series1h.last;
+    final htfBullish = ema20_1h > ema50_1h && closes1h.last >= ema20_1h * 0.995;
 
-    final bullishCross = prevEma20 <= prevEma50 && curEma20 > curEma50;
-    final bearishCross = prevEma20 >= prevEma50 && curEma20 < curEma50;
-    final rsiValid = rsi14 >= config.rsiMinBullish && rsi14 <= config.rsiMaxBullish;
+    final lastCandle = closed15m.last;
+    final closePrice = lastCandle.close;
 
-    final latestCandle = closedCandles15m.last;
-    final diagnostics =
-        '15m EMA20: ${curEma20.toStringAsFixed(2)} | EMA50: ${curEma50.toStringAsFixed(2)} | RSI14: ${rsi14.toStringAsFixed(1)} | ATR14: ${atr14.toStringAsFixed(2)} | 1h: ${higherBullish ? "BULL" : "BEAR"}';
+    final crossedUp =
+        prevEma20_15m <= prevEma50_15m && ema20_15m > ema50_15m;
+    final trendAlignedUp =
+        ema20_15m > ema50_15m && closePrice > ema20_15m;
+    final rsiInBuyBand =
+        rsi14 >= config.rsiBuyMin && rsi14 <= config.rsiBuyMax;
 
-    if (bearishCross) {
+    if (htfBullish &&
+        (crossedUp || trendAlignedUp) &&
+        rsiInBuyBand &&
+        atr14 > 0) {
+      return StrategyEvaluationResult(
+        symbol: symbol,
+        signal: StrategySignalType.buy,
+        evaluatedCandleCloseMs: lastCandle.closeTimeMs,
+        closePrice: closePrice,
+        ema20_15m: ema20_15m,
+        ema50_15m: ema50_15m,
+        rsi14_15m: rsi14,
+        atr14_15m: atr14,
+        ema20_1h: ema20_1h,
+        ema50_1h: ema50_1h,
+        higherTimeframeBullish: true,
+        reason:
+            'BUY_SIGNAL: 1H Bullish + 15m EMA20>EMA50 + RSI ${rsi14.toStringAsFixed(1)}',
+      );
+    }
+
+    final crossedDown =
+        prevEma20_15m >= prevEma50_15m && ema20_15m < ema50_15m;
+    if (crossedDown ||
+        (ema20_15m < ema50_15m && rsi14 <= config.rsiSellThreshold)) {
       return StrategyEvaluationResult(
         symbol: symbol,
         signal: StrategySignalType.sell,
-        evaluatedCandleCloseMs: latestCandle.closeTimeMs,
-        closePrice: latestCandle.close,
-        ema20_15m: curEma20,
-        ema50_15m: curEma50,
+        evaluatedCandleCloseMs: lastCandle.closeTimeMs,
+        closePrice: closePrice,
+        ema20_15m: ema20_15m,
+        ema50_15m: ema50_15m,
         rsi14_15m: rsi14,
         atr14_15m: atr14,
-        ema20_1h: curEma20_1h,
-        ema50_1h: curEma50_1h,
-        higherTimeframeBullish: higherBullish,
-        reason: 'BEARISH 15M EMA20/50 CROSSOVER EXIT ($diagnostics)',
+        ema20_1h: ema20_1h,
+        ema50_1h: ema50_1h,
+        higherTimeframeBullish: htfBullish,
+        reason:
+            'SELL_SIGNAL: 15m EMA20<EMA50 bearish reversal (RSI ${rsi14.toStringAsFixed(1)})',
       );
     }
 
-    if (!higherBullish) {
-      return StrategyEvaluationResult(
-        symbol: symbol,
-        signal: StrategySignalType.none,
-        evaluatedCandleCloseMs: latestCandle.closeTimeMs,
-        closePrice: latestCandle.close,
-        ema20_15m: curEma20,
-        ema50_15m: curEma50,
-        rsi14_15m: rsi14,
-        atr14_15m: atr14,
-        ema20_1h: curEma20_1h,
-        ema50_1h: curEma50_1h,
-        higherTimeframeBullish: false,
-        reason: 'Why no trade: 1h not bullish ($diagnostics)',
-      );
-    }
-
-    if (!bullishCross) {
-      return StrategyEvaluationResult(
-        symbol: symbol,
-        signal: StrategySignalType.none,
-        evaluatedCandleCloseMs: latestCandle.closeTimeMs,
-        closePrice: latestCandle.close,
-        ema20_15m: curEma20,
-        ema50_15m: curEma50,
-        rsi14_15m: rsi14,
-        atr14_15m: atr14,
-        ema20_1h: curEma20_1h,
-        ema50_1h: curEma50_1h,
-        higherTimeframeBullish: true,
-        reason: 'Why no trade: No EMA cross ($diagnostics)',
-      );
-    }
-
-    if (!rsiValid) {
-      return StrategyEvaluationResult(
-        symbol: symbol,
-        signal: StrategySignalType.none,
-        evaluatedCandleCloseMs: latestCandle.closeTimeMs,
-        closePrice: latestCandle.close,
-        ema20_15m: curEma20,
-        ema50_15m: curEma50,
-        rsi14_15m: rsi14,
-        atr14_15m: atr14,
-        ema20_1h: curEma20_1h,
-        ema50_1h: curEma50_1h,
-        higherTimeframeBullish: true,
-        reason: 'Why no trade: RSI outside 50-65 (${rsi14.toStringAsFixed(1)}) ($diagnostics)',
-      );
-    }
+    final whyNo = !htfBullish
+        ? 'NO_TRADE: 1H trend filter not bullish (1H EMA20 <= EMA50)'
+        : (ema20_15m <= ema50_15m
+            ? 'NO_TRADE: 15m EMA20 <= EMA50'
+            : 'NO_TRADE: RSI ${rsi14.toStringAsFixed(1)} outside [${config.rsiBuyMin}-${config.rsiBuyMax}]');
 
     return StrategyEvaluationResult(
       symbol: symbol,
-      signal: StrategySignalType.buy,
-      evaluatedCandleCloseMs: latestCandle.closeTimeMs,
-      closePrice: latestCandle.close,
-      ema20_15m: curEma20,
-      ema50_15m: curEma50,
+      signal: StrategySignalType.none,
+      evaluatedCandleCloseMs: lastCandle.closeTimeMs,
+      closePrice: closePrice,
+      ema20_15m: ema20_15m,
+      ema50_15m: ema50_15m,
       rsi14_15m: rsi14,
       atr14_15m: atr14,
-      ema20_1h: curEma20_1h,
-      ema50_1h: curEma50_1h,
-      higherTimeframeBullish: true,
-      reason: 'BULLISH 15M EMA20/50 CROSSOVER CONFIRMED (1H BULLISH, RSI ${rsi14.toStringAsFixed(1)})',
+      ema20_1h: ema20_1h,
+      ema50_1h: ema50_1h,
+      higherTimeframeBullish: htfBullish,
+      reason: whyNo,
     );
   }
 }

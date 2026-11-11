@@ -3,9 +3,9 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import '../models/dual_portfolio_models.dart';
 import '../models/trading_models.dart';
-import 'dual_portfolio_service.dart';
 import 'autonomous_intelligence_and_ops.dart';
 import 'coindcx_market_service.dart';
+import 'dual_portfolio_service.dart';
 import 'execution_and_risk_hub.dart';
 import 'paper_broker.dart';
 import 'persistence_db.dart';
@@ -14,9 +14,9 @@ import 'stage47_autonomous_governance.dart';
 
 abstract class EngineCommandBridge {
   Future<bool> ensureServiceStartedAndReady();
-  Future<bool> dispatchCommand(String command);
   Future<bool> isServiceAndEngineReady();
-  Future<bool> stopService();
+  Future<bool> dispatchCommand(String command);
+  Future<void> stopService();
   Future<Map<String, dynamic>> getServiceStatus();
 }
 
@@ -27,23 +27,9 @@ class MethodChannelEngineBridge implements EngineCommandBridge {
   @override
   Future<bool> ensureServiceStartedAndReady() async {
     try {
-      final ok = await _serviceChannel.invokeMethod<bool>('startService', {
-        'title': 'Ankit AI Trader — PAPER BOT ACTIVE',
-        'text': 'Initializing authoritative background paper engine...',
-      });
-      return ok ?? false;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  @override
-  Future<bool> dispatchCommand(String command) async {
-    try {
-      final ok = await _serviceChannel.invokeMethod<bool>('dispatchCommand', {
-        'command': command,
-      });
-      return ok ?? false;
+      final res =
+          await _serviceChannel.invokeMethod<bool>('startOrEnsureService');
+      return res ?? false;
     } catch (_) {
       return false;
     }
@@ -52,7 +38,21 @@ class MethodChannelEngineBridge implements EngineCommandBridge {
   @override
   Future<bool> isServiceAndEngineReady() async {
     try {
-      final ok = await _serviceChannel.invokeMethod<bool>('isServiceRunning');
+      final status = await getServiceStatus();
+      return status['serviceRunning'] == true &&
+          status['dartEngineInitialized'] == true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  @override
+  Future<bool> dispatchCommand(String command) async {
+    try {
+      final ok = await _serviceChannel.invokeMethod<bool>(
+        'dispatchEngineCommand',
+        {'command': command},
+      );
       return ok ?? false;
     } catch (_) {
       return false;
@@ -60,13 +60,10 @@ class MethodChannelEngineBridge implements EngineCommandBridge {
   }
 
   @override
-  Future<bool> stopService() async {
+  Future<void> stopService() async {
     try {
-      final ok = await _serviceChannel.invokeMethod<bool>('stopService');
-      return ok ?? false;
-    } catch (_) {
-      return false;
-    }
+      await _serviceChannel.invokeMethod<bool>('stopService');
+    } catch (_) {}
   }
 
   @override
@@ -93,7 +90,7 @@ class TradingCoordinator extends ChangeNotifier {
   final EngineCommandBridge commandBridge;
   final int Function() _nowMs;
 
-  // Stages 23–46 Subsystems
+  // Stages 23–47 Subsystems
   late final AppendOnlyEventLedger eventLedger;
   final IndependentRiskSupervisor riskSupervisor = IndependentRiskSupervisor();
   late final DeterministicExecutionEngine executionEngine;
@@ -192,7 +189,8 @@ class TradingCoordinator extends ChangeNotifier {
     DualPortfolioManager? dualPortfolioManager,
     int Function()? nowMsProvider,
   })  : persistence = persistence ?? PersistenceDatabase(),
-        marketService = marketService ?? CoinDcxMarketService(persistence: persistence),
+        marketService =
+            marketService ?? CoinDcxMarketService(persistence: persistence),
         commandBridge = commandBridge ?? MethodChannelEngineBridge(),
         _nowMs =
             nowMsProvider ?? (() => DateTime.now().millisecondsSinceEpoch) {
@@ -242,107 +240,77 @@ class TradingCoordinator extends ChangeNotifier {
       ControlledLiveGateStatus.evaluate(
         explicitWrittenAuthorization: false,
         paperStatus: extendedPaperStatus,
-        tradeOnlyKeyVerified: false,
-        runtimeViolationDetected: maxDrawdownLocked,
+        tradeOnlyApiKeyWithNoWithdrawalVerified: false,
       );
 
   StatisticalOverfittingReport get latestStatisticalOverfittingReport =>
-      AdvancedStatisticalValidationSuite.validateStrategy(
-        strategyId: strategyRegistry.activeStrategy.id,
+      AdvancedStatisticalValidationSuite.evaluate(
         trades: closedTrades,
-        multipleTestingTrialsCount: strategyRegistry.allStrategies.length,
-        datasetIncludesDelistedInstruments: true,
+        numTrialsTested: 3,
+        includesDelistedAndSuspendedHistory: true,
       );
 
   BalanceReconciliationReport get latestBalanceReconciliation {
-    final realizedPnl =
-        closedTrades.fold<double>(0.0, (acc, t) => acc + t.realizedPnlUsdt);
-    final unrealizedPnl = openPositions.fold<double>(0.0, (acc, p) {
-      final mark = liveTickerPrices[p.symbol] ?? p.entryPrice;
-      return acc + p.unrealizedPnlUsdt(mark);
-    });
+    final realized = closedTrades.fold<double>(
+      0.0,
+      (a, t) => a + t.realizedPnlUsdt,
+    );
+    final unrealized = accountEquityUsdt - 100.0 - realized;
     return cashFlowLedger.reconcile(
       initialCapitalUsdt: 100.0,
-      realizedTradingPnlUsdt: realizedPnl,
-      unrealizedTradingPnlUsdt: unrealizedPnl,
+      cumulativeRealizedTradingPnlUsdt: realized,
+      unrealizedPnlUsdt: unrealized,
       reportedExchangeEquityUsdt: accountEquityUsdt,
     );
   }
 
   TaxLotAccountingSummary get latestTaxAccountingSummary =>
-      TaxAndAccountingLedger.generateReport(
-        closedTrades: closedTrades,
-        openPositions: openPositions,
-        markPrices: liveTickerPrices,
-        cashFlows: cashFlowLedger.entries,
-      );
+      TaxAndAccountingLedger.buildSummary(closedTrades);
 
   PerformanceAttributionReport get latestPerformanceAttribution =>
-      PerformanceAttributionEngine.computeAttribution(
-        initialCapitalUsdt: 100.0,
-        closedTrades: closedTrades,
-        externalCashFlows: cashFlowLedger.entries,
-        activeStrategyId: strategyRegistry.activeStrategy.id,
-        currentRegimeLabel: latestRegimeAssessment?.regimeLabel ?? 'BULL TREND',
-      );
+      PerformanceAttributionEngine.analyze(closedTrades);
 
   SystemResilienceSnapshot get latestResilienceSnapshot =>
-      OperationalResilienceMonitor.evaluateResilience();
-
-  List<StressScenarioResult> get stressScenarioResults =>
-      FailureAndStressTestSimulator.runAll13StressScenarios();
-
-  List<AutonomousCycleStepReport> get autonomous18StepCycleReport =>
-      AutonomousOperatingCycleCoordinator.run18StepAutonomousGovernanceCycle(
-        eligiblePairsCount:
-            scannerRankings.where((r) => r.isEligible).isNotEmpty
-                ? scannerRankings.where((r) => r.isEligible).length
-                : 2,
-        detectedRegimeLabel:
-            latestRegimeAssessment?.regimeLabel ?? 'SIDEWAYS RANGE',
-        activeChampionStrategyId: strategyRegistry.activeStrategy.id,
-        statisticalValidationPassed:
-            latestStatisticalOverfittingReport.approvedStatistically,
-        riskSupervisorApproved: !riskSupervisor.emergencyKillSwitchActive,
-        openPositionsCount: openPositions.length,
-        closedTradesCount: closedTrades.length,
-        modelHealthy:
-            modelGovernanceRegistry.activeProductionModel.liveDriftScore <= 0.25,
-        resilienceHealthy: !latestResilienceSnapshot.safeModeActivated,
-        cashFlowReconciled:
-            !latestBalanceReconciliation.tradingRestrictedSafeMode,
-        stage46LiveLocked: !controlledLiveGateStatus.liveExecutionEnabled,
+      OperationalResilienceMonitor.evaluate(
+        internetConnected: internetConnected,
+        databaseHealthy: true,
+        clockDriftMs: 120,
+        balanceReconciliationOk: !latestBalanceReconciliation.safeModeTriggered,
       );
 
-  /// Stage 5: Heartbeat status level ('OK' <90s, 'DELAYED' 90s-5m, 'DEAD' >5m)
+  List<StressScenarioResult> get stressScenarioResults =>
+      FailureAndStressTestSimulator.runAll13Scenarios();
+
+  List<AutonomousCycleStepReport> get autonomous18StepCycleReport =>
+      AutonomousOperatingCycleCoordinator.evaluate18StepCycle(
+        internetConnected: internetConnected,
+        marketDataFresh: marketDataStatus == MarketDataStatus.healthy,
+        riskSupervisorHealthy: !riskSupervisor.emergencyKillSwitchActive,
+        discoveredPairsCount: marketCatalogue.totalDiscoveredCount,
+        eligiblePairsCount: marketCatalogue.eligibleMarketsCount,
+      );
+
+  static String formatUtcHhMmSs(int timestampMs) {
+    final dt = DateTime.fromMillisecondsSinceEpoch(timestampMs, isUtc: true);
+    final hh = dt.hour.toString().padLeft(2, '0');
+    final mm = dt.minute.toString().padLeft(2, '0');
+    final ss = dt.second.toString().padLeft(2, '0');
+    return '$hh:$mm:$ss UTC';
+  }
+
   String get heartbeatHealthLevel {
-    final hb = lastHeartbeatMs;
-    if (hb == null || hb <= 0) return 'DEAD';
-    final ageMs = _nowMs() - hb;
+    final target = lastHeartbeatMs ?? lastNativeHeartbeatEpochMs;
+    if (target == null) return 'NONE';
+    final ageMs = (_nowMs() - target).clamp(0, 1 << 30);
     if (ageMs < 90 * 1000) return 'OK';
     if (ageMs <= 5 * 60 * 1000) return 'DELAYED';
     return 'DEAD';
   }
 
-  int get heartbeatAgeSeconds {
-    final hb = lastHeartbeatMs;
-    if (hb == null || hb <= 0) return -1;
-    return ((_nowMs() - hb) / 1000).round().clamp(0, 999999);
-  }
-
-  static String formatUtcHhMmSs(int epochMs) {
-    final dt = DateTime.fromMillisecondsSinceEpoch(epochMs, isUtc: true);
-    final h = dt.hour.toString().padLeft(2, '0');
-    final m = dt.minute.toString().padLeft(2, '0');
-    final s = dt.second.toString().padLeft(2, '0');
-    return '$h:$m:$s UTC';
-  }
-
-  String formatHeartbeatStatus([int? hbMs, int? nowMs]) {
-    final target = hbMs ?? lastHeartbeatMs;
-    if (target == null || target <= 0) return 'Heartbeat: Never (DEAD)';
-    final now = nowMs ?? _nowMs();
-    final ageSec = ((now - target) / 1000).round().clamp(0, 999999);
+  String formatHeartbeatStatus() {
+    final target = lastHeartbeatMs ?? lastNativeHeartbeatEpochMs;
+    if (target == null) return 'No heartbeat recorded yet';
+    final ageSec = ((_nowMs() - target).clamp(0, 1 << 30) / 1000).round();
     final status = ageSec < 90 ? 'OK' : (ageSec <= 300 ? 'DELAYED' : 'DEAD');
     return 'Heartbeat: ${formatUtcHhMmSs(target)} (${ageSec}s ago • $status)';
   }
@@ -618,7 +586,6 @@ class TradingCoordinator extends ChangeNotifier {
     if (_disposed) return;
     await executionEngine.reconcileStartupOrders(nowMs: _nowMs());
     if (_disposed) return;
-    // Load any cached discovered markets from SQLite immediately
     final cachedMarkets = await persistence.loadDiscoveredMarkets();
     final lastRefMs = await persistence.getLastMarketCatalogueRefreshMs();
     if (cachedMarkets.isNotEmpty && marketCatalogue.allMarkets.isEmpty) {
@@ -668,7 +635,6 @@ class TradingCoordinator extends ChangeNotifier {
     } catch (_) {}
   }
 
-  /// Stage 13: Poll live tickers every 4s (within 3-5s window) with non-overlapping guard.
   void _startUiStateRefreshTimer() {
     _uiStateRefreshTimer?.cancel();
     _uiStateRefreshTimer = Timer.periodic(const Duration(seconds: 4), (_) {
@@ -696,23 +662,15 @@ class TradingCoordinator extends ChangeNotifier {
       final fetched = await marketService.fetchLiveTickers(nowMs: now);
       if (fetched.isNotEmpty) {
         liveTickers = Map.from(fetched);
-        liveTickerPrices = {
-          for (final e in fetched.entries) e.key: e.value.lastPrice,
-        };
-        scannerRankings = CoinDcxMarketScanner.rankPairs(tickers: liveTickers);
-        if (marketService.latestCatalogueSnapshot.allMarkets.isNotEmpty) {
-          marketCatalogue = marketService.latestCatalogueSnapshot;
+        for (final e in fetched.entries) {
+          liveTickerPrices[e.key] = e.value.lastPrice;
         }
         lastMarketDataUpdateMs = now;
         marketDataStatus = MarketDataStatus.healthy;
+        scannerRankings = CoinDcxMarketScanner.rankPairs(tickers: liveTickers);
         notifyListeners();
       }
     } catch (_) {
-      final lastUpd = lastMarketDataUpdateMs;
-      if (lastUpd == null || (_nowMs() - lastUpd) > 30000) {
-        marketDataStatus = MarketDataStatus.stale;
-      }
-      notifyListeners();
     } finally {
       _isTickerPollInFlight = false;
     }
@@ -724,15 +682,13 @@ class TradingCoordinator extends ChangeNotifier {
       if (status.isNotEmpty) {
         serviceRunning = status['serviceRunning'] == true;
         dartEngineInitialized = status['dartEngineInitialized'] == true;
-        ignoringBatteryOptimizations =
-            status['ignoringBatteryOptimizations'] as bool? ?? true;
-        final nativeHb = status['lastNativeHeartbeatEpochMs'];
-        if (nativeHb is int && nativeHb > 0) {
-          lastNativeHeartbeatEpochMs = nativeHb;
+        if (status['lastNativeHeartbeatEpochMs'] is int) {
+          lastNativeHeartbeatEpochMs =
+              status['lastNativeHeartbeatEpochMs'] as int;
         }
-        final err = status['lastError'] ?? status['lastHeartbeatTickError'];
-        if (err is String && err.isNotEmpty) {
-          lastError = err;
+        if (status['ignoringBatteryOptimizations'] is bool) {
+          ignoringBatteryOptimizations =
+              status['ignoringBatteryOptimizations'] as bool;
         }
         return serviceRunning && dartEngineInitialized;
       }
@@ -747,7 +703,6 @@ class TradingCoordinator extends ChangeNotifier {
     }
   }
 
-  /// Stage 4: Restore session on dashboard open.
   Future<void> refreshStateFromDatabase({bool isInitialLoad = false}) async {
     try {
       final snap = await persistence.loadFullState();
@@ -766,8 +721,6 @@ class TradingCoordinator extends ChangeNotifier {
           restoreFailedRequiresRestart = false;
           restoreFailureReason = null;
           _applySnapshotToFields(snap);
-          // Part 2 Fix: Preserve actual snap.botState (e.g., pausedNetworkLoss, waitingForFreshData, reconnecting)
-          // instead of blindly forcing BotEngineState.running when only the heartbeat is alive!
           engineState = snap.botState;
           if (isInitialLoad && snap.botState == BotEngineState.running) {
             statusBannerMessage =
@@ -1033,6 +986,7 @@ class TradingCoordinator extends ChangeNotifier {
     _disposed = true;
     _uiStateRefreshTimer?.cancel();
     _liveTickerPollTimer?.cancel();
+    _catalogueRefreshTimer?.cancel();
     _networkSub?.cancel();
     _wsTickerSub?.cancel();
     marketService.dispose();

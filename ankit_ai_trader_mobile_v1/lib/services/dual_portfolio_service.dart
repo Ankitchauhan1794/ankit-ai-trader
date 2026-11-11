@@ -15,13 +15,11 @@ abstract class PortfolioMarketDataProvider {
   bool get isProviderConnected;
   bool get isProviderVerified;
 
-  /// Returns verified specification for a symbol/pair, or an unverified record if unsupported/unconfigured.
   VerifiedInstrumentSpecification getInstrumentSpecification(
     String symbolOrPair, {
     CoinDcxMarketRecord? discoveredRecord,
   });
 
-  /// Returns list of research-only or verified instruments known to this provider.
   List<VerifiedInstrumentSpecification> listKnownSpecifications({
     List<CoinDcxMarketRecord> discoveredCatalogue = const [],
   });
@@ -97,7 +95,7 @@ class CoinDcxPortfolioProvider implements PortfolioMarketDataProvider {
         takerFeeRate: 0.001,
         swapLongRate: 0.0,
         swapShortRate: 0.0,
-        marginRequirementFraction: 1.0, // Spot 1:1 cash backed
+        marginRequirementFraction: 1.0,
         tradingSessions: const ['24/7_SPOT'],
         supportedOrderTypes: discoveredRecord.orderTypes,
         isProviderConnected: isProviderConnected,
@@ -109,8 +107,10 @@ class CoinDcxPortfolioProvider implements PortfolioMarketDataProvider {
       );
     }
 
-    // Default baseline verified specification for BTCUSDT / ETHUSDT when catalogue is warming up
-    if (upper == 'BTCUSDT' || upper == 'B-BTC_USDT' || upper == 'ETHUSDT' || upper == 'B-ETH_USDT') {
+    if (upper == 'BTCUSDT' ||
+        upper == 'B-BTC_USDT' ||
+        upper == 'ETHUSDT' ||
+        upper == 'B-ETH_USDT') {
       final isBtc = upper.contains('BTC');
       return VerifiedInstrumentSpecification(
         symbol: isBtc ? 'BTCUSDT' : 'ETHUSDT',
@@ -173,7 +173,6 @@ class CoinDcxPortfolioProvider implements PortfolioMarketDataProvider {
 }
 
 /// Section 2 & 5: Unselected High-Volatility & Precious Metals Provider Abstraction.
-/// Explicitly keeps XAUUSD (Gold) and XAGUSD (Silver) in RESEARCH-ONLY mode with no invented prices or specs.
 class UnverifiedHighVolatilityProvider implements PortfolioMarketDataProvider {
   @override
   String get providerId => 'UNSELECTED_HIGH_VOL_PROVIDER';
@@ -204,7 +203,6 @@ class UnverifiedHighVolatilityProvider implements PortfolioMarketDataProvider {
         baseCurrency: isGold ? 'XAU' : 'XAG',
         quoteCurrency: 'USD',
         category: PortfolioAssetCategory.preciousMetalSpotCfd,
-        // Strictly null: do not invent contract size, tick size, fees, or sessions!
         contractSize: null,
         minQuantity: null,
         maxQuantity: null,
@@ -228,8 +226,6 @@ class UnverifiedHighVolatilityProvider implements PortfolioMarketDataProvider {
       );
     }
 
-    // If evaluating a high-volatility crypto pair via verified CoinDCX catalogue data,
-    // allow research analysis while keeping High-Volatility portfolio execution locked until approved.
     if (discoveredRecord != null && discoveredRecord.hasValidSpecifications) {
       final tickSz = math
           .pow(10, -discoveredRecord.baseCurrencyPrecision.clamp(0, 8))
@@ -258,7 +254,7 @@ class UnverifiedHighVolatilityProvider implements PortfolioMarketDataProvider {
         supportedOrderTypes: discoveredRecord.orderTypes,
         isProviderConnected: true,
         isSpecificationVerified: discoveredRecord.isActiveStatus,
-        isExecutionAuthorized: false, // Disabled until High-Volatility portfolio execution is approved
+        isExecutionAuthorized: false,
         statusNote:
             'RESEARCH_ONLY: Verified CoinDCX crypto specs available for research; High-Volatility Portfolio autonomous execution disabled until verified & approved.',
       );
@@ -294,7 +290,6 @@ class UnverifiedHighVolatilityProvider implements PortfolioMarketDataProvider {
 }
 
 /// Section 4: Modular High-Volatility Market Classification System.
-/// Evaluates historical volatility, ATR%, 24h movement, volume, spread, candle history, freshness, status, and specs.
 class HighVolatilityMarketClassifier {
   final HighVolatilityClassificationCriteria criteria;
 
@@ -302,7 +297,6 @@ class HighVolatilityMarketClassifier {
     this.criteria = const HighVolatilityClassificationCriteria(),
   });
 
-  /// Compute realized volatility (% std dev of log returns) across closed candles.
   static double? computeRealizedVolatilityPct(List<Candle> closedCandles) {
     if (closedCandles.length < 10) return null;
     final returns = <double>[];
@@ -322,7 +316,6 @@ class HighVolatilityMarketClassifier {
     return math.sqrt(sumSq / returns.length);
   }
 
-  /// Evaluate a market record and its closed candles without fabricating any missing values.
   HighVolatilityClassificationResult classifyCryptoMarket({
     required CoinDcxMarketRecord market,
     required List<Candle> closedCandles,
@@ -478,7 +471,6 @@ class HighVolatilityMarketClassifier {
     }
 
     final atrPct = (atr14 / lastClose) * 100.0;
-    // Never classify on a single price spike alone: require multi-candle ATR% AND realized volatility within bounds
     final multiCandleVolQualifies = atrPct >= criteria.minAtrPct &&
         atrPct <= criteria.maxAtrPct &&
         realizedVol >= criteria.minRealizedVolatilityPct;
@@ -511,7 +503,6 @@ class HighVolatilityMarketClassifier {
       category: PortfolioAssetCategory.highVolatilityCryptoSpot,
       qualifiesAsHighVolatility: true,
       isResearchEligible: true,
-      // Discovery does NOT automatically authorize execution!
       isExecutionAuthorized: portfolioExecutionApproved,
       verificationStatus: portfolioExecutionApproved
           ? InstrumentVerificationStatus.verifiedTradableInPaper
@@ -529,7 +520,6 @@ class HighVolatilityMarketClassifier {
     );
   }
 
-  /// Evaluate precious metals (XAUUSD, XAGUSD) strictly as research-only until a provider is selected & verified.
   HighVolatilityClassificationResult classifyPreciousMetal(String symbol) {
     final upper = symbol.trim().toUpperCase();
     return HighVolatilityClassificationResult(
@@ -551,9 +541,6 @@ class HighVolatilityMarketClassifier {
 }
 
 /// Section 3, 6, 7 & 8: Complete Dual Portfolio Runtime Manager & Isolation Engine.
-/// Guarantees that Crypto Portfolio (Portfolio A) and High-Volatility Portfolio (Portfolio B)
-/// have 100% isolated balances, positions, orders, trade history, cash flows, risk supervisors,
-/// and AI learning contexts.
 class DualPortfolioManager {
   static const int maxArchitecturalSimultaneousPositions = 5;
 
@@ -564,7 +551,6 @@ class DualPortfolioManager {
 
   PortfolioId selectedPortfolioId = PortfolioId.crypto;
 
-  /// Independent deterministic risk supervisors per portfolio (Section 6)
   final Map<PortfolioId, IndependentRiskSupervisor> _riskSupervisors = {
     PortfolioId.crypto: IndependentRiskSupervisor(
       config: const RiskConfig(),
@@ -574,13 +560,11 @@ class DualPortfolioManager {
     ),
   };
 
-  /// Independent cash-flow ledgers per portfolio (Section 3)
   final Map<PortfolioId, CashFlowReconciliationLedger> _cashFlowLedgers = {
     PortfolioId.crypto: CashFlowReconciliationLedger(),
     PortfolioId.highVolatility: CashFlowReconciliationLedger(),
   };
 
-  /// Independent portfolio snapshots (Section 3)
   final Map<PortfolioId, PortfolioAccountSnapshot> _snapshots = {
     PortfolioId.crypto: PortfolioAccountSnapshot(
       portfolioId: PortfolioId.crypto,
@@ -612,7 +596,7 @@ class DualPortfolioManager {
       availableCashUsdt: 100.0,
       accountEquityUsdt: 100.0,
       startOfDayEquityUsdt: 100.0,
-      executionEnabled: false, // Disabled until provider & specs are verified
+      executionEnabled: false,
       isResearchOnlyMode: true,
       liveTradingLocked: true,
       activeStrategyId: 'HIGH_VOL_RESEARCH_CANDIDATE_V1',
@@ -657,8 +641,6 @@ class DualPortfolioManager {
     selectedPortfolioId = id;
   }
 
-  /// Syncs the Crypto Portfolio (Portfolio A) from the authoritative engine snapshot
-  /// without ever touching or mutating the High-Volatility Portfolio (Portfolio B).
   Future<void> syncCryptoPortfolioFromEngineSnapshot(
     PersistedEngineSnapshot snap,
   ) async {
@@ -730,7 +712,6 @@ class DualPortfolioManager {
     _snapshots[PortfolioId.crypto] = updatedCrypto;
     await persistence.savePortfolioAccountSnapshot(updatedCrypto);
 
-    // Also load High-Volatility Portfolio from DB if persisted
     final persistedHighVol = await persistence.loadPortfolioAccountSnapshot(
       PortfolioId.highVolatility,
     );
@@ -743,12 +724,6 @@ class DualPortfolioManager {
     }
   }
 
-  /// Section 6 & 7: Vet and size an order strictly within the target portfolio.
-  /// - Rejects any live trading request (paper trading only).
-  /// - Rejects any order in a portfolio where `isResearchOnlyMode == true` or `!executionEnabled`.
-  /// - Rejects any order on an unverified instrument (e.g., XAUUSD, XAGUSD, or unverified crypto).
-  /// - Never moves stop-loss closer to accommodate order size.
-  /// - Rejects if minimum permitted quantity exceeds permitted account risk ($1.00).
   ({
     bool approved,
     double approvedQuantity,
@@ -815,7 +790,6 @@ class DualPortfolioManager {
     final step = instrumentSpec.quantityStep!;
     final minNotional = instrumentSpec.minNotional!;
 
-    // Compute risk at minimum permitted quantity WITHOUT moving stop-loss closer
     final stopDistPerUnit = entryPrice - stopLossPrice;
     final costPerUnit = entryPrice * (feeRate * 2.0 + slippageRate * 2.0);
     final totalRiskPerUnit = stopDistPerUnit + costPerUnit;
@@ -830,14 +804,11 @@ class DualPortfolioManager {
         snap.accountEquityUsdt * supervisor.config.maxRiskPerTradeFraction;
     final riskAtMinQty = effectiveMinQty * totalRiskPerUnit;
 
-    // Section 6 mandatory rule:
-    // "Never move a stop-loss closer simply to accommodate an order size.
-    //  If the minimum permitted quantity exceeds the permitted account risk, reject the trade."
     if (riskAtMinQty > maxAllowedRiskUsdt + 1e-9) {
       return (
         approved: false,
         approvedQuantity: 0.0,
-        stopLossPrice: stopLossPrice, // Preserved unchanged!
+        stopLossPrice: stopLossPrice,
         rejectionReason:
             'MIN_QUANTITY_EXCEEDS_PERMITTED_RISK: Minimum quantity $effectiveMinQty requires \$${riskAtMinQty.toStringAsFixed(2)} risk at stop-loss $stopLossPrice, exceeding permitted \$${maxAllowedRiskUsdt.toStringAsFixed(2)} risk cap.',
       );
@@ -857,7 +828,6 @@ class DualPortfolioManager {
       );
     }
 
-    // Vet through the portfolio's own independent deterministic risk supervisor
     final vet = supervisor.vetOrderRequest(
       symbol: instrumentSpec.symbol,
       currentEquityUsdt: snap.accountEquityUsdt,
@@ -894,8 +864,6 @@ class DualPortfolioManager {
     );
   }
 
-  /// Section 3 & Step 4 Tests: Execute an isolated paper position open inside a specific portfolio
-  /// (when execution is enabled for that portfolio or during verified unit testing of isolation).
   Future<({bool executed, String? reason, PaperPosition? position})>
       openIsolatedPaperPosition({
     required PortfolioId portfolioId,
@@ -1000,7 +968,6 @@ class DualPortfolioManager {
     return (executed: true, reason: null, position: pos);
   }
 
-  /// Close an open paper position inside a specific portfolio without affecting the other portfolio.
   Future<({bool closed, ClosedPaperTrade? trade})> closeIsolatedPaperPosition({
     required PortfolioId portfolioId,
     required String positionId,
@@ -1087,7 +1054,6 @@ class DualPortfolioManager {
     return (closed: true, trade: closedTrade);
   }
 
-  /// Explicitly enable or disable execution on High-Volatility Portfolio ONLY after verification & human approval.
   Future<void> setHighVolatilityExecutionApproval({
     required bool approvedAndVerified,
     required int nowMs,

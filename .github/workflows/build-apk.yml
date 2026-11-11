@@ -20,11 +20,31 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Ensure Gradle 8.10.2 wrapper & clean unused WatchdogWorker
+      - name: Ensure Gradle 8.10.2 wrapper, launcher icons & clean unused WatchdogWorker
         run: |
           rm -f android/app/src/main/kotlin/com/ankit/aitrader/WatchdogWorker.kt
           mkdir -p android/gradle/wrapper
-          sed -i 's|gradle-[0-9.]*-all.zip|gradle-8.10.2-all.zip|g; s|gradle-[0-9.]*-bin.zip|gradle-8.10.2-all.zip|g' android/gradle/wrapper/gradle-wrapper.properties || true
+          sed -i 's|gradle-[0-9].*-all.zip|gradle-8.10.2-all.zip|g; s|gradle-[0-9].*-bin.zip|gradle-8.10.2-all.zip|g' android/gradle/wrapper/gradle-wrapper.properties || true
+          python3 - << 'PYEOF'
+          import os, struct, zlib
+          def make_png(w, h):
+              raw = b""
+              for y in range(h):
+                  raw += b"\x00"
+                  for x in range(w):
+                      border = x < 4 or x >= w - 4 or y < 4 or y >= h - 4
+                      raw += (b"\x00\xe6\x76\xff" if border else b"\x0b\x10\x1b\xff")
+              def chunk(tag, data):
+                  return struct.pack("!I", len(data)) + tag + data + struct.pack("!I", zlib.crc32(tag + data) & 0xffffffff)
+              return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack("!IIBBBBB", w, h, 8, 6, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b"")
+          for folder, sz in [("mipmap-mdpi", 48), ("mipmap-hdpi", 72), ("mipmap-xhdpi", 96), ("mipmap-xxhdpi", 144), ("mipmap-xxxhdpi", 192)]:
+              d = os.path.join("android/app/src/main/res", folder)
+              os.makedirs(d, exist_ok=True)
+              p = os.path.join(d, "ic_launcher.png")
+              if not os.path.exists(p) or os.path.getsize(p) == 0:
+                  with open(p, "wb") as f:
+                      f.write(make_png(sz, sz))
+          PYEOF
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4

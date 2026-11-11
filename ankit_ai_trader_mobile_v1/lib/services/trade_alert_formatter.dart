@@ -1,18 +1,15 @@
 import '../models/trading_models.dart';
 
 class TradeAlertFormatter {
-  const TradeAlertFormatter();
-
   static TradeAlertPayload formatEntryAlert(
-    SimulatedOrder order, {
-    required double stopLoss,
-    required double takeProfit,
-  }) {
+    PaperPosition position,
+    SimulatedOrder order,
+  ) {
     return TradeAlertPayload(
-      alertId: 'ENTRY_${order.id}',
-      title: '[PAPER TRADE] BUY ${order.symbol}',
+      alertId: 'ENTRY_${position.id}_${position.signalCandleCloseMs}',
+      title: 'PAPER BUY EXECUTED: ${position.symbol}',
       body:
-          'Entered ${order.symbol} @ \$${order.executedPrice.toStringAsFixed(2)} | Qty: ${order.quantity.toStringAsFixed(5)} | SL: \$${stopLoss.toStringAsFixed(2)} | TP: \$${takeProfit.toStringAsFixed(2)} (Fees: \$${order.feeUsdt.toStringAsFixed(3)})',
+          'Qty: ${position.quantity} @ \$${position.entryPrice.toStringAsFixed(2)} | SL: \$${position.stopLoss.toStringAsFixed(2)} | TP: \$${position.takeProfit.toStringAsFixed(2)}',
       timestampMs: order.executedAtMs,
     );
   }
@@ -20,24 +17,23 @@ class TradeAlertFormatter {
   static TradeAlertPayload formatExitAlert(ClosedPaperTrade trade) {
     final sign = trade.realizedPnlUsdt >= 0 ? '+' : '';
     return TradeAlertPayload(
-      alertId: 'EXIT_${trade.id}',
-      title: '[PAPER TRADE] EXIT ${trade.symbol} (${trade.exitReason})',
+      alertId: 'EXIT_${trade.id}_${trade.closedAtMs}',
+      title: 'PAPER POSITION CLOSED (${trade.exitReason}): ${trade.symbol}',
       body:
-          'Closed ${trade.symbol} @ \$${trade.exitPrice.toStringAsFixed(2)} | PnL: $sign\$${trade.realizedPnlUsdt.toStringAsFixed(2)} (Fees: \$${trade.totalFeesUsdt.toStringAsFixed(3)})',
+          'Exit @ \$${trade.exitPrice.toStringAsFixed(2)} | Realized PnL: $sign\$${trade.realizedPnlUsdt.toStringAsFixed(2)} USDT',
       timestampMs: trade.closedAtMs,
     );
   }
 
-  static TradeAlertPayload formatSafetyLockAlert({
+  static TradeAlertPayload formatRiskPauseAlert({
     required String lockType,
-    required String message,
+    required String reason,
     required int timestampMs,
   }) {
-    final dayBucket = timestampMs ~/ (60 * 60 * 1000);
     return TradeAlertPayload(
-      alertId: 'LOCK_${lockType}_$dayBucket',
-      title: '[PAPER BOT SAFETY LOCK] $lockType',
-      body: message,
+      alertId: 'RISK_${lockType}_$timestampMs',
+      title: 'RISK SUPERVISOR LOCK: $lockType',
+      body: reason,
       timestampMs: timestampMs,
     );
   }

@@ -1,34 +1,8 @@
 import 'dart:convert';
-import 'dart:math' as math;
 import '../models/trading_models.dart';
 import 'persistence_db.dart';
 import 'risk_manager.dart';
 
-/// STAGE 44 — CONNECTOR ARCHITECTURE:
-/// Standard adapter interface. CoinDCX Spot first.
-/// Verified: CoinDCX provides Spot & Crypto Derivatives only (NO Forex or Equity Indices).
-enum SupportedAssetClass {
-  cryptoSpot,
-}
-
-abstract class ExchangeConnectorAdapter {
-  String get venueId;
-  String get displayName;
-  Set<SupportedAssetClass> get supportedAssetClasses;
-  Future<Map<String, LiveMarketTicker>> fetchTickers({required int nowMs});
-  Future<OrderBookSnapshot> fetchOrderBook({
-    required String pair,
-    required int nowMs,
-    int depth = 20,
-  });
-  Future<List<PublicTradeRecord>> fetchPublicTrades({
-    required String pair,
-    required int nowMs,
-    int limit = 30,
-  });
-}
-
-/// STAGE 23 — ADVANCED MARKET DATA ENGINE MODELS:
 class OrderBookSnapshot {
   final String symbol;
   final Map<double, double> bids;
@@ -43,103 +17,88 @@ class OrderBookSnapshot {
   });
 
   double get bestBid =>
-      bids.keys.isEmpty ? 0.0 : bids.keys.reduce(math.max);
+      bids.keys.isEmpty ? 0.0 : bids.keys.reduce((a, b) => a > b ? a : b);
+
   double get bestAsk =>
-      asks.keys.isEmpty ? 0.0 : asks.keys.reduce(math.min);
+      asks.keys.isEmpty ? 0.0 : asks.keys.reduce((a, b) => a < b ? a : b);
+
   double get midPrice =>
       (bestBid > 0 && bestAsk > 0) ? (bestBid + bestAsk) / 2.0 : 0.0;
+
   double get spreadPct =>
-      (midPrice > 0 && bestAsk >= bestBid)
+      midPrice > 0 && bestAsk >= bestBid
           ? ((bestAsk - bestBid) / midPrice) * 100.0
           : 0.0;
 
-  bool isHealthy({required int nowMs, int maxAgeMs = 30000}) {
+  bool isValidAndFresh(int nowMs, {int maxAgeMs = 60000}) {
     if (bids.isEmpty || asks.isEmpty) return false;
     if (bestBid <= 0 || bestAsk <= 0 || bestAsk < bestBid) return false;
-    return (nowMs - timestampMs) <= maxAgeMs;
+    if (timestampMs <= 0 || (nowMs - timestampMs) > maxAgeMs) return false;
+    return true;
   }
 }
 
 class PublicTradeRecord {
+  final String tradeId;
   final String symbol;
   final double price;
   final double quantity;
-  final int timestampMs;
   final bool isBuyerMaker;
+  final int timestampMs;
 
   const PublicTradeRecord({
+    required this.tradeId,
     required this.symbol,
     required this.price,
     required this.quantity,
-    required this.timestampMs,
     required this.isBuyerMaker,
+    required this.timestampMs,
   });
 }
 
 class MarketDataQualityReport {
   final String symbol;
-  final bool tickerFresh;
-  final bool candlesFresh;
-  final bool spreadAcceptable;
+  final bool isFresh;
+  final bool isCorrupt;
   final double spreadPct;
-  final int tickerAgeMs;
-  final int candleAgeMs;
-  final String? rejectionReason;
+  final String statusReason;
 
   const MarketDataQualityReport({
     required this.symbol,
-    required this.tickerFresh,
-    required this.candlesFresh,
-    required this.spreadAcceptable,
+    required this.isFresh,
+    required this.isCorrupt,
     required this.spreadPct,
-    required this.tickerAgeMs,
-    required this.candleAgeMs,
-    this.rejectionReason,
+    required this.statusReason,
   });
 
-  bool get isDecisionAllowed =>
-      tickerFresh && candlesFresh && spreadAcceptable && rejectionReason == null;
+  bool get isDecisionAllowed => isFresh && !isCorrupt;
 }
 
-/// STAGE 24 — CENTRAL APPEND-ONLY EVENT LEDGER:
 enum LedgerCategory {
   signal,
   riskCheck,
   orderLifecycle,
   fill,
-  positionChange,
   accountChange,
   strategyVersion,
-  reconciliation,
-  securityAudit,
   failure,
+  reconciliation,
 }
 
 class LedgerRecord {
-  final int sequenceId;
+  final int sequenceNumber;
   final int timestampMs;
   final LedgerCategory category;
-  final String strategyVersion;
-  final String summary;
+  final String eventName;
   final Map<String, dynamic> payload;
 
   const LedgerRecord({
-    required this.sequenceId,
+    required this.sequenceNumber,
     required this.timestampMs,
     required this.category,
-    required this.strategyVersion,
-    required this.summary,
-    this.payload = const {},
+    required this.eventName,
+    required this.payload,
   });
-
-  Map<String, dynamic> toMap() => {
-        'sequenceId': sequenceId,
-        'timestampMs': timestampMs,
-        'category': category.name,
-        'strategyVersion': strategyVersion,
-        'summary': summary,
-        'payload': jsonEncode(payload),
-      };
 }
 
 class AppendOnlyEventLedger {
@@ -153,35 +112,28 @@ class AppendOnlyEventLedger {
 
   Future<LedgerRecord> append({
     required LedgerCategory category,
-    required String strategyVersion,
-    required String summary,
-    Map<String, dynamic> payload = const {},
+    required String eventName,
+    required Map<String, dynamic> payload,
     int? timestampMs,
   }) async {
-    _seq++;
     final ts = timestampMs ?? DateTime.now().millisecondsSinceEpoch;
-    final record = LedgerRecord(
-      sequenceId: _seq,
+    final rec = LedgerRecord(
+      sequenceNumber: ++_seq,
       timestampMs: ts,
       category: category,
-      strategyVersion: strategyVersion,
-      summary: summary,
-      payload: payload,
+      eventName: eventName,
+      payload: Map<String, dynamic>.from(payload),
     );
-    _records.insert(0, record);
-    if (_records.length > 500) {
-      _records.removeRange(500, _records.length);
-    }
+    _records.add(rec);
     await persistence.logDiagnosticEvent(
       'LEDGER_${category.name.toUpperCase()}',
-      '[$strategyVersion] $summary',
+      '$eventName: ${jsonEncode(payload)}',
       timestampMs: ts,
     );
-    return record;
+    return rec;
   }
 }
 
-/// STAGE 25 & 26 — DETERMINISTIC EXECUTION ENGINE & ORDER STATE MACHINE:
 enum OrderLifecycleState {
   created,
   pendingSubmit,
@@ -261,7 +213,6 @@ class ManagedExecutionOrder {
   }
 }
 
-/// STAGE 27 — INDEPENDENT DETERMINISTIC RISK SUPERVISOR (No AI/LLM Can Override):
 class IndependentRiskSupervisor {
   final RiskConfig config;
   final int maxConsecutiveLosses;
@@ -307,7 +258,6 @@ class IndependentRiskSupervisor {
         reason: 'RISK_SUPERVISOR_STALE_DATA: Market or candle feed is stale',
       );
     }
-    // Stage 25 rule: Never submit a new order while an earlier order's status is unknown/in-flight
     if (activeOrders.any((o) => o.blocksNewSubmissions)) {
       return (
         approved: false,
@@ -372,7 +322,6 @@ class IndependentRiskSupervisor {
       );
     }
 
-    // Stage 27: Count fees and expected execution costs in monetary exposure
     final notional = entryPrice * quantity;
     final entryFee = notional * feeRate;
     final expectedExitFee = notional * feeRate;
@@ -409,7 +358,6 @@ class IndependentRiskSupervisor {
   }
 }
 
-/// STAGE 25, 26 & 28 — HIGH-FIDELITY EXECUTION ENGINE WITH IDEMPOTENCY & RECONCILIATION:
 class DeterministicExecutionEngine {
   final Map<String, ManagedExecutionOrder> _ordersByClientId = {};
   final AppendOnlyEventLedger ledger;
@@ -423,145 +371,179 @@ class DeterministicExecutionEngine {
   List<ManagedExecutionOrder> get allOrders =>
       _ordersByClientId.values.toList();
 
-  bool get hasUnresolvedOrderState =>
+  List<ManagedExecutionOrder> get activeOrders =>
+      _ordersByClientId.values.where((o) => !o.isTerminal).toList();
+
+  bool get hasUnresolvedOrder =>
       _ordersByClientId.values.any((o) => o.blocksNewSubmissions);
 
-  /// Stage 25: Reconcile open/unknown orders on startup or recovery before allowing new orders.
+  void injectOrderForRecoveryTest(ManagedExecutionOrder order) {
+    _ordersByClientId[order.clientOrderId] = order;
+  }
+
   Future<int> reconcileStartupOrders({required int nowMs}) async {
-    int reconciled = 0;
+    int resolved = 0;
     for (final entry in _ordersByClientId.entries.toList()) {
       final ord = entry.value;
       if (ord.state == OrderLifecycleState.unknownReconciling ||
           ord.state == OrderLifecycleState.pendingSubmit) {
-        _ordersByClientId[entry.key] = ord.copyWith(
+        final canceled = ord.copyWith(
           state: OrderLifecycleState.canceled,
           updatedAtMs: nowMs,
-          rejectionReason: 'Auto-canceled uncommitted order during startup reconciliation',
+          rejectionReason: 'RECONCILED_ON_STARTUP_SAFE_CANCEL',
         );
-        reconciled++;
+        _ordersByClientId[entry.key] = canceled;
+        resolved++;
+        await ledger.append(
+          category: LedgerCategory.reconciliation,
+          eventName: 'STARTUP_ORDER_RECONCILED',
+          payload: {'clientOrderId': ord.clientOrderId},
+          timestampMs: nowMs,
+        );
       }
     }
-    if (reconciled > 0) {
-      await ledger.append(
-        category: LedgerCategory.reconciliation,
-        strategyVersion: 'v1.0.0',
-        summary: 'Startup reconciliation resolved $reconciled in-flight order(s)',
-        timestampMs: nowMs,
-      );
-    }
-    return reconciled;
+    return resolved;
   }
 
-  /// Stage 26 & 28: Idempotent order submission with bid/ask spread, slippage, fees & partial-fill support.
-  Future<ManagedExecutionOrder> submitSimulatedOrder({
+  Future<ManagedExecutionOrder> submitIdempotentPaperOrder({
     required String clientOrderId,
     required String symbol,
     required String side,
     required double quantity,
-    required double bidPrice,
-    required double askPrice,
-    required double feeRate,
-    required double slippageRate,
-    required String strategyId,
+    required double requestedPrice,
+    required double stopLossPrice,
+    required double currentEquityUsdt,
+    required double startOfDayEquityUsdt,
+    required double availableCashUsdt,
+    required double spreadPct,
+    required double atr14,
+    required bool isDataFresh,
+    required List<PaperPosition> openPositions,
+    required int? lastStopLossClosedAtMs,
     required int nowMs,
-    double liquidityFillRatio = 1.0,
-    double minQuantity = 0.00001,
-    double stepSize = 0.00001,
+    String strategyId = 'EMA_20_50_RSI_ATR_V1',
+    double feeRate = 0.001,
+    double slippageRate = 0.0005,
+    double partialFillRatio = 1.0,
   }) async {
-    // Stage 26: Idempotent submit — if clientOrderId already exists, return existing order
-    final existing = _ordersByClientId[clientOrderId];
-    if (existing != null) {
-      return existing;
+    if (_ordersByClientId.containsKey(clientOrderId)) {
+      return _ordersByClientId[clientOrderId]!;
     }
 
-    // Stage 25: Never submit a new BUY order while an earlier order's status is unknown/open
-    if (side == 'BUY' && hasUnresolvedOrderState) {
+    final riskDecision = riskSupervisor.vetOrderRequest(
+      symbol: symbol,
+      currentEquityUsdt: currentEquityUsdt,
+      startOfDayEquityUsdt: startOfDayEquityUsdt,
+      availableCashUsdt: availableCashUsdt,
+      entryPrice: requestedPrice,
+      stopLossPrice: stopLossPrice,
+      quantity: quantity,
+      feeRate: feeRate,
+      slippageRate: slippageRate,
+      spreadPct: spreadPct,
+      atr14: atr14,
+      isDataFresh: isDataFresh,
+      openPositions: openPositions,
+      activeOrders: activeOrders,
+      lastStopLossClosedAtMs: lastStopLossClosedAtMs,
+      nowMs: nowMs,
+    );
+
+    if (!riskDecision.approved) {
       final rejected = ManagedExecutionOrder(
         clientOrderId: clientOrderId,
         symbol: symbol,
         side: side,
         requestedQuantity: quantity,
         filledQuantity: 0.0,
-        requestedPrice: side == 'BUY' ? askPrice : bidPrice,
+        requestedPrice: requestedPrice,
         averageFillPrice: 0.0,
         totalFeeUsdt: 0.0,
         state: OrderLifecycleState.rejected,
         createdAtMs: nowMs,
         updatedAtMs: nowMs,
         strategyId: strategyId,
-        rejectionReason: 'RECONCILIATION_LOCK: Previous order state unresolved',
+        rejectionReason: riskDecision.reason,
       );
       _ordersByClientId[clientOrderId] = rejected;
+      await ledger.append(
+        category: LedgerCategory.riskCheck,
+        eventName: 'ORDER_REJECTED_BY_SUPERVISOR',
+        payload: {
+          'clientOrderId': clientOrderId,
+          'reason': riskDecision.reason,
+        },
+        timestampMs: nowMs,
+      );
       return rejected;
     }
 
-    final roundedQty = (((quantity / stepSize) + 1e-9).floorToDouble()) * stepSize;
-    if (roundedQty < minQuantity || bidPrice <= 0 || askPrice <= 0 || askPrice < bidPrice) {
-      final rejected = ManagedExecutionOrder(
-        clientOrderId: clientOrderId,
-        symbol: symbol,
-        side: side,
-        requestedQuantity: quantity,
-        filledQuantity: 0.0,
-        requestedPrice: side == 'BUY' ? askPrice : bidPrice,
-        averageFillPrice: 0.0,
-        totalFeeUsdt: 0.0,
-        state: OrderLifecycleState.rejected,
-        createdAtMs: nowMs,
-        updatedAtMs: nowMs,
-        strategyId: strategyId,
-        rejectionReason: 'INVALID_QUANTITY_OR_BOOK',
-      );
-      _ordersByClientId[clientOrderId] = rejected;
-      return rejected;
-    }
-
-    final ratio = liquidityFillRatio.clamp(0.0, 1.0);
-    final filledQty = ((((roundedQty * ratio) / stepSize) + 1e-9).floorToDouble()) * stepSize;
-    final refPrice = side == 'BUY' ? askPrice : bidPrice;
-    final fillPrice = side == 'BUY'
-        ? refPrice * (1.0 + slippageRate)
-        : refPrice * (1.0 - slippageRate);
-    final notional = filledQty * fillPrice;
-    final feeUsdt = notional * feeRate;
-
-    final targetState = filledQty <= 0
-        ? OrderLifecycleState.open
-        : (filledQty + 1e-9 < roundedQty
+    final ratio = partialFillRatio.clamp(0.0, 1.0);
+    final filledQty = quantity * ratio;
+    final execPrice = side == 'BUY'
+        ? requestedPrice * (1.0 + slippageRate)
+        : requestedPrice * (1.0 - slippageRate);
+    final fee = filledQty * execPrice * feeRate;
+    final state = ratio >= 0.9999
+        ? OrderLifecycleState.filled
+        : (ratio > 0
             ? OrderLifecycleState.partiallyFilled
-            : OrderLifecycleState.filled);
+            : OrderLifecycleState.open);
 
     final order = ManagedExecutionOrder(
       clientOrderId: clientOrderId,
       symbol: symbol,
       side: side,
-      requestedQuantity: roundedQty,
+      requestedQuantity: quantity,
       filledQuantity: filledQty,
-      requestedPrice: refPrice,
-      averageFillPrice: fillPrice,
-      totalFeeUsdt: feeUsdt,
-      state: targetState,
+      requestedPrice: requestedPrice,
+      averageFillPrice: execPrice,
+      totalFeeUsdt: fee,
+      state: state,
       createdAtMs: nowMs,
       updatedAtMs: nowMs,
       strategyId: strategyId,
     );
     _ordersByClientId[clientOrderId] = order;
-
     await ledger.append(
       category: LedgerCategory.orderLifecycle,
-      strategyVersion: strategyId,
-      summary:
-          'Order $clientOrderId ($side $symbol) -> ${targetState.name} @ \$${fillPrice.toStringAsFixed(2)}',
+      eventName: 'ORDER_${state.name.toUpperCase()}',
       payload: {
         'clientOrderId': clientOrderId,
         'symbol': symbol,
-        'side': side,
         'filledQty': filledQty,
-        'fillPrice': fillPrice,
-        'feeUsdt': feeUsdt,
+        'avgPrice': execPrice,
       },
       timestampMs: nowMs,
     );
     return order;
+  }
+
+  Future<ManagedExecutionOrder?> completeRemainingPartialFill({
+    required String clientOrderId,
+    required int nowMs,
+    double feeRate = 0.001,
+  }) async {
+    final existing = _ordersByClientId[clientOrderId];
+    if (existing == null ||
+        existing.state != OrderLifecycleState.partiallyFilled) {
+      return existing;
+    }
+    final remQty = existing.requestedQuantity - existing.filledQuantity;
+    final addFee = remQty * existing.averageFillPrice * feeRate;
+    final completed = existing.copyWith(
+      filledQuantity: existing.requestedQuantity,
+      totalFeeUsdt: existing.totalFeeUsdt + addFee,
+      state: OrderLifecycleState.filled,
+      updatedAtMs: nowMs,
+    );
+    _ordersByClientId[clientOrderId] = completed;
+    await ledger.append(
+      category: LedgerCategory.fill,
+      eventName: 'PARTIAL_FILL_COMPLETED',
+      payload: {'clientOrderId': clientOrderId},
+      timestampMs: nowMs,
+    );
+    return completed;
   }
 }

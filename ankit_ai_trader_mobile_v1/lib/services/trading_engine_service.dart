@@ -1,19 +1,6 @@
-import 'authoritative_engine.dart';
-import 'coindcx_market_service.dart';
-import 'persistence_db.dart';
+import 'package:flutter/foundation.dart';
+import '../models/trading_models.dart';
 
-/// Legacy compatibility wrapper around AuthoritativeTradingEngine.
-class TradingEngineService {
-  final AuthoritativeTradingEngine engine;
-
-  TradingEngineService({
-    CoinDcxMarketService? marketService,
-    PersistenceDatabase? persistence,
-  }) : engine = AuthoritativeTradingEngine(
-          marketService: marketService ?? CoinDcxMarketService(),
-          persistence: persistence ?? PersistenceDatabase(),
-        );
-
-  Future<bool> runTick() =>
-      engine.executeAuthoritativeCycle(allowTradingExecution: true);
+class TradingEngineService extends ChangeNotifier {
+  BotEngineState state = BotEngineState.stopped;
 }

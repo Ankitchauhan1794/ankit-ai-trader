@@ -127,28 +127,13 @@ class VerifiedInstrumentSpecification {
 
 /// Section 4: Configurable and documented High-Volatility Market Classification Criteria.
 class HighVolatilityClassificationCriteria {
-  /// Minimum 14-period ATR as % of price to qualify as high-volatility crypto.
   final double minAtrPct;
-
-  /// Maximum allowed ATR % before rejecting as extreme/chaotic anomaly.
   final double maxAtrPct;
-
-  /// Minimum realized period volatility (%) across closed candles.
   final double minRealizedVolatilityPct;
-
-  /// Minimum 24h absolute price movement (%) when combined with ATR/realized vol.
   final double min24hPriceMovePct;
-
-  /// Minimum 24h quote turnover / volume in USDT equivalent.
   final double min24hVolumeQuote;
-
-  /// Maximum allowed bid-ask spread in basis points (bps).
   final double maxSpreadBps;
-
-  /// Minimum number of closed candles required to verify historical volatility.
   final int minClosedCandlesRequired;
-
-  /// Maximum allowed data age in milliseconds.
   final int maxDataAgeMs;
 
   const HighVolatilityClassificationCriteria({

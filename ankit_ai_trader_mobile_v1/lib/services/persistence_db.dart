@@ -261,8 +261,6 @@ class PersistenceDatabase {
     ''');
   }
 
-  /// Section 10: Backward-compatible migration assigning all existing records to CRYPTO
-  /// without resetting balances or deleting history, and creating HIGH_VOLATILITY separately.
   Future<void> _migrateAndSeedPortfoliosOnDb(Database db) async {
     for (final table in [
       'open_positions',
@@ -274,12 +272,9 @@ class PersistenceDatabase {
         await db.execute(
           "ALTER TABLE $table ADD COLUMN portfolioId TEXT NOT NULL DEFAULT 'CRYPTO'",
         );
-      } catch (_) {
-        // Column already exists
-      }
+      } catch (_) {}
     }
 
-    // Read existing Crypto account values from engine_kv_state if present
     double cryptoCash = 100.0;
     double cryptoEquity = 100.0;
     double cryptoStartDay = 100.0;
@@ -369,7 +364,6 @@ class PersistenceDatabase {
     );
   }
 
-  /// Backward-compatible migration: preserves all existing tables, $100 account, open positions, orders & trade history.
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
     await _onCreate(db, newVersion);
     if (oldVersion < 4) {
@@ -381,7 +375,6 @@ class PersistenceDatabase {
     }
   }
 
-  /// Allow testing backward-compatible schema migration on any Database instance.
   Future<void> migrateDatabaseSchemaIfNeeded(
     Database db, {
     required int oldVersion,
@@ -390,7 +383,6 @@ class PersistenceDatabase {
     await _onUpgrade(db, oldVersion, newVersion);
   }
 
-  /// Stage 47.1 Section 5 & 6: Persist discovered market catalogue without deleting historical trades/positions.
   Future<void> saveDiscoveredMarkets(
     List<CoinDcxMarketRecord> markets, {
     required int refreshedAtMs,
@@ -413,7 +405,6 @@ class PersistenceDatabase {
     });
   }
 
-  /// Stage 47.1: Load cached discovered markets from SQLite (or in-memory fallback).
   Future<List<CoinDcxMarketRecord>> loadDiscoveredMarkets() async {
     final db = await database;
     if (db == null) {
@@ -469,7 +460,6 @@ class PersistenceDatabase {
     return rows.first['value'] as String?;
   }
 
-  /// Stage 3: Persist user session intention separately from runtime botState.
   Future<void> saveUserIntention(UserSessionIntention intention) async {
     await putKv('userIntention', intention.name);
     await logDiagnosticEvent(
@@ -486,7 +476,6 @@ class PersistenceDatabase {
     );
   }
 
-  /// Stage 5: Record diagnostic event in SQLite and prune to ~500 rows.
   Future<void> logDiagnosticEvent(
     String eventType,
     String reason, {
@@ -539,12 +528,10 @@ class PersistenceDatabase {
     return rows.map((r) => DiagnosticEvent.fromMap(r)).toList();
   }
 
-  /// Stage 4 & 5: Record engine heartbeat timestamp in SQLite.
   Future<void> recordHeartbeat(int timestampMs) async {
     await putKv('lastHeartbeatMs', jsonEncode(timestampMs));
   }
 
-  /// Stage 9: Persist autoResumeEnabled setting (default false).
   Future<bool> getAutoResumeEnabled() async {
     final raw = await getKv('autoResumeEnabled');
     return raw == 'true';
@@ -558,7 +545,6 @@ class PersistenceDatabase {
     );
   }
 
-  /// Stage 7 & 8: Single authoritative engine execution lock.
   Future<bool> acquireExecutionLock({
     required String lockName,
     required String ownerId,
@@ -835,6 +821,7 @@ class PersistenceDatabase {
         'equity_snapshots',
         {
           'timestampMs': nowMs,
+          'portfolioId': 'CRYPTO',
           'equityUsdt': accountEquityUsdt,
           'availableCashUsdt': availableCashUsdt,
         },
@@ -1044,7 +1031,6 @@ class PersistenceDatabase {
     );
   }
 
-  /// Section 3 & 10: Save an isolated PortfolioAccountSnapshot without affecting the other portfolio.
   Future<void> savePortfolioAccountSnapshot(
     PortfolioAccountSnapshot snapshot,
   ) async {
@@ -1093,7 +1079,6 @@ class PersistenceDatabase {
     });
   }
 
-  /// Section 3 & 10: Load an isolated PortfolioAccountSnapshot from SQLite (or in-memory fallback).
   Future<PortfolioAccountSnapshot?> loadPortfolioAccountSnapshot(
     PortfolioId portfolioId,
   ) async {

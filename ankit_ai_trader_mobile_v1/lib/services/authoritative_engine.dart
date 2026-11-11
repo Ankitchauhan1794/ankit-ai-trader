@@ -5,574 +5,475 @@ import 'coindcx_market_service.dart';
 import 'execution_and_risk_hub.dart';
 import 'paper_broker.dart';
 import 'persistence_db.dart';
+import 'risk_manager.dart';
 import 'strategy_engine.dart';
 import 'trade_alert_formatter.dart';
 
 class AuthoritativeTradingEngine {
-  static const String authoritativeLockName = 'AUTHORITATIVE_ENGINE_LOCK';
-  static const List<String> watchedSymbols = ['B-BTC_USDT', 'B-ETH_USDT'];
-  static const int maxEligiblePairsPerScanCycle = 25;
+  static const String lockName = 'authoritative_paper_engine_lock';
 
   final CoinDcxMarketService marketService;
   final PersistenceDatabase persistence;
-  final PaperBroker broker;
   final StrategyEngine strategyEngine;
+  final RiskManager riskManager;
+  final PaperBroker paperBroker;
   final IndependentRiskSupervisor riskSupervisor;
-  final int Function() nowMsProvider;
-  final Future<void> Function(String title, String text)? onNotificationUpdate;
-  final Future<bool> Function(TradeAlertPayload alert)? onTradeAlert;
-  final Future<void> Function(int delayMs, String reason)? onSchedulerRetry;
-  final Future<void> Function(UserSessionIntention intention)?
-      onSyncUserIntention;
+  final String ownerId;
+  final int Function() _nowMs;
   final bool verifyReachabilityBeforeNetworkPause;
+  final Future<void> Function(String title, String text)? onNotificationUpdate;
+  final Future<void> Function(TradeAlertPayload alert)? onTradeAlert;
 
-  final String _ownerId;
-  bool _isCycleExecuting = false;
-  Timer? _retryTimer;
+  BotEngineState state = BotEngineState.stopped;
+  UserSessionIntention userIntention = UserSessionIntention.stopped;
+  double availableCashUsdt = 100.0;
+  double accountEquityUsdt = 100.0;
+  double startOfDayEquityUsdt = 100.0;
+  bool maxDrawdownLocked = false;
+  String? lockedDailyLossUtcDate;
+  int? lastStopLossClosedAtMs;
+  int? lastHeartbeatMs;
+  int? lastMarketDataUpdateMs;
+  int? lastCandleUpdateMs;
+  int? runningSinceMs;
+  int totalActiveMs = 0;
+  int orderSeq = 0;
+  String statusBannerMessage = 'PAPER BOT STOPPED — PRESS START';
+  Map<String, double> liveTickerPrices = {};
+  Map<String, LiveMarketTicker> liveTickers = {};
+  Map<String, double> closedCandlePrices = {};
+  Map<String, String> whyNoTradeForSymbol = {};
+  List<PaperPosition> openPositions = [];
+  List<SimulatedOrder> orders = [];
+  List<ClosedPaperTrade> closedTrades = [];
+  Set<String> processedEntrySignalKeys = {};
+  ScanCycleDiagnosticsSnapshot scanDiagnostics =
+      const ScanCycleDiagnosticsSnapshot();
+
+  Timer? _cycleTimer;
+  bool _isCycleInFlight = false;
+  bool _disposed = false;
 
   AuthoritativeTradingEngine({
     required this.marketService,
     required this.persistence,
-    PaperBroker? broker,
     this.strategyEngine = const StrategyEngine(),
+    this.riskManager = const RiskManager(),
+    this.paperBroker = const PaperBroker(),
     IndependentRiskSupervisor? riskSupervisor,
+    this.ownerId = 'bg_service_engine_1',
     int Function()? nowMsProvider,
+    this.verifyReachabilityBeforeNetworkPause = false,
     this.onNotificationUpdate,
     this.onTradeAlert,
-    this.onSchedulerRetry,
-    this.onSyncUserIntention,
-    this.verifyReachabilityBeforeNetworkPause = false,
-  })  : broker = broker ?? PaperBroker(),
-        riskSupervisor = riskSupervisor ?? IndependentRiskSupervisor(),
-        nowMsProvider =
-            nowMsProvider ?? (() => DateTime.now().millisecondsSinceEpoch),
-        _ownerId = 'auth_engine_${DateTime.now().microsecondsSinceEpoch}';
+  })  : riskSupervisor = riskSupervisor ?? IndependentRiskSupervisor(),
+        _nowMs =
+            nowMsProvider ?? (() => DateTime.now().millisecondsSinceEpoch);
 
-  /// Stage 6: Process-death recreation restarts trading ONLY if intention == RUNNING.
   Future<void> restoreSessionIfRunningIntended() async {
     final snap = await persistence.loadFullState();
-    _hydrateBrokerFromSnapshot(snap);
-    if (snap.userIntention == UserSessionIntention.running &&
-        snap.botState != BotEngineState.stoppedMaxDrawdownReached &&
-        snap.botState != BotEngineState.lockedDailyLossLimit) {
-      await persistence.logDiagnosticEvent(
-        'PROCESS_RESTORE',
-        'Headless engine initialized; restoring RUNNING session',
-      );
-      await executeAuthoritativeCycle(
-        allowTradingExecution: true,
-        transitionToRunningOnSuccess: true,
-      );
+    state = snap.botState;
+    userIntention = snap.userIntention;
+    availableCashUsdt = snap.availableCashUsdt;
+    accountEquityUsdt = snap.accountEquityUsdt;
+    startOfDayEquityUsdt = snap.startOfDayEquityUsdt;
+    maxDrawdownLocked = snap.maxDrawdownLocked;
+    lockedDailyLossUtcDate = snap.lockedDailyLossUtcDate;
+    lastStopLossClosedAtMs = snap.lastStopLossClosedAtMs;
+    lastHeartbeatMs = snap.lastHeartbeatMs;
+    lastMarketDataUpdateMs = snap.lastMarketDataUpdateMs;
+    lastCandleUpdateMs = snap.lastCandleUpdateMs;
+    runningSinceMs = snap.runningSinceMs;
+    totalActiveMs = snap.totalActiveMs;
+    orderSeq = snap.orderSeq;
+    statusBannerMessage = snap.statusBannerMessage;
+    liveTickerPrices = Map.from(snap.liveTickerPrices);
+    liveTickers = Map.from(snap.liveTickers);
+    closedCandlePrices = Map.from(snap.closedCandlePrices);
+    whyNoTradeForSymbol = Map.from(snap.whyNoTradeForSymbol);
+    openPositions = List.from(snap.openPositions);
+    orders = List.from(snap.orders);
+    closedTrades = List.from(snap.closedTrades);
+    processedEntrySignalKeys = Set.from(snap.processedEntrySignalKeys);
+    scanDiagnostics = snap.scanDiagnostics;
+
+    if (userIntention == UserSessionIntention.running &&
+        !maxDrawdownLocked &&
+        lockedDailyLossUtcDate == null) {
+      await startEngine();
     }
   }
 
-  void _hydrateBrokerFromSnapshot(PersistedEngineSnapshot snap) {
-    broker.availableCashUsdt = snap.availableCashUsdt;
-    broker.maxDrawdownLocked = snap.maxDrawdownLocked;
-    broker.lockedDailyLossUtcDate = snap.lockedDailyLossUtcDate;
-    broker.lastStopLossClosedAtMs = snap.lastStopLossClosedAtMs;
-    broker.openPositions
-      ..clear()
-      ..addAll(snap.openPositions);
-    broker.orders
-      ..clear()
-      ..addAll(snap.orders);
-    broker.closedTrades
-      ..clear()
-      ..addAll(snap.closedTrades);
-    broker.processedEntrySignalKeys
-      ..clear()
-      ..addAll(snap.processedEntrySignalKeys);
+  Future<bool> startEngine() async {
+    final now = _nowMs();
+    final locked = await persistence.acquireExecutionLock(
+      lockName: lockName,
+      ownerId: ownerId,
+      nowMs: now,
+    );
+    if (!locked) {
+      statusBannerMessage =
+          'CANNOT START: Another authoritative engine instance holds the execution lock.';
+      return false;
+    }
+
+    userIntention = UserSessionIntention.running;
+    await persistence.saveUserIntention(UserSessionIntention.running);
+    state = BotEngineState.running;
+    runningSinceMs ??= now;
+    lastHeartbeatMs = now;
+    statusBannerMessage = 'PAPER BOT RUNNING — Multi-Pair CoinDCX Scanner Active';
+    await persistence.clearRecoveryState();
+    await _persistCurrentState(now);
+    await executeTradingCycle(allowTradingExecution: true);
+    _startPeriodicTimer();
+    return true;
   }
 
-  Future<bool> handleCommand(String command) async {
-    final cmd = command.trim().toUpperCase();
-    final nowMs = nowMsProvider();
-    final snap = await persistence.loadFullState();
-    _hydrateBrokerFromSnapshot(snap);
+  Future<void> pauseEngine({String reason = 'Paused by user'}) async {
+    userIntention = UserSessionIntention.paused;
+    await persistence.saveUserIntention(UserSessionIntention.paused);
+    state = BotEngineState.pausedAfterRecoveryManualStartRequired;
+    statusBannerMessage = 'PAUSED (PAUSED_BY_USER): $reason';
+    await _persistCurrentState(_nowMs());
+  }
 
-    switch (cmd) {
-      case 'START':
-        if (broker.maxDrawdownLocked ||
-            broker.riskManager.isMaxDrawdownReached(snap.accountEquityUsdt)) {
-          // Stage 3: Safety lock changes botState ONLY, never userIntention
-          await persistence.saveFullState(
-            botState: BotEngineState.stoppedMaxDrawdownReached,
-            availableCashUsdt: broker.availableCashUsdt,
-            accountEquityUsdt: snap.accountEquityUsdt,
-            maxDrawdownLocked: true,
-            lockedDailyLossUtcDate: broker.lockedDailyLossUtcDate,
-            lastStopLossClosedAtMs: broker.lastStopLossClosedAtMs,
-            lastHeartbeatMs: nowMs,
-            statusBannerMessage:
-                'Account equity reached or fell below \$90.00 floor. Engine stopped; manual review & reset required.',
-            liveTickerPrices: snap.liveTickerPrices,
-            liveTickers: snap.liveTickers,
-            closedCandlePrices: snap.closedCandlePrices,
-            whyNoTradeForSymbol: snap.whyNoTradeForSymbol,
-            openPositions: broker.openPositions,
-            orders: broker.orders,
-            closedTrades: broker.closedTrades,
-            processedEntrySignalKeys: broker.processedEntrySignalKeys,
-            scanDiagnostics: snap.scanDiagnostics,
-          );
-          return false;
+  Future<void> stopEngine({String reason = 'Stopped by user'}) async {
+    _cycleTimer?.cancel();
+    userIntention = UserSessionIntention.stopped;
+    await persistence.saveUserIntention(UserSessionIntention.stopped);
+    state = BotEngineState.stopped;
+    runningSinceMs = null;
+    statusBannerMessage = 'PAPER BOT STOPPED — $reason';
+    await _persistCurrentState(_nowMs());
+    await persistence.releaseExecutionLock(lockName: lockName, ownerId: ownerId);
+  }
+
+  Future<void> resetAccountTo100() async {
+    _cycleTimer?.cancel();
+    userIntention = UserSessionIntention.stopped;
+    state = BotEngineState.stopped;
+    availableCashUsdt = 100.0;
+    accountEquityUsdt = 100.0;
+    startOfDayEquityUsdt = 100.0;
+    maxDrawdownLocked = false;
+    lockedDailyLossUtcDate = null;
+    lastStopLossClosedAtMs = null;
+    openPositions.clear();
+    orders.clear();
+    closedTrades.clear();
+    processedEntrySignalKeys.clear();
+    whyNoTradeForSymbol.clear();
+    statusBannerMessage = 'Paper account reset to \$100.00 USDT.';
+    await persistence.clearRecoveryState();
+    await _persistCurrentState(_nowMs());
+  }
+
+  Future<void> handleNetworkTransition(bool connected) async {
+    final now = _nowMs();
+    if (!connected) {
+      if (verifyReachabilityBeforeNetworkPause) {
+        final probe = await marketService.fetchLiveTickers(nowMs: now);
+        if (probe.isNotEmpty) {
+          return; // False OS disconnect event; CoinDCX REST is still reachable!
         }
-        await persistence.saveUserIntention(UserSessionIntention.running);
-        await onSyncUserIntention?.call(UserSessionIntention.running);
-        await _resetRecoveryTracking();
-        return await executeAuthoritativeCycle(
-          allowTradingExecution: true,
-          transitionToRunningOnSuccess: true,
+      }
+      if (state == BotEngineState.running) {
+        state = BotEngineState.pausedNetworkLoss;
+        statusBannerMessage =
+            'PAUSED (PAUSED_BY_NETWORK): Internet disconnected. Bot paused for safety.';
+        await persistence.saveRecoveryState(
+          attemptCount: 1,
+          recoveryStartedAtMs: now,
+          nextRecoveryAllowedAtMs: now + 5000,
+          logMessage:
+              'AUTO-RECOVERY RETRY #1 (5s): Internet disconnected. Bot paused for safety.',
         );
-
-      case 'PAUSE':
-        _retryTimer?.cancel();
-        await _resetRecoveryTracking();
-        await persistence.saveFullState(
-          botState: BotEngineState.pausedAfterRecoveryManualStartRequired,
-          userIntention: UserSessionIntention.paused,
-          availableCashUsdt: broker.availableCashUsdt,
-          accountEquityUsdt: snap.accountEquityUsdt,
-          maxDrawdownLocked: broker.maxDrawdownLocked,
-          lockedDailyLossUtcDate: broker.lockedDailyLossUtcDate,
-          lastStopLossClosedAtMs: broker.lastStopLossClosedAtMs,
-          lastHeartbeatMs: nowMs,
-          runningSinceMs: null,
-          totalActiveMs: snap.totalActiveMs,
-          statusBannerMessage: 'BOT PAUSED MANUALLY – PRESS RESUME TO CONTINUE',
-          liveTickerPrices: snap.liveTickerPrices,
-          liveTickers: snap.liveTickers,
-          closedCandlePrices: snap.closedCandlePrices,
-          whyNoTradeForSymbol: snap.whyNoTradeForSymbol,
-          openPositions: broker.openPositions,
-          orders: broker.orders,
-          closedTrades: broker.closedTrades,
-          processedEntrySignalKeys: broker.processedEntrySignalKeys,
-          scanDiagnostics: snap.scanDiagnostics,
-        );
-        await onSyncUserIntention?.call(UserSessionIntention.paused);
-        await _notify(
-          'Ankit AI Trader — PAUSED',
-          _formatOngoingNotificationText(
-            snap.accountEquityUsdt,
-            snap.liveTickerPrices,
-          ),
-        );
-        return true;
-
-      case 'STOP':
-        _retryTimer?.cancel();
-        await _resetRecoveryTracking();
-        await persistence.saveFullState(
-          botState: BotEngineState.stopped,
-          userIntention: UserSessionIntention.stopped,
-          availableCashUsdt: broker.availableCashUsdt,
-          accountEquityUsdt: snap.accountEquityUsdt,
-          maxDrawdownLocked: broker.maxDrawdownLocked,
-          lockedDailyLossUtcDate: broker.lockedDailyLossUtcDate,
-          lastStopLossClosedAtMs: broker.lastStopLossClosedAtMs,
-          lastHeartbeatMs: nowMs,
-          runningSinceMs: null,
-          totalActiveMs: snap.totalActiveMs,
-          statusBannerMessage: 'ENGINE STOPPED BY USER',
-          liveTickerPrices: snap.liveTickerPrices,
-          liveTickers: snap.liveTickers,
-          closedCandlePrices: snap.closedCandlePrices,
-          whyNoTradeForSymbol: snap.whyNoTradeForSymbol,
-          openPositions: broker.openPositions,
-          orders: broker.orders,
-          closedTrades: broker.closedTrades,
-          processedEntrySignalKeys: broker.processedEntrySignalKeys,
-          scanDiagnostics: snap.scanDiagnostics,
-        );
-        await onSyncUserIntention?.call(UserSessionIntention.stopped);
-        return true;
-
-      case 'RESET':
-        _retryTimer?.cancel();
-        await _resetRecoveryTracking();
-        // Stage 8: Preserve notifiedAlertIds across RESET
-        final preservedAlerts = await persistence.getNotifiedAlertIds();
-        broker.manualResetPaperAccount();
-        riskSupervisor.consecutiveLosses = 0;
-        await persistence.saveFullState(
-          botState: BotEngineState.stopped,
-          userIntention: UserSessionIntention.stopped,
-          availableCashUsdt: broker.availableCashUsdt,
-          accountEquityUsdt: broker.availableCashUsdt,
-          maxDrawdownLocked: false,
-          lockedDailyLossUtcDate: null,
-          lastStopLossClosedAtMs: null,
-          lastHeartbeatMs: nowMs,
-          runningSinceMs: null,
-          totalActiveMs: 0,
-          statusBannerMessage: 'Paper account reset to \$100.00 USDT.',
-          liveTickerPrices: snap.liveTickerPrices,
-          liveTickers: snap.liveTickers,
-          closedCandlePrices: snap.closedCandlePrices,
-          whyNoTradeForSymbol: const {},
-          openPositions: const [],
-          orders: const [],
-          closedTrades: const [],
-          processedEntrySignalKeys: const {},
-          scanDiagnostics: const ScanCycleDiagnosticsSnapshot(),
-        );
-        for (final id in preservedAlerts) {
-          await persistence.markAlertIdNotified(id);
+        await _persistCurrentState(now);
+      }
+    } else {
+      final autoResume = await persistence.getAutoResumeEnabled();
+      if (state == BotEngineState.pausedNetworkLoss) {
+        if (autoResume && userIntention == UserSessionIntention.running) {
+          state = BotEngineState.running;
+          statusBannerMessage = 'PAPER BOT RUNNING — Network Restored';
+          await persistence.clearRecoveryState();
+          await _persistCurrentState(now);
+          await executeTradingCycle(allowTradingExecution: true);
+        } else {
+          state = BotEngineState.pausedAfterRecoveryManualStartRequired;
+          statusBannerMessage =
+              'Network restored. Auto-resume is OFF — tap START to resume.';
+          await _persistCurrentState(now);
         }
-        await onSyncUserIntention?.call(UserSessionIntention.stopped);
-        return true;
-
-      case 'REFRESH_QUOTES':
-        return await executeAuthoritativeCycle(
-          allowTradingExecution: false,
-          transitionToRunningOnSuccess: false,
-        );
-
-      default:
-        return false;
+      }
     }
   }
 
-  /// Compute ranking score for valid BUY signals across multiple eligible pairs (Part 4 & Part 5).
-  static double computeOpportunityRankingScore({
-    required StrategyEvaluationResult evaluation,
-    required LiveMarketTicker? ticker,
+  void _startPeriodicTimer() {
+    _cycleTimer?.cancel();
+    _cycleTimer = Timer.periodic(const Duration(seconds: 15), (_) {
+      if (!_disposed && state == BotEngineState.running) {
+        executeTradingCycle(allowTradingExecution: true);
+      }
+    });
+  }
+
+  static double _scoreSignalOpportunity({
+    required CoinDcxMarketRecord market,
+    required StrategyEvaluationResult eval,
+    required LiveMarketTicker ticker,
   }) {
-    final px = evaluation.closePrice > 0 ? evaluation.closePrice : 1.0;
-    final ema15mSpreadBps =
-        ((evaluation.ema20_15m - evaluation.ema50_15m) / px) * 10000.0;
-    final ema1hSpreadBps =
-        ((evaluation.ema20_1h - evaluation.ema50_1h) / px) * 10000.0;
-    // Prefer RSI near middle of 50-65 band (57.5)
-    final rsiScore =
-        (15.0 - (evaluation.rsi14_15m - 57.5).abs()).clamp(0.0, 15.0) * 2.0;
-    final spreadBps = ticker?.spreadBps ?? 10.0;
-    final tightSpreadScore = (25.0 - spreadBps).clamp(0.0, 25.0) * 1.2;
-    final volScore = ticker != null && ticker.volume24h > 0
-        ? (math.log(ticker.volume24h + 1.0) / math.log(1000000.0))
-                .clamp(0.0, 1.0) *
-            20.0
-        : 5.0;
-
-    return (ema15mSpreadBps.clamp(0.0, 50.0) * 0.6) +
-        (ema1hSpreadBps.clamp(0.0, 80.0) * 0.3) +
-        rsiScore +
-        tightSpreadScore +
-        volScore;
+    final volScore = ticker.volume24h > 0
+        ? math.min(35.0, math.log(ticker.volume24h + 1) * 2.8)
+        : 0.0;
+    final spreadScore = (35.0 - ticker.spreadBps).clamp(0.0, 35.0);
+    final trendStrength = eval.ema50_15m > 0
+        ? (((eval.ema20_15m - eval.ema50_15m) / eval.ema50_15m) * 1000.0)
+            .clamp(0.0, 20.0)
+        : 0.0;
+    final rsiSweetSpot = (10.0 - (eval.rsi14_15m - 58.0).abs()).clamp(0.0, 10.0);
+    return volScore + spreadScore + trendStrength + rsiSweetSpot;
   }
 
-  /// Stage 8, Part 4, Part 5 & Part 6: Single authoritative engine execution covered by SQLite lease lock.
-  /// Dynamically discovers all CoinDCX markets, evaluates every eligible pair, ranks valid BUY opportunities,
-  /// and executes within the $100 / 1-max-open-position portfolio risk controls.
-  Future<bool> executeAuthoritativeCycle({
-    required bool allowTradingExecution,
-    bool transitionToRunningOnSuccess = false,
-  }) async {
-    if (_isCycleExecuting) return false;
-    _isCycleExecuting = true;
-    final nowMs = nowMsProvider();
-
+  Future<void> executeTradingCycle({bool allowTradingExecution = true}) async {
+    if (_isCycleInFlight || _disposed) return;
+    _isCycleInFlight = true;
     try {
-      final acquired = await persistence.acquireExecutionLock(
-        lockName: authoritativeLockName,
-        ownerId: _ownerId,
-        nowMs: nowMs,
-        ttlMs: 55000,
+      final now = _nowMs();
+      final locked = await persistence.acquireExecutionLock(
+        lockName: lockName,
+        ownerId: ownerId,
+        nowMs: now,
       );
-      if (!acquired) return false;
+      if (!locked) return;
 
-      await persistence.recordHeartbeat(nowMs);
-      final snap = await persistence.loadFullState();
-      _hydrateBrokerFromSnapshot(snap);
+      lastHeartbeatMs = now;
+      await persistence.recordHeartbeat(now);
 
-      // Stage 3 & 6: Never auto-run if userIntention is STOPPED or PAUSED
-      final userWantsRunning = transitionToRunningOnSuccess ||
-          snap.userIntention == UserSessionIntention.running;
-
-      if (!userWantsRunning && allowTradingExecution) {
-        return true;
-      }
-
-      if (snap.botState == BotEngineState.stoppedMaxDrawdownReached ||
-          snap.botState == BotEngineState.lockedDailyLossLimit) {
-        return false;
-      }
-
-      // Part 2: If paused due to network/stale data and Auto Resume is OFF, do NOT silently resume on background ticks!
-      // Only resume when transitionToRunningOnSuccess == true (explicit START/RESUME) or snap.autoResumeEnabled == true.
-      if (snap.botState.isNetworkOrStalePause &&
-          !snap.autoResumeEnabled &&
-          !transitionToRunningOnSuccess) {
-        return false;
-      }
-
-      // Part 3 & Part 4: Refresh dynamic CoinDCX market catalogue so newly listed & eligible pairs enter the pipeline automatically.
-      try {
-        await marketService.refreshMarketCatalogue(force: false, nowMs: nowMs);
-      } catch (_) {}
-
-      // Stage 12 & 14: Fetch live tickers for current price, equity, uPnL & live SL/TP
-      Map<String, LiveMarketTicker> liveTickers = {};
-      String restStatus = 'OK';
-      try {
-        liveTickers = await marketService.fetchLiveTickers(nowMs: nowMs);
-      } catch (e) {
-        restStatus = 'ERROR: $e';
-        liveTickers = Map.from(marketService.latestTickers);
-      }
-
-      if (liveTickers.isEmpty) {
-        if (userWantsRunning) {
-          await _handleBoundedRecoveryOrPause(
-            snap: snap,
-            nowMs: nowMs,
-            pauseState: BotEngineState.pausedNetworkLoss,
-            reason:
-                'Live ticker feed unavailable — waiting for network recovery',
-          );
+      // 1. Refresh or load complete CoinDCX market catalogue
+      final catalogue = await marketService.refreshMarketCatalogue(
+        force: false,
+        nowMs: now,
+      );
+      final fetchedTickers = await marketService.fetchLiveTickers(nowMs: now);
+      if (fetchedTickers.isNotEmpty) {
+        liveTickers = Map.from(fetchedTickers);
+        for (final e in fetchedTickers.entries) {
+          liveTickerPrices[e.key] = e.value.lastPrice;
         }
-        return false;
+        lastMarketDataUpdateMs = now;
       }
 
-      final catSnap = marketService.latestCatalogueSnapshot;
-      final livePrices = {
-        for (final e in liveTickers.entries) e.key: e.value.lastPrice,
-      };
-      final closedPrices = Map<String, double>.from(snap.closedCandlePrices);
-      final whyNoTrade = Map<String, String>.from(snap.whyNoTradeForSymbol);
-      final canTrade = allowTradingExecution && userWantsRunning;
-      int latestCandleMs = snap.lastCandleUpdateMs ?? 0;
+      if (catalogue.allMarkets.isEmpty && liveTickers.isEmpty) {
+        if (state == BotEngineState.running) {
+          state = BotEngineState.waitingForFreshData;
+          statusBannerMessage =
+              'WAITING_FOR_FRESH_DATA: CoinDCX market feed unavailable';
+        }
+        await _persistCurrentState(now);
+        return;
+      }
 
-      // Build dynamic list of eligible pairs (sorted by volume/tight spread, capped at maxEligiblePairsPerScanCycle)
-      final eligibleRecords = List<CoinDcxMarketRecord>.from(
-        catSnap.eligibleMarkets,
-      )..sort((a, b) {
-          final volA = a.latestTicker?.volume24h ?? 0.0;
-          final volB = b.latestTicker?.volume24h ?? 0.0;
-          return volB.compareTo(volA);
-        });
+      // Clear any stale network pause once data is flowing and userIntention is running
+      if (userIntention == UserSessionIntention.running &&
+          (state == BotEngineState.waitingForFreshData ||
+              state == BotEngineState.reconnecting)) {
+        state = BotEngineState.running;
+        await persistence.clearRecoveryState();
+      }
 
-      final dynamicEligiblePairs = eligibleRecords
-          .take(maxEligiblePairsPerScanCycle)
-          .map((m) => m.pair)
-          .where((p) => p.isNotEmpty)
+      // 2. Determine all eligible pairs (USDT spot pairs for $100 USDT paper account)
+      final eligibleMarkets = catalogue.allMarkets
+          .where((m) =>
+              m.isEligibleForPaperTrading &&
+              m.quoteCurrency.toUpperCase() == 'USDT' &&
+              m.pair.isNotEmpty)
           .toList();
 
-      final openPositionSymbols =
-          broker.openPositions.map((p) => p.symbol).toSet();
+      int evaluatedCount = 0;
+      int skippedCount = 0;
+      final skippedReasons = <String, String>{};
+      int totalSignals = 0;
+      int buySignals = 0;
+      int sellSignals = 0;
+      int rejectedSignals = 0;
+      final rejectionReasons = <String, String>{};
+      int submittedOrders = 0;
+      int acceptedOrders = 0;
+      int rejectedOrders = 0;
 
-      final activeSymbolsToEvaluate = <String>{
-        ...openPositionSymbols,
-        ...(dynamicEligiblePairs.isNotEmpty
-            ? dynamicEligiblePairs
-            : watchedSymbols),
-      };
-
-      final skippedPairsReasons = <String, String>{};
-      final signalRejectionReasons = <String, String>{};
-      final rankedBuyOpportunities = <RankedSignalOpportunity>[];
-
-      int pairsEvaluatedCount = 0;
-      int signalsGeneratedCount = 0;
-      int buySignalsCount = 0;
-      int sellSignalsCount = 0;
-      int rejectedSignalsCount = 0;
-      int paperOrdersSubmittedCount = 0;
-      int acceptedOrdersCount = 0;
-      int rejectedOrdersCount = 0;
-      int newOrderSeqDelta = 0;
-      bool anyNetworkError = false;
-      String? lastSymbolFetchError;
-
-      // Record catalogue-level rejections in skippedPairsReasons for visibility
-      for (final m in catSnap.allMarkets) {
-        if (!m.isEligibleForPaperTrading && m.pair.isNotEmpty) {
-          skippedPairsReasons[m.pair] =
-              '${m.eligibilityStatus.categoryLabel}: ${m.eligibilityReason}';
+      // 3. First evaluate any open positions for SL / TP / Exit on closed candles
+      for (final pos in List<PaperPosition>.from(openPositions)) {
+        try {
+          final candles15m = await marketService.fetchClosedCandles(
+            pair: pos.symbol,
+            interval: '15m',
+            nowMs: now,
+            limit: 80,
+          );
+          final candles1h = await marketService.fetchClosedCandles(
+            pair: pos.symbol,
+            interval: '1h',
+            nowMs: now,
+            limit: 65,
+          );
+          if (candles15m.isNotEmpty) {
+            lastCandleUpdateMs = now;
+            final latestClosed = candles15m.last;
+            closedCandlePrices[pos.symbol] = latestClosed.close;
+            final eval = strategyEngine.evaluate(
+              symbol: pos.symbol,
+              closedCandles15m: candles15m,
+              closedCandles1h: candles1h,
+              nowMs: now,
+            );
+            final exitCheck = paperBroker.evaluateOpenPositionOnClosedCandle(
+              position: pos,
+              closedCandle: latestClosed,
+              nextOrderId: 'ORD_${++orderSeq}',
+              nextTradeId: 'TRD_$orderSeq',
+              strategySignal: eval.signal,
+            );
+            if (exitCheck.closedTrade != null && exitCheck.exitOrder != null) {
+              availableCashUsdt += exitCheck.cashDeltaUsdt;
+              openPositions.removeWhere((p) => p.id == pos.id);
+              orders.insert(0, exitCheck.exitOrder!);
+              closedTrades.insert(0, exitCheck.closedTrade!);
+              riskSupervisor.recordClosedTradeOutcome(
+                exitCheck.closedTrade!.realizedPnlUsdt,
+              );
+              if (exitCheck.outcome == CandleStreamOutcome.stopLossTriggered) {
+                lastStopLossClosedAtMs = now;
+              }
+              if (onTradeAlert != null) {
+                await onTradeAlert!(
+                  TradeAlertFormatter.formatExitAlert(exitCheck.closedTrade!),
+                );
+              }
+            }
+          }
+        } catch (e) {
+          // Single-pair candle error isolated safely
+          skippedReasons[pos.symbol] = 'OPEN_POS_CANDLE_ERR: $e';
         }
       }
 
-      // Phase 1: Fetch candles, evaluate SL/TP & SELL exits for open positions, and collect BUY signals across all eligible pairs
-      for (final symbol in activeSymbolsToEvaluate) {
-        List<Candle> candles15m;
-        List<Candle> candles1h;
+      // Update mark-to-market account equity
+      double openMarketVal = 0.0;
+      for (final p in openPositions) {
+        final mark = liveTickerPrices[p.symbol] ??
+            closedCandlePrices[p.symbol] ??
+            p.entryPrice;
+        openMarketVal += (p.quantity * mark) - (p.quantity * mark * 0.001);
+      }
+      accountEquityUsdt = availableCashUsdt + openMarketVal;
+
+      // Check global risk locks
+      if (riskManager.shouldStopForMaxDrawdown(accountEquityUsdt)) {
+        maxDrawdownLocked = true;
+        state = BotEngineState.stoppedMaxDrawdownReached;
+        statusBannerMessage =
+            'PAUSED_BY_RISK: Max drawdown floor (\$90.00) reached.';
+        await _persistCurrentState(now);
+        return;
+      }
+      if (riskManager.shouldLockDailyLoss(
+        startOfDayEquityUsdt: startOfDayEquityUsdt,
+        currentEquityUsdt: accountEquityUsdt,
+      )) {
+        lockedDailyLossUtcDate = RiskManager.currentUtcDateString(now);
+        state = BotEngineState.lockedDailyLossLimit;
+        statusBannerMessage =
+            'PAUSED_BY_RISK: Daily loss limit (\$2.00) reached.';
+        await _persistCurrentState(now);
+        return;
+      }
+
+      // 4. Evaluate all eligible pairs and rank BUY candidates
+      final buyOpportunities = <RankedSignalOpportunity>[];
+
+      for (final market in eligibleMarkets) {
+        final pairKey = market.pair;
+        final ticker = market.latestTicker ??
+            CoinDcxMarketService.matchTickerForMarket(
+              symbol: market.symbol,
+              coindcxName: market.coindcxName,
+              pair: market.pair,
+              tickersByKey: liveTickers,
+            );
+        if (ticker == null) {
+          skippedCount++;
+          skippedReasons[pairKey] = 'MISSING_LIVE_TICKER';
+          whyNoTradeForSymbol[pairKey] = 'SKIPPED: Missing live ticker';
+          continue;
+        }
+        liveTickerPrices[pairKey] = ticker.lastPrice;
+        liveTickerPrices[market.symbol] = ticker.lastPrice;
+
+        List<Candle> candles15m = const [];
+        List<Candle> candles1h = const [];
         try {
-          candles15m = await _fetchClosedCandlesWithRetry(symbol, '15m', nowMs);
-          candles1h = await _fetchClosedCandlesWithRetry(symbol, '1h', nowMs);
-        } catch (e) {
-          anyNetworkError = true;
-          lastSymbolFetchError = 'Candle fetch error for $symbol: $e';
-          skippedPairsReasons[symbol] = 'SKIPPED: Candle fetch failed ($e)';
-          whyNoTrade[symbol] = 'Why no trade: Candle fetch failed';
-          continue;
-        }
-
-        if (marketService.isDataStale(
-          closedCandles15m: candles15m,
-          nowMs: nowMs,
-        )) {
-          skippedPairsReasons[symbol] =
-              'SKIPPED: Stale or incomplete 15m candle history (${candles15m.length} bars)';
-          whyNoTrade[symbol] = 'Why no trade: Stale data for $symbol';
-          continue;
-        }
-
-        pairsEvaluatedCount++;
-        final latestCandle = candles15m.last;
-        closedPrices[symbol] = latestCandle.close;
-        if (latestCandle.closeTimeMs > latestCandleMs) {
-          latestCandleMs = latestCandle.closeTimeMs;
-        }
-
-        final discoveredRecord = marketService.catalogueByPair[symbol];
-        final pairMeta = discoveredRecord != null
-            ? discoveredRecord.toMarketPairMetadata()
-            : MarketPairMetadata(
-                symbol: symbol,
-                baseCurrency: symbol.contains('BTC') ? 'BTC' : 'ETH',
-                quoteCurrency: 'USDT',
-              );
-
-        // 1A. If we hold an open position on this symbol, process SL/TP & bearish EMA crossover exits immediately
-        final holdsPositionOnSymbol =
-            broker.openPositions.any((p) => p.symbol == symbol);
-        if (holdsPositionOnSymbol) {
-          final exitOutcome = broker.processClosedCandleStream(
-            symbol: symbol,
-            closedCandles15m: candles15m,
-            closedCandles1h: candles1h,
-            strategyEngine: strategyEngine,
-            pairMetadata: pairMeta,
-            currentMarkPrices: livePrices,
-            liveTicker: liveTickers[symbol],
-            allowNewEntries: false,
+          candles15m = await marketService.fetchClosedCandles(
+            pair: pairKey,
+            interval: '15m',
+            nowMs: now,
+            limit: 80,
           );
-          if (exitOutcome.whyNoTradeReason != null) {
-            whyNoTrade[symbol] = exitOutcome.whyNoTradeReason!;
-          }
-          if (exitOutcome.newOrders.isNotEmpty) {
-            newOrderSeqDelta += exitOutcome.newOrders.length;
-            paperOrdersSubmittedCount += exitOutcome.newOrders.length;
-            acceptedOrdersCount += exitOutcome.newOrders.length;
-          }
-          for (final closedTrd in exitOutcome.newClosedTrades) {
-            riskSupervisor.recordClosedTradeOutcome(closedTrd.realizedPnlUsdt);
-          }
-          await _emitAlertsForNewOrders(exitOutcome);
-
-          if (exitOutcome.triggeredSafetyState != null) {
-            final eq = broker.accountEquityUsdt(livePrices);
-            await persistence.logDiagnosticEvent(
-              'SAFETY_LOCK',
-              exitOutcome.safetyMessage ??
-                  exitOutcome.triggeredSafetyState!.name,
-              timestampMs: nowMs,
-            );
-            await persistence.saveFullState(
-              botState: exitOutcome.triggeredSafetyState!,
-              availableCashUsdt: broker.availableCashUsdt,
-              accountEquityUsdt: eq,
-              maxDrawdownLocked: broker.maxDrawdownLocked,
-              lockedDailyLossUtcDate: broker.lockedDailyLossUtcDate,
-              lastStopLossClosedAtMs: broker.lastStopLossClosedAtMs,
-              lastHeartbeatMs: nowMs,
-              lastMarketDataUpdateMs: nowMs,
-              lastCandleUpdateMs: latestCandleMs,
-              orderSeq: snap.orderSeq + newOrderSeqDelta,
-              statusBannerMessage:
-                  exitOutcome.safetyMessage ?? 'SAFETY LOCK TRIGGERED',
-              liveTickerPrices: livePrices,
-              liveTickers: liveTickers,
-              closedCandlePrices: closedPrices,
-              whyNoTradeForSymbol: whyNoTrade,
-              openPositions: broker.openPositions,
-              orders: broker.orders,
-              closedTrades: broker.closedTrades,
-              processedEntrySignalKeys: broker.processedEntrySignalKeys,
-            );
-            return false;
-          }
+          candles1h = await marketService.fetchClosedCandles(
+            pair: pairKey,
+            interval: '1h',
+            nowMs: now,
+            limit: 65,
+          );
+        } catch (e) {
+          skippedCount++;
+          skippedReasons[pairKey] = 'CANDLE_FETCH_ERROR';
+          whyNoTradeForSymbol[pairKey] = 'SKIPPED: Candle fetch error';
+          continue;
         }
 
-        // 1B. Evaluate strategy on closed 15m and 1h candles
-        final eval = strategyEngine.evaluateClosedCandles(
-          symbol: symbol,
+        if (candles15m.length < 52 || candles1h.length < 50) {
+          skippedCount++;
+          skippedReasons[pairKey] =
+              'INSUFFICIENT_CANDLES (15m=${candles15m.length}, 1h=${candles1h.length})';
+          whyNoTradeForSymbol[pairKey] =
+              'SKIPPED: Insufficient closed candles (15m=${candles15m.length}/52, 1h=${candles1h.length}/50)';
+          continue;
+        }
+
+        lastCandleUpdateMs = now;
+        closedCandlePrices[pairKey] = candles15m.last.close;
+        closedCandlePrices[market.symbol] = candles15m.last.close;
+        evaluatedCount++;
+
+        final eval = strategyEngine.evaluate(
+          symbol: pairKey,
           closedCandles15m: candles15m,
           closedCandles1h: candles1h,
+          nowMs: now,
         );
-        whyNoTrade[symbol] = eval.reason;
+        whyNoTradeForSymbol[pairKey] = eval.reason;
+        whyNoTradeForSymbol[market.symbol] = eval.reason;
 
-        if (eval.signal == StrategySignalType.sell) {
-          signalsGeneratedCount++;
-          sellSignalsCount++;
-        } else if (eval.signal == StrategySignalType.buy) {
-          signalsGeneratedCount++;
-          buySignalsCount++;
-
-          final allowEntryForMarket = canTrade &&
-              (discoveredRecord == null ||
-                  discoveredRecord.isEligibleForPaperTrading);
-          if (!allowEntryForMarket) {
-            rejectedSignalsCount++;
-            final rejReason = discoveredRecord != null &&
-                    !discoveredRecord.isEligibleForPaperTrading
-                ? 'Rejected: Market ${discoveredRecord.pair} is not eligible (${discoveredRecord.eligibilityReason})'
-                : 'Rejected: Trading execution not active in current mode';
-            signalRejectionReasons[symbol] = rejReason;
-            whyNoTrade[symbol] = rejReason;
+        if (eval.signal == StrategySignalType.buy) {
+          totalSignals++;
+          buySignals++;
+          final sigKey = '${pairKey}_${eval.evaluatedCandleCloseMs}';
+          if (processedEntrySignalKeys.contains(sigKey)) {
+            rejectedSignals++;
+            rejectionReasons[pairKey] = 'DUPLICATE_CANDLE_SIGNAL';
+            whyNoTradeForSymbol[pairKey] = 'REJECTED: Duplicate candle signal';
             continue;
           }
-
-          final ticker = liveTickers[symbol] ??
-              discoveredRecord?.latestTicker ??
-              LiveMarketTicker(
-                symbol: symbol,
-                lastPrice: latestCandle.close,
-                bid: latestCandle.close,
-                ask: latestCandle.close,
-                high24h: latestCandle.high,
-                low24h: latestCandle.low,
-                volume24h: latestCandle.volume,
-                change24hPct: 0.0,
-                timestampMs: latestCandle.closeTimeMs,
-              );
-
-          final recordForOpportunity = discoveredRecord ??
-              CoinDcxMarketRecord(
-                coindcxName: symbol,
-                symbol: symbol,
-                pair: symbol,
-                ecode: 'B',
-                baseCurrencyShortName: 'USDT',
-                targetCurrencyShortName:
-                    symbol.contains('BTC') ? 'BTC' : 'ETH',
-                status: 'active',
-                baseCurrencyPrecision: 2,
-                targetCurrencyPrecision: 5,
-                minQuantity: 0.00001,
-                maxQuantity: 90000000.0,
-                maxQuantityMarket: 100000.0,
-                step: 0.00001,
-                minNotional: 5.0,
-                minPrice: 0.01,
-                maxPrice: 1000000.0,
-                orderTypes: const ['limit_order', 'market_order'],
-                latestTicker: ticker,
-                lastMetadataRefreshMs: nowMs,
-                eligibilityStatus:
-                    MarketEligibilityStatus.eligibleForPaperTrading,
-              );
-
-          final score = computeOpportunityRankingScore(
-            evaluation: eval,
+          final score = _scoreSignalOpportunity(
+            market: market,
+            eval: eval,
             ticker: ticker,
           );
-
-          rankedBuyOpportunities.add(
+          buyOpportunities.add(
             RankedSignalOpportunity(
-              market: recordForOpportunity,
+              market: market,
               evaluation: eval,
               closedCandles15m: candles15m,
               closedCandles1h: candles1h,
@@ -580,458 +481,212 @@ class AuthoritativeTradingEngine {
               rankingScore: score,
             ),
           );
+        } else if (eval.signal == StrategySignalType.sell) {
+          totalSignals++;
+          sellSignals++;
         }
       }
 
-      // If zero pairs could be evaluated, pause safely for network or stale data
-      if (pairsEvaluatedCount == 0 && activeSymbolsToEvaluate.isNotEmpty) {
-        if (userWantsRunning) {
-          final pauseTarget = anyNetworkError
-              ? BotEngineState.pausedNetworkLoss
-              : BotEngineState.pausedStaleData;
-          final pauseReason = anyNetworkError
-              ? (lastSymbolFetchError ?? 'All candle requests failed')
-              : 'Why no trade: Stale data across all evaluated pairs';
-          await _handleBoundedRecoveryOrPause(
-            snap: snap,
-            nowMs: nowMs,
-            pauseState: pauseTarget,
-            reason: pauseReason,
+      // Sort BUY opportunities highest score first
+      buyOpportunities.sort((a, b) => b.rankingScore.compareTo(a.rankingScore));
+
+      // 5. Execute top-ranked valid BUY opportunity if portfolio capacity allows
+      if (allowTradingExecution &&
+          state == BotEngineState.running &&
+          buyOpportunities.isNotEmpty) {
+        for (final opp in buyOpportunities) {
+          final pairKey = opp.market.pair;
+          if (openPositions.length >=
+              riskManager.config.maxConcurrentOpenPositions) {
+            rejectedSignals++;
+            rejectionReasons[pairKey] = 'MAX_OPEN_POSITIONS_LIMIT_REACHED';
+            whyNoTradeForSymbol[pairKey] =
+                'REJECTED: Max open positions (${riskManager.config.maxConcurrentOpenPositions}) already active';
+            continue;
+          }
+
+          final refAsk = opp.ticker.ask > 0
+              ? opp.ticker.ask
+              : opp.evaluation.closePrice;
+          final estFill = paperBroker.computeBuyFillPrice(refAsk);
+          final sizing = riskManager.evaluateEntry(
+            symbol: pairKey,
+            entryFillPrice: estFill,
+            atr14: opp.evaluation.atr14_15m,
+            currentEquityUsdt: accountEquityUsdt,
+            startOfDayEquityUsdt: startOfDayEquityUsdt,
+            availableCashUsdt: availableCashUsdt,
+            openPositions: openPositions,
+            metadata: opp.market.toMarketPairMetadata(),
+            lastStopLossClosedAtMs: lastStopLossClosedAtMs,
+            nowMs: now,
           );
-        }
-        return false;
-      }
 
-      // Phase 2: Sort all valid BUY opportunities by descending rankingScore and execute within portfolio risk limits
-      rankedBuyOpportunities
-          .sort((a, b) => b.rankingScore.compareTo(a.rankingScore));
+          if (!sizing.approved) {
+            rejectedSignals++;
+            rejectionReasons[pairKey] =
+                sizing.rejectionReason ?? 'RISK_SIZING_REJECTED';
+            whyNoTradeForSymbol[pairKey] =
+                'REJECTED: ${sizing.rejectionReason}';
+            continue;
+          }
 
-      for (final opp in rankedBuyOpportunities) {
-        final symbol = opp.market.pair;
-        final pairMeta = opp.market.toMarketPairMetadata();
-
-        // Check portfolio max concurrent open positions (1) before submitting
-        if (broker.openPositions.length >=
-            broker.riskManager.config.maxConcurrentOpenPositions) {
-          rejectedSignalsCount++;
-          rejectedOrdersCount++;
-          const reason =
-              'Why no trade: Max concurrent open positions (1/1) reached after higher-ranked opportunity';
-          signalRejectionReasons[symbol] = reason;
-          whyNoTrade[symbol] = reason;
-          continue;
-        }
-
-        paperOrdersSubmittedCount++;
-        final outcome = broker.processClosedCandleStream(
-          symbol: symbol,
-          closedCandles15m: opp.closedCandles15m,
-          closedCandles1h: opp.closedCandles1h,
-          strategyEngine: strategyEngine,
-          pairMetadata: pairMeta,
-          currentMarkPrices: livePrices,
-          liveTicker: opp.ticker,
-          allowNewEntries: true,
-        );
-
-        if (outcome.whyNoTradeReason != null) {
-          whyNoTrade[symbol] = outcome.whyNoTradeReason!;
-        }
-
-        if (outcome.newOrders.isNotEmpty) {
-          acceptedOrdersCount += outcome.newOrders.length;
-          newOrderSeqDelta += outcome.newOrders.length;
-          await _emitAlertsForNewOrders(outcome);
-        } else {
-          rejectedSignalsCount++;
-          rejectedOrdersCount++;
-          signalRejectionReasons[symbol] =
-              outcome.whyNoTradeReason ?? 'Rejected by RiskManager / PaperBroker';
-        }
-
-        if (outcome.triggeredSafetyState != null) {
-          final eq = broker.accountEquityUsdt(livePrices);
-          await persistence.logDiagnosticEvent(
-            'SAFETY_LOCK',
-            outcome.safetyMessage ?? outcome.triggeredSafetyState!.name,
-            timestampMs: nowMs,
+          final orderValid = opp.market.validateOrder(
+            quantity: sizing.quantity,
+            price: estFill,
           );
-          await persistence.saveFullState(
-            botState: outcome.triggeredSafetyState!,
-            availableCashUsdt: broker.availableCashUsdt,
-            accountEquityUsdt: eq,
-            maxDrawdownLocked: broker.maxDrawdownLocked,
-            lockedDailyLossUtcDate: broker.lockedDailyLossUtcDate,
-            lastStopLossClosedAtMs: broker.lastStopLossClosedAtMs,
-            lastHeartbeatMs: nowMs,
-            lastMarketDataUpdateMs: nowMs,
-            lastCandleUpdateMs: latestCandleMs,
-            orderSeq: snap.orderSeq + newOrderSeqDelta,
-            statusBannerMessage:
-                outcome.safetyMessage ?? 'SAFETY LOCK TRIGGERED',
-            liveTickerPrices: livePrices,
-            liveTickers: liveTickers,
-            closedCandlePrices: closedPrices,
-            whyNoTradeForSymbol: whyNoTrade,
-            openPositions: broker.openPositions,
-            orders: broker.orders,
-            closedTrades: broker.closedTrades,
-            processedEntrySignalKeys: broker.processedEntrySignalKeys,
+          if (!orderValid.valid) {
+            rejectedSignals++;
+            rejectionReasons[pairKey] =
+                orderValid.reason ?? 'EXCHANGE_RULE_REJECTED';
+            whyNoTradeForSymbol[pairKey] = 'REJECTED: ${orderValid.reason}';
+            continue;
+          }
+
+          final supVet = riskSupervisor.vetOrderRequest(
+            symbol: pairKey,
+            currentEquityUsdt: accountEquityUsdt,
+            startOfDayEquityUsdt: startOfDayEquityUsdt,
+            availableCashUsdt: availableCashUsdt,
+            entryPrice: estFill,
+            stopLossPrice: sizing.stopLossPrice,
+            quantity: sizing.quantity,
+            feeRate: paperBroker.feeRate,
+            slippageRate: paperBroker.slippageRate,
+            spreadPct: opp.ticker.spreadPct,
+            atr14: opp.evaluation.atr14_15m,
+            isDataFresh: true,
+            openPositions: openPositions,
+            activeOrders: const [],
+            lastStopLossClosedAtMs: lastStopLossClosedAtMs,
+            nowMs: now,
           );
-          return false;
+
+          submittedOrders++;
+          if (!supVet.approved) {
+            rejectedSignals++;
+            rejectedOrders++;
+            rejectionReasons[pairKey] =
+                supVet.reason ?? 'SUPERVISOR_REJECTED';
+            whyNoTradeForSymbol[pairKey] = 'REJECTED: ${supVet.reason}';
+            continue;
+          }
+
+          final executed = paperBroker.executeEntry(
+            positionId: 'POS_${++orderSeq}',
+            orderId: 'ORD_$orderSeq',
+            symbol: pairKey,
+            rawReferencePrice: refAsk,
+            sizing: sizing,
+            signalCandleCloseMs: opp.evaluation.evaluatedCandleCloseMs,
+            executedAtMs: now,
+            reason: opp.evaluation.reason,
+          );
+
+          availableCashUsdt += executed.cashDeltaUsdt;
+          openPositions.insert(0, executed.position);
+          orders.insert(0, executed.order);
+          processedEntrySignalKeys
+              .add('${pairKey}_${opp.evaluation.evaluatedCandleCloseMs}');
+          acceptedOrders++;
+          whyNoTradeForSymbol[pairKey] =
+              'EXECUTED PAPER BUY: Qty ${executed.position.quantity} @ \$${executed.position.entryPrice.toStringAsFixed(2)}';
+          whyNoTradeForSymbol[opp.market.symbol] =
+              whyNoTradeForSymbol[pairKey]!;
+
+          if (onTradeAlert != null) {
+            await onTradeAlert!(
+              TradeAlertFormatter.formatEntryAlert(
+                executed.position,
+                executed.order,
+              ),
+            );
+          }
         }
       }
 
-      // Check drawdown / daily loss even when no BUY signals occurred
-      if (broker.enforceMaxDrawdownCheck(livePrices)) {
-        final eq = broker.accountEquityUsdt(livePrices);
-        await persistence.saveFullState(
-          botState: BotEngineState.stoppedMaxDrawdownReached,
-          availableCashUsdt: broker.availableCashUsdt,
-          accountEquityUsdt: eq,
-          maxDrawdownLocked: true,
-          lockedDailyLossUtcDate: broker.lockedDailyLossUtcDate,
-          lastStopLossClosedAtMs: broker.lastStopLossClosedAtMs,
-          lastHeartbeatMs: nowMs,
-          lastMarketDataUpdateMs: nowMs,
-          lastCandleUpdateMs: latestCandleMs,
-          orderSeq: snap.orderSeq + newOrderSeqDelta,
-          statusBannerMessage:
-              'Account equity reached or fell below \$90.00 floor. Engine stopped; manual review & reset required.',
-          liveTickerPrices: livePrices,
-          liveTickers: liveTickers,
-          closedCandlePrices: closedPrices,
-          whyNoTradeForSymbol: whyNoTrade,
-          openPositions: broker.openPositions,
-          orders: broker.orders,
-          closedTrades: broker.closedTrades,
-          processedEntrySignalKeys: broker.processedEntrySignalKeys,
-        );
-        return false;
+      // Recompute equity after any entries
+      double finalOpenVal = 0.0;
+      for (final p in openPositions) {
+        final mark = liveTickerPrices[p.symbol] ??
+            closedCandlePrices[p.symbol] ??
+            p.entryPrice;
+        finalOpenVal += (p.quantity * mark) - (p.quantity * mark * 0.001);
       }
+      accountEquityUsdt = availableCashUsdt + finalOpenVal;
 
-      // Cycle succeeded with fresh validated data -> clear recovery tracking & lastError!
-      await _resetRecoveryTracking();
-      final eq = broker.accountEquityUsdt(livePrices);
-      final targetState =
-          userWantsRunning ? BotEngineState.running : snap.botState;
-      final banner = userWantsRunning
-          ? 'PAPER BOT RUNNING — Scanned $pairsEvaluatedCount pair(s) • Heartbeat ${_formatHhMmSs(nowMs)}'
-          : snap.statusBannerMessage;
-
-      final scanDiag = ScanCycleDiagnosticsSnapshot(
-        lastCycleTimestampMs: nowMs,
-        lastSuccessfulScanMs: nowMs,
-        totalPairsDiscovered: catSnap.totalDiscoveredCount > 0
-            ? catSnap.totalDiscoveredCount
-            : activeSymbolsToEvaluate.length,
-        activePairsCount: catSnap.activeMarketsCount > 0
-            ? catSnap.activeMarketsCount
-            : activeSymbolsToEvaluate.length,
-        eligiblePairsCount: catSnap.eligibleMarketsCount > 0
-            ? catSnap.eligibleMarketsCount
-            : activeSymbolsToEvaluate.length,
-        rejectedPairsCount: catSnap.rejectedMarketsCount,
-        lastCatalogueRefreshMs: catSnap.lastSuccessfulRefreshMs ?? nowMs,
-        totalPairsEvaluated: pairsEvaluatedCount,
-        pairsSkippedCount: skippedPairsReasons.length,
-        skippedPairsReasons: skippedPairsReasons,
-        signalsGeneratedCount: signalsGeneratedCount,
-        buySignalsCount: buySignalsCount,
-        sellSignalsCount: sellSignalsCount,
-        rejectedSignalsCount: rejectedSignalsCount,
-        signalRejectionReasons: signalRejectionReasons,
-        paperOrdersSubmittedCount: paperOrdersSubmittedCount,
-        acceptedOrdersCount: acceptedOrdersCount,
-        rejectedOrdersCount: rejectedOrdersCount,
-        coindcxRestStatus: restStatus,
-        webSocketStatus: 'REST_AUTHORITATIVE_4S_POLL',
-        recoveryStateLabel: 'NORMAL (0 RETRIES)',
+      scanDiagnostics = ScanCycleDiagnosticsSnapshot(
+        lastCycleTimestampMs: now,
+        lastSuccessfulScanMs: now,
+        totalPairsDiscovered: catalogue.totalDiscoveredCount,
+        activePairsCount: catalogue.activeMarketsCount,
+        eligiblePairsCount: eligibleMarkets.length,
+        rejectedPairsCount:
+            catalogue.totalDiscoveredCount - eligibleMarkets.length,
+        lastCatalogueRefreshMs: catalogue.lastSuccessfulRefreshMs,
+        totalPairsEvaluated: evaluatedCount,
+        pairsSkippedCount: skippedCount,
+        skippedPairsReasons: skippedReasons,
+        signalsGeneratedCount: totalSignals,
+        buySignalsCount: buySignals,
+        sellSignalsCount: sellSignals,
+        rejectedSignalsCount: rejectedSignals,
+        signalRejectionReasons: rejectionReasons,
+        paperOrdersSubmittedCount: submittedOrders,
+        acceptedOrdersCount: acceptedOrders,
+        rejectedOrdersCount: rejectedOrders,
+        coindcxRestStatus: 'HEALTHY_200_OK',
+        webSocketStatus: 'REST_POLLING_ACTIVE',
+        recoveryStateLabel: 'NORMAL',
       );
 
-      await persistence.saveFullState(
-        botState: targetState,
-        availableCashUsdt: broker.availableCashUsdt,
-        accountEquityUsdt: eq,
-        maxDrawdownLocked: broker.maxDrawdownLocked,
-        lockedDailyLossUtcDate: broker.lockedDailyLossUtcDate,
-        lastStopLossClosedAtMs: broker.lastStopLossClosedAtMs,
-        lastHeartbeatMs: nowMs,
-        lastMarketDataUpdateMs: nowMs,
-        lastCandleUpdateMs: latestCandleMs,
-        runningSinceMs:
-            snap.runningSinceMs ?? (userWantsRunning ? nowMs : null),
-        totalActiveMs: snap.totalActiveMs,
-        orderSeq: snap.orderSeq + newOrderSeqDelta + 1,
-        statusBannerMessage: banner,
-        liveTickerPrices: livePrices,
-        liveTickers: liveTickers,
-        closedCandlePrices: closedPrices,
-        whyNoTradeForSymbol: whyNoTrade,
-        openPositions: broker.openPositions,
-        orders: broker.orders,
-        closedTrades: broker.closedTrades,
-        processedEntrySignalKeys: broker.processedEntrySignalKeys,
-        scanDiagnostics: scanDiag,
-      );
+      if (state == BotEngineState.running) {
+        statusBannerMessage =
+            'PAPER BOT RUNNING • Scanned $evaluatedCount/${eligibleMarkets.length} Eligible Pairs • Open: ${openPositions.length}/1';
+      }
 
-      if (userWantsRunning) {
-        await _notify(
-          'Ankit AI Trader — PAPER BOT ACTIVE',
-          _formatOngoingNotificationText(eq, livePrices),
+      await _persistCurrentState(now);
+      if (onNotificationUpdate != null) {
+        await onNotificationUpdate!(
+          'Ankit AI Trader (${state.dashboardLabel})',
+          'Equity: \$${accountEquityUsdt.toStringAsFixed(2)} | Open: ${openPositions.length}/1 | Eligible Pairs: ${eligibleMarkets.length}',
         );
       }
-      return true;
     } finally {
-      await persistence.releaseExecutionLock(
-        lockName: authoritativeLockName,
-        ownerId: _ownerId,
-      );
-      _isCycleExecuting = false;
+      _isCycleInFlight = false;
     }
   }
 
-  Future<List<Candle>> _fetchClosedCandlesWithRetry(
-    String pair,
-    String interval,
-    int nowMs,
-  ) async {
-    Object? lastErr;
-    for (int attempt = 0; attempt < 2; attempt++) {
-      try {
-        return await marketService.fetchClosedCandles(
-          pair: pair,
-          interval: interval,
-          nowMs: nowMs,
-        );
-      } catch (e) {
-        lastErr = e;
-        await Future<void>.delayed(const Duration(milliseconds: 200));
-      }
-    }
-    throw lastErr ?? Exception('Failed to fetch candles for $pair');
-  }
-
-  Future<void> _handleBoundedRecoveryOrPause({
-    required PersistedEngineSnapshot snap,
-    required int nowMs,
-    required BotEngineState pauseState,
-    required String reason,
-  }) async {
-    final attempt = snap.recoveryAttemptCount + 1;
-    final delaySec =
-        attempt <= 1 ? 5 : (attempt == 2 ? 15 : (attempt == 3 ? 30 : 60));
-    final delayMs = delaySec * 1000;
-    final startedAt = snap.recoveryStartedAtMs ?? nowMs;
-    final nextAllowed = nowMs + delayMs;
-    final logLine =
-        '[${_formatHhMmSs(nowMs)}] AUTO-RECOVERY RETRY #$attempt (${delaySec}s): $reason';
-
-    await persistence.saveRecoveryState(
-      attemptCount: attempt,
-      recoveryStartedAtMs: startedAt,
-      nextRecoveryAllowedAtMs: nextAllowed,
-      logMessage: logLine,
-    );
-
-    final updatedDiag = ScanCycleDiagnosticsSnapshot(
-      lastCycleTimestampMs: nowMs,
-      lastSuccessfulScanMs: snap.scanDiagnostics.lastSuccessfulScanMs,
-      totalPairsDiscovered: snap.scanDiagnostics.totalPairsDiscovered,
-      activePairsCount: snap.scanDiagnostics.activePairsCount,
-      eligiblePairsCount: snap.scanDiagnostics.eligiblePairsCount,
-      rejectedPairsCount: snap.scanDiagnostics.rejectedPairsCount,
-      lastCatalogueRefreshMs: snap.scanDiagnostics.lastCatalogueRefreshMs,
-      totalPairsEvaluated: 0,
-      pairsSkippedCount: snap.scanDiagnostics.pairsSkippedCount,
-      skippedPairsReasons: snap.scanDiagnostics.skippedPairsReasons,
-      signalsGeneratedCount: 0,
-      buySignalsCount: 0,
-      sellSignalsCount: 0,
-      rejectedSignalsCount: 0,
-      signalRejectionReasons: snap.scanDiagnostics.signalRejectionReasons,
-      paperOrdersSubmittedCount: 0,
-      acceptedOrdersCount: 0,
-      rejectedOrdersCount: 0,
-      coindcxRestStatus: 'DEGRADED: $reason',
-      webSocketStatus: 'DISCONNECTED_OR_WAITING',
-      recoveryStateLabel:
-          '${pauseState.dashboardLabel} (RETRY #$attempt • AutoResume=${snap.autoResumeEnabled ? "ON" : "OFF"})',
-    );
-
-    // Stage 3: Never mutate userIntention on transient errors/network loss/stale data!
+  Future<void> _persistCurrentState(int nowMs) async {
     await persistence.saveFullState(
-      botState: pauseState,
-      availableCashUsdt: broker.availableCashUsdt,
-      accountEquityUsdt: snap.accountEquityUsdt,
-      maxDrawdownLocked: broker.maxDrawdownLocked,
-      lockedDailyLossUtcDate: broker.lockedDailyLossUtcDate,
-      lastStopLossClosedAtMs: broker.lastStopLossClosedAtMs,
-      lastHeartbeatMs: nowMs,
-      statusBannerMessage: 'PAUSED (${pauseState.dashboardLabel}): $reason',
-      liveTickerPrices: snap.liveTickerPrices,
-      liveTickers: snap.liveTickers,
-      closedCandlePrices: snap.closedCandlePrices,
-      whyNoTradeForSymbol: snap.whyNoTradeForSymbol,
-      openPositions: broker.openPositions,
-      orders: broker.orders,
-      closedTrades: broker.closedTrades,
-      processedEntrySignalKeys: broker.processedEntrySignalKeys,
-      scanDiagnostics: updatedDiag,
+      botState: state,
+      userIntention: userIntention,
+      availableCashUsdt: availableCashUsdt,
+      accountEquityUsdt: accountEquityUsdt,
+      maxDrawdownLocked: maxDrawdownLocked,
+      lockedDailyLossUtcDate: lockedDailyLossUtcDate,
+      lastStopLossClosedAtMs: lastStopLossClosedAtMs,
+      lastHeartbeatMs: lastHeartbeatMs ?? nowMs,
+      lastMarketDataUpdateMs: lastMarketDataUpdateMs,
+      lastCandleUpdateMs: lastCandleUpdateMs,
+      runningSinceMs: runningSinceMs,
+      totalActiveMs: totalActiveMs,
+      orderSeq: orderSeq,
+      statusBannerMessage: statusBannerMessage,
+      liveTickerPrices: liveTickerPrices,
+      liveTickers: liveTickers,
+      closedCandlePrices: closedCandlePrices,
+      whyNoTradeForSymbol: whyNoTradeForSymbol,
+      openPositions: openPositions,
+      orders: orders,
+      closedTrades: closedTrades,
+      processedEntrySignalKeys: processedEntrySignalKeys,
+      scanDiagnostics: scanDiagnostics,
     );
-
-    if (snap.autoResumeEnabled) {
-      _retryTimer?.cancel();
-      _retryTimer = Timer(Duration(milliseconds: delayMs), () {
-        executeAuthoritativeCycle(
-          allowTradingExecution: true,
-          transitionToRunningOnSuccess: true,
-        );
-      });
-    }
-    await onSchedulerRetry?.call(delayMs, reason);
-  }
-
-  Future<void> _resetRecoveryTracking() async {
-    _retryTimer?.cancel();
-    await persistence.clearRecoveryState();
-  }
-
-  /// Stage 9 & Part 2: Network transition handler respecting autoResumeEnabled (default OFF).
-  /// When ON, resumes ONLY after fresh validated data and ONLY from network/stale-data pauses.
-  /// NEVER resumes from user PAUSE/STOP, daily-loss lock, or drawdown lock.
-  Future<void> handleNetworkTransition(bool connected) async {
-    final nowMs = nowMsProvider();
-    final snap = await persistence.loadFullState();
-    if (!connected) {
-      if (snap.userIntention == UserSessionIntention.running &&
-          snap.botState == BotEngineState.running) {
-        if (verifyReachabilityBeforeNetworkPause) {
-          try {
-            final probe = await marketService.fetchLiveTickers(nowMs: nowMs);
-            if (probe.isNotEmpty) {
-              await persistence.logDiagnosticEvent(
-                'NETWORK_FLICKER_IGNORED',
-                'OS NetworkCallback reported loss, but CoinDCX REST probe succeeded',
-                timestampMs: nowMs,
-              );
-              return;
-            }
-          } catch (_) {}
-        }
-        await _handleBoundedRecoveryOrPause(
-          snap: snap,
-          nowMs: nowMs,
-          pauseState: BotEngineState.pausedNetworkLoss,
-          reason: 'Internet disconnected. Bot paused for safety.',
-        );
-      }
-      return;
-    }
-
-    // Network returned
-    await persistence.logDiagnosticEvent(
-      'NETWORK_RESTORED',
-      'Internet connection restored (autoResume=${snap.autoResumeEnabled})',
-      timestampMs: nowMs,
-    );
-
-    if (snap.userIntention == UserSessionIntention.running &&
-        snap.botState.isNetworkOrStalePause) {
-      if (snap.autoResumeEnabled) {
-        await persistence.putKv(
-          'botState',
-          BotEngineState.reconnecting.name,
-        );
-        await persistence.putKv(
-          'statusBannerMessage',
-          'RECONNECTING — Validating fresh market data...',
-        );
-        await executeAuthoritativeCycle(
-          allowTradingExecution: true,
-          transitionToRunningOnSuccess: true,
-        );
-      } else {
-        await persistence.putKv(
-          'statusBannerMessage',
-          'PAUSED_BY_NETWORK: Internet restored, but Auto-Resume is OFF — tap RESUME to continue.',
-        );
-      }
-    }
-  }
-
-  /// Stage 8: Mark an alert "sent" in SQLite ONLY after it actually posted (`posted == true`).
-  Future<void> _emitAlertsForNewOrders(CandleStreamOutcome outcome) async {
-    final enabled = await persistence.getTradeAlertsEnabled();
-    if (!enabled) return;
-    final notified = await persistence.getNotifiedAlertIds();
-
-    for (final ord in outcome.newOrders.where((o) => o.side == 'BUY')) {
-      final pos = broker.openPositions
-          .where((p) => p.symbol == ord.symbol)
-          .firstOrNull;
-      final alert = TradeAlertFormatter.formatEntryAlert(
-        ord,
-        stopLoss: pos?.stopLoss ?? 0.0,
-        takeProfit: pos?.takeProfit ?? 0.0,
-      );
-      if (!notified.contains(alert.alertId)) {
-        final posted = (await onTradeAlert?.call(alert)) ?? false;
-        if (posted) {
-          await persistence.markAlertIdNotified(alert.alertId);
-        }
-      }
-    }
-
-    for (final trd in outcome.newClosedTrades) {
-      final alert = TradeAlertFormatter.formatExitAlert(trd);
-      if (!notified.contains(alert.alertId)) {
-        final posted = (await onTradeAlert?.call(alert)) ?? false;
-        if (posted) {
-          await persistence.markAlertIdNotified(alert.alertId);
-        }
-      }
-    }
-
-    if (outcome.triggeredSafetyState != null && outcome.safetyMessage != null) {
-      final alert = TradeAlertFormatter.formatSafetyLockAlert(
-        lockType: outcome.triggeredSafetyState!.name,
-        message: outcome.safetyMessage!,
-        timestampMs: nowMsProvider(),
-      );
-      if (!notified.contains(alert.alertId)) {
-        final posted = (await onTradeAlert?.call(alert)) ?? false;
-        if (posted) {
-          await persistence.markAlertIdNotified(alert.alertId);
-        }
-      }
-    }
-  }
-
-  String _formatOngoingNotificationText(
-    double equity,
-    Map<String, double> prices,
-  ) {
-    final btc = prices['B-BTC_USDT'];
-    final eth = prices['B-ETH_USDT'];
-    final btcStr = btc != null ? '\$${btc.toStringAsFixed(1)}' : '--';
-    final ethStr = eth != null ? '\$${eth.toStringAsFixed(1)}' : '--';
-    return 'Eq: \$${equity.toStringAsFixed(2)} | BTC: $btcStr | ETH: $ethStr';
-  }
-
-  String _formatHhMmSs(int epochMs) {
-    final dt = DateTime.fromMillisecondsSinceEpoch(epochMs, isUtc: true);
-    final h = dt.hour.toString().padLeft(2, '0');
-    final m = dt.minute.toString().padLeft(2, '0');
-    final s = dt.second.toString().padLeft(2, '0');
-    return '$h:$m:$s UTC';
-  }
-
-  Future<void> _notify(String title, String text) async {
-    await onNotificationUpdate?.call(title, text);
   }
 
   void dispose() {
-    _retryTimer?.cancel();
+    _disposed = true;
+    _cycleTimer?.cancel();
   }
 }

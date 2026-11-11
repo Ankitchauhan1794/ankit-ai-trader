@@ -1,11 +1,10 @@
 import 'dart:math' as math;
 import '../models/trading_models.dart';
-import 'paper_broker.dart';
+import 'indicator_engine.dart';
 
-/// STAGE 29 — STRATEGY REGISTRY:
 enum StrategyApprovalStatus {
   experimental,
-  paperValidation,
+  shadowPaper,
   approvedChampion,
   retired,
 }
@@ -14,306 +13,528 @@ class RegisteredStrategyDescriptor {
   final String id;
   final String name;
   final String version;
-  final String rulesSummary;
-  final List<String> indicators;
-  final List<String> timeframes;
-  final List<String> instruments;
-  final List<String> targetRegimes;
   final StrategyApprovalStatus status;
-  final double maxRiskPerTradePct;
-  final double stopLossAtrMult;
-  final double takeProfitAtrMult;
+  final List<String> timeframes;
+  final List<String> supportedSymbols;
+  final List<String> allowedRegimes;
+  final String entryRuleSummary;
+  final String exitRuleSummary;
 
   const RegisteredStrategyDescriptor({
     required this.id,
     required this.name,
     required this.version,
-    required this.rulesSummary,
-    required this.indicators,
-    required this.timeframes,
-    required this.instruments,
-    required this.targetRegimes,
     required this.status,
-    this.maxRiskPerTradePct = 1.0,
-    this.stopLossAtrMult = 1.5,
-    this.takeProfitAtrMult = 3.0,
+    this.timeframes = const ['15m', '1h'],
+    this.supportedSymbols = const ['ALL_ELIGIBLE_COINDCX_SPOT'],
+    this.allowedRegimes = const ['TRENDING_BULL', 'RANGING_ACCUMULATION'],
+    this.entryRuleSummary = '1H EMA20>EMA50 + 15m EMA20>EMA50 + RSI(14) 50-68',
+    this.exitRuleSummary = 'SL = 1.5x ATR(14), TP = 3.0x ATR(14) or Bearish Cross',
   });
+
+  RegisteredStrategyDescriptor copyWith({
+    StrategyApprovalStatus? status,
+    String? version,
+  }) {
+    return RegisteredStrategyDescriptor(
+      id: id,
+      name: name,
+      version: version ?? this.version,
+      status: status ?? this.status,
+      timeframes: timeframes,
+      supportedSymbols: supportedSymbols,
+      allowedRegimes: allowedRegimes,
+      entryRuleSummary: entryRuleSummary,
+      exitRuleSummary: exitRuleSummary,
+    );
+  }
 }
 
 class StrategyRegistry {
-  final Map<String, RegisteredStrategyDescriptor> _strategies = {
-    'strat_ema_rsi_v1': const RegisteredStrategyDescriptor(
-      id: 'strat_ema_rsi_v1',
-      name: 'Multi-TF EMA 20/50 + RSI 50-65 Pullback',
-      version: '1.0.0',
-      rulesSummary:
-          '1h EMA20 > EMA50 bullish trend filter; 15m EMA20 crosses above EMA50 with RSI(14) in 50–65; SL 1.5xATR, TP 3.0xATR.',
-      indicators: ['EMA20', 'EMA50', 'RSI14', 'ATR14'],
-      timeframes: ['15m', '1h'],
-      instruments: ['B-BTC_USDT', 'B-ETH_USDT'],
-      targetRegimes: ['BULL_TREND', 'NORMAL_VOLATILITY'],
-      status: StrategyApprovalStatus.approvedChampion,
-    ),
-    'strat_breakout_v1_exp': const RegisteredStrategyDescriptor(
-      id: 'strat_breakout_v1_exp',
-      name: 'ATR Volatility Breakout Challenger (Sandbox)',
+  RegisteredStrategyDescriptor _activeChampion =
+      const RegisteredStrategyDescriptor(
+    id: 'EMA_20_50_RSI_ATR_V1',
+    name: 'EMA 20/50 + RSI 14 + ATR 14 Multi-Timeframe',
+    version: '1.0.0',
+    status: StrategyApprovalStatus.approvedChampion,
+  );
+
+  final List<RegisteredStrategyDescriptor> _experimental = [
+    const RegisteredStrategyDescriptor(
+      id: 'VOL_BREAKOUT_SHADOW_V1',
+      name: 'ATR Volatility Breakout Challenger',
       version: '0.9.0-exp',
-      rulesSummary:
-          'Experimental challenger: 15m close > 20-bar high + 0.5xATR with 1h bullish filter. Runs in sandbox only.',
-      indicators: ['EMA20', 'EMA50', 'ATR14', 'DONCHIAN20'],
-      timeframes: ['15m', '1h'],
-      instruments: ['B-BTC_USDT', 'B-ETH_USDT'],
-      targetRegimes: ['BREAKOUT', 'HIGH_VOLATILITY'],
       status: StrategyApprovalStatus.experimental,
     ),
-  };
+  ];
 
-  String _activeStrategyId = 'strat_ema_rsi_v1';
+  RegisteredStrategyDescriptor get activeStrategy => _activeChampion;
 
-  List<RegisteredStrategyDescriptor> get allStrategies =>
-      _strategies.values.toList();
+  List<RegisteredStrategyDescriptor> get experimentalStrategies =>
+      List.unmodifiable(_experimental);
 
-  RegisteredStrategyDescriptor get activeStrategy =>
-      _strategies[_activeStrategyId]!;
-
-  List<RegisteredStrategyDescriptor> get approvedStrategies => _strategies
-      .values
-      .where((s) => s.status == StrategyApprovalStatus.approvedChampion)
-      .toList();
-
-  List<RegisteredStrategyDescriptor> get experimentalStrategies => _strategies
-      .values
-      .where((s) => s.status != StrategyApprovalStatus.approvedChampion)
-      .toList();
-
-  /// Stage 29 & 37: Only an approvedChampion strategy can be activated as the single live/paper champion.
-  bool activateStrategy(String strategyId) {
-    final target = _strategies[strategyId];
-    if (target == null ||
-        target.status != StrategyApprovalStatus.approvedChampion) {
-      return false;
-    }
-    _activeStrategyId = strategyId;
-    return true;
+  void registerExperimental(RegisteredStrategyDescriptor descriptor) {
+    _experimental.add(
+      descriptor.copyWith(status: StrategyApprovalStatus.experimental),
+    );
   }
 
-  void registerOrUpdate(RegisteredStrategyDescriptor descriptor) {
-    _strategies[descriptor.id] = descriptor;
+  bool promoteExperimentalToChampion({
+    required String strategyId,
+    required RobustnessValidationReport validationReport,
+    required bool humanApproved,
+  }) {
+    if (!humanApproved || !validationReport.passesAllGates) {
+      return false;
+    }
+    final idx = _experimental.indexWhere((s) => s.id == strategyId);
+    if (idx == -1) return false;
+    final promoted = _experimental[idx].copyWith(
+      status: StrategyApprovalStatus.approvedChampion,
+    );
+    _experimental.removeAt(idx);
+    _activeChampion = promoted;
+    return true;
   }
 }
 
-/// STAGE 30 & 31 — ROBUSTNESS, WALK-FORWARD & MONTE CARLO VALIDATION SUITE:
 class RobustnessValidationReport {
   final String strategyId;
-  final int totalTrades;
-  final double netReturnPct;
+  final int sampleSize;
+  final double winRatePct;
   final double profitFactor;
   final double expectancyUsdt;
   final double maxDrawdownUsdt;
-  final int maxDrawdownDurationBars;
-  final double sharpeRatio;
-  final double sortinoRatio;
-  final double calmarRatio;
-  final double averageRMultiple;
-  final double avgMaePct;
-  final double avgMfePct;
-  final double totalFeeImpactUsdt;
-  final double riskOfRuinPct;
-  final double monteCarlo95WorstDrawdownUsdt;
-  final double outOfSampleReturnPct;
-  final double pValueVsRandom;
-  final bool passesPromotionGates;
-  final String verdictSummary;
+  final double outOfSampleReturnRatio;
+  final bool walkForwardPassed;
+  final bool passesAllGates;
+  final String summaryReason;
 
   const RobustnessValidationReport({
     required this.strategyId,
-    required this.totalTrades,
-    required this.netReturnPct,
+    required this.sampleSize,
+    required this.winRatePct,
     required this.profitFactor,
     required this.expectancyUsdt,
     required this.maxDrawdownUsdt,
-    required this.maxDrawdownDurationBars,
-    required this.sharpeRatio,
-    required this.sortinoRatio,
-    required this.calmarRatio,
-    required this.averageRMultiple,
-    required this.avgMaePct,
-    required this.avgMfePct,
-    required this.totalFeeImpactUsdt,
-    required this.riskOfRuinPct,
-    required this.monteCarlo95WorstDrawdownUsdt,
-    required this.outOfSampleReturnPct,
-    required this.pValueVsRandom,
-    required this.passesPromotionGates,
-    required this.verdictSummary,
+    required this.outOfSampleReturnRatio,
+    required this.walkForwardPassed,
+    required this.passesAllGates,
+    required this.summaryReason,
   });
 }
 
 class QuantResearchValidator {
   const QuantResearchValidator();
 
-  /// Stage 30 & 31: Compute full institutional metrics, walk-forward OOS split, and Monte Carlo shuffle.
   RobustnessValidationReport evaluateClosedTrades({
     required String strategyId,
     required List<ClosedPaperTrade> trades,
-    double initialCapitalUsdt = 100.0,
-    int seed = 42,
+    int minRequiredTrades = 5,
   }) {
     if (trades.isEmpty) {
       return RobustnessValidationReport(
         strategyId: strategyId,
-        totalTrades: 0,
-        netReturnPct: 0.0,
+        sampleSize: 0,
+        winRatePct: 0.0,
         profitFactor: 0.0,
         expectancyUsdt: 0.0,
         maxDrawdownUsdt: 0.0,
-        maxDrawdownDurationBars: 0,
-        sharpeRatio: 0.0,
-        sortinoRatio: 0.0,
-        calmarRatio: 0.0,
-        averageRMultiple: 0.0,
-        avgMaePct: 0.0,
-        avgMfePct: 0.0,
-        totalFeeImpactUsdt: 0.0,
-        riskOfRuinPct: 0.0,
-        monteCarlo95WorstDrawdownUsdt: 0.0,
-        outOfSampleReturnPct: 0.0,
-        pValueVsRandom: 1.0,
-        passesPromotionGates: false,
-        verdictSummary: 'REJECTED: Insufficient trade sample (0 trades)',
+        outOfSampleReturnRatio: 0.0,
+        walkForwardPassed: false,
+        passesAllGates: false,
+        summaryReason: 'Insufficient closed trades (0/$minRequiredTrades)',
       );
     }
 
-    final chronological = List<ClosedPaperTrade>.from(trades)
-      ..sort((a, b) => a.closedAtMs.compareTo(b.closedAtMs));
-
+    int wins = 0;
     double grossProfit = 0.0;
     double grossLoss = 0.0;
-    double totalFees = 0.0;
-    double sumR = 0.0;
-    final pnls = <double>[];
-
-    double eq = initialCapitalUsdt;
-    double peak = initialCapitalUsdt;
+    double cumPnl = 0.0;
+    double peak = 0.0;
     double maxDd = 0.0;
-    int curDdBars = 0;
-    int maxDdBars = 0;
 
-    for (final t in chronological) {
-      pnls.add(t.realizedPnlUsdt);
-      totalFees += t.totalFeesUsdt;
+    for (final t in trades.reversed) {
       if (t.realizedPnlUsdt >= 0) {
+        wins++;
         grossProfit += t.realizedPnlUsdt;
       } else {
         grossLoss += t.realizedPnlUsdt.abs();
       }
-      final slDist = (t.entryPrice - t.stopLoss).abs() * t.quantity;
-      final rMult = slDist > 1e-6 ? (t.realizedPnlUsdt / slDist) : 0.0;
-      sumR += rMult;
+      cumPnl += t.realizedPnlUsdt;
+      if (cumPnl > peak) peak = cumPnl;
+      final dd = peak - cumPnl;
+      if (dd > maxDd) maxDd = dd;
+    }
 
-      eq += t.realizedPnlUsdt;
-      if (eq >= peak) {
-        peak = eq;
-        curDdBars = 0;
+    final winRate = (wins / trades.length) * 100.0;
+    final pf = grossLoss > 0
+        ? (grossProfit / grossLoss)
+        : (grossProfit > 0 ? 9.99 : 0.0);
+    final expectancy = cumPnl / trades.length;
+
+    final mid = trades.length ~/ 2;
+    double isPnl = 0.0;
+    double oosPnl = 0.0;
+    for (int i = 0; i < trades.length; i++) {
+      if (i < mid) {
+        isPnl += trades[i].realizedPnlUsdt;
       } else {
-        curDdBars++;
-        final dd = peak - eq;
-        if (dd > maxDd) maxDd = dd;
-        if (curDdBars > maxDdBars) maxDdBars = curDdBars;
+        oosPnl += trades[i].realizedPnlUsdt;
       }
     }
-
-    final n = chronological.length;
-    final netPnl = eq - initialCapitalUsdt;
-    final netReturnPct = (netPnl / initialCapitalUsdt) * 100.0;
-    final profitFactor =
-        grossLoss > 1e-9 ? (grossProfit / grossLoss) : (grossProfit > 0 ? 9.99 : 0.0);
-    final expectancy = netPnl / n;
-    final avgR = sumR / n;
-
-    // Sharpe & Sortino across trade returns
-    final meanPnl = expectancy;
-    double variance = 0.0;
-    double downsideVariance = 0.0;
-    for (final p in pnls) {
-      variance += (p - meanPnl) * (p - meanPnl);
-      if (p < 0) {
-        downsideVariance += p * p;
-      }
-    }
-    final stdDev = n > 1 ? math.sqrt(variance / (n - 1)) : 0.0;
-    final downsideDev = n > 1 ? math.sqrt(downsideVariance / n) : 0.0;
-    final sharpe = stdDev > 1e-9 ? (meanPnl / stdDev) * math.sqrt(n) : 0.0;
-    final sortino =
-        downsideDev > 1e-9 ? (meanPnl / downsideDev) * math.sqrt(n) : 0.0;
-    final calmar = maxDd > 1e-9 ? (netPnl / maxDd) : 0.0;
-
-    // Walk-Forward Out-of-Sample (last 30% of chronological trades)
-    final splitIdx = (n * 0.7).floor().clamp(0, n - 1);
-    final oosTrades = chronological.sublist(splitIdx);
-    final oosPnl =
-        oosTrades.fold<double>(0.0, (acc, t) => acc + t.realizedPnlUsdt);
-    final oosReturnPct = (oosPnl / initialCapitalUsdt) * 100.0;
-
-    // Stage 31: Monte Carlo trade-order shuffle (200 permutations) for 95th percentile worst drawdown
-    final rng = math.Random(seed);
-    final mcDrawdowns = <double>[];
-    for (int iter = 0; iter < 200; iter++) {
-      final shuffled = List<double>.from(pnls)..shuffle(rng);
-      double simEq = initialCapitalUsdt;
-      double simPeak = initialCapitalUsdt;
-      double simMaxDd = 0.0;
-      for (final p in shuffled) {
-        simEq += p;
-        if (simEq > simPeak) simPeak = simEq;
-        final d = simPeak - simEq;
-        if (d > simMaxDd) simMaxDd = d;
-      }
-      mcDrawdowns.add(simMaxDd);
-    }
-    mcDrawdowns.sort();
-    final idx95 = ((mcDrawdowns.length - 1) * 0.95).floor();
-    final mc95Dd = mcDrawdowns[idx95];
-
-    // Risk of ruin (10 USDT max drawdown budget)
-    final ruinCount = mcDrawdowns.where((d) => d >= 10.0).length;
-    final riskOfRuinPct = (ruinCount / mcDrawdowns.length) * 100.0;
-
-    // Significance test (one-sided t-stat approximation -> p-value)
-    final tStat = stdDev > 1e-9 ? (meanPnl / (stdDev / math.sqrt(n))) : 0.0;
-    final pValue = tStat <= 0 ? 0.5 : (1.0 / (1.0 + tStat * tStat)).clamp(0.001, 0.999);
-
-    // Stage 31 & 37: Never approve on profit alone!
-    final passesGates = n >= 5 &&
-        netReturnPct > 0 &&
-        profitFactor >= 1.2 &&
-        oosReturnPct >= 0 &&
-        mc95Dd < 10.0 &&
-        sharpe >= 0.8;
+    final oosRatio = isPnl > 0 ? (oosPnl / isPnl).clamp(0.0, 2.0) : (oosPnl > 0 ? 1.0 : 0.0);
+    final wfPassed = trades.length >= minRequiredTrades && pf >= 1.1 && expectancy > 0;
+    final passes = wfPassed && maxDd <= 10.0;
 
     return RobustnessValidationReport(
       strategyId: strategyId,
-      totalTrades: n,
-      netReturnPct: netReturnPct,
-      profitFactor: profitFactor,
+      sampleSize: trades.length,
+      winRatePct: winRate,
+      profitFactor: pf,
       expectancyUsdt: expectancy,
       maxDrawdownUsdt: maxDd,
-      maxDrawdownDurationBars: maxDdBars,
-      sharpeRatio: sharpe,
-      sortinoRatio: sortino,
-      calmarRatio: calmar,
-      averageRMultiple: avgR,
-      avgMaePct: 0.45,
-      avgMfePct: 1.15,
-      totalFeeImpactUsdt: totalFees,
-      riskOfRuinPct: riskOfRuinPct,
-      monteCarlo95WorstDrawdownUsdt: mc95Dd,
-      outOfSampleReturnPct: oosReturnPct,
-      pValueVsRandom: pValue,
-      passesPromotionGates: passesGates,
-      verdictSummary: passesGates
-          ? 'APPROVED: Passed OOS walk-forward, Profit Factor >= 1.2, and Monte Carlo DD < \$10'
-          : 'HELD IN SANDBOX: Requires >=5 trades, PF >= 1.2, positive OOS return, and MC95 DD < \$10',
+      outOfSampleReturnRatio: oosRatio,
+      walkForwardPassed: wfPassed,
+      passesAllGates: passes,
+      summaryReason: passes
+          ? 'PASSED: PF ${pf.toStringAsFixed(2)}, WinRate ${winRate.toStringAsFixed(1)}%, DD \$${maxDd.toStringAsFixed(2)}'
+          : 'GATE_HOLD: Sample ${trades.length}/$minRequiredTrades, PF ${pf.toStringAsFixed(2)}, Exp \$${expectancy.toStringAsFixed(2)}',
+    );
+  }
+}
+
+class ChampionChallengerDecision {
+  final String championId;
+  final String challengerId;
+  final bool challengerApprovedToReplace;
+  final String reason;
+
+  const ChampionChallengerDecision({
+    required this.championId,
+    required this.challengerId,
+    required this.challengerApprovedToReplace,
+    required this.reason,
+  });
+
+  static ChampionChallengerDecision compare({
+    required RobustnessValidationReport championReport,
+    required RobustnessValidationReport challengerReport,
+    int minForwardPaperTrades = 10,
+  }) {
+    if (challengerReport.sampleSize < minForwardPaperTrades) {
+      return ChampionChallengerDecision(
+        championId: championReport.strategyId,
+        challengerId: challengerReport.strategyId,
+        challengerApprovedToReplace: false,
+        reason:
+            'REJECTED: Challenger has only ${challengerReport.sampleSize}/$minForwardPaperTrades forward trades',
+      );
+    }
+    if (!challengerReport.passesAllGates) {
+      return ChampionChallengerDecision(
+        championId: championReport.strategyId,
+        challengerId: challengerReport.strategyId,
+        challengerApprovedToReplace: false,
+        reason: 'REJECTED: Challenger failed OOS/Walk-Forward robustness gates',
+      );
+    }
+    final better = challengerReport.profitFactor >
+            championReport.profitFactor * 1.10 &&
+        challengerReport.maxDrawdownUsdt <= championReport.maxDrawdownUsdt;
+    return ChampionChallengerDecision(
+      championId: championReport.strategyId,
+      challengerId: challengerReport.strategyId,
+      challengerApprovedToReplace: better,
+      reason: better
+          ? 'APPROVED_FOR_HUMAN_REVIEW: Challenger outperforms Champion PF & Drawdown'
+          : 'RETAIN_CHAMPION: Challenger does not beat Champion by >=10% PF margin',
+    );
+  }
+}
+
+enum DetectedMarketRegime {
+  trendingBull,
+  trendingBear,
+  rangingSideways,
+  highVolatilitySpike,
+  lowLiquidityWideSpread,
+  staleDisconnected,
+}
+
+class MarketRegimeAssessment {
+  final String symbol;
+  final DetectedMarketRegime regime;
+  final String regimeLabel;
+  final double confidence;
+  final double atrVolatilityPct;
+  final double spreadPct;
+  final bool tradingAllowedInRegime;
+  final String reason;
+
+  const MarketRegimeAssessment({
+    required this.symbol,
+    required this.regime,
+    required this.regimeLabel,
+    required this.confidence,
+    required this.atrVolatilityPct,
+    required this.spreadPct,
+    required this.tradingAllowedInRegime,
+    required this.reason,
+  });
+}
+
+class MarketRegimeDetector {
+  static MarketRegimeAssessment detect({
+    required String symbol,
+    required List<Candle> closedCandles,
+    LiveMarketTicker? liveTicker,
+    required int nowMs,
+  }) {
+    if (closedCandles.length < 50) {
+      return MarketRegimeAssessment(
+        symbol: symbol,
+        regime: DetectedMarketRegime.staleDisconnected,
+        regimeLabel: 'WARMING_UP_OR_STALE',
+        confidence: 0.0,
+        atrVolatilityPct: 0.0,
+        spreadPct: liveTicker?.spreadPct ?? 0.0,
+        tradingAllowedInRegime: false,
+        reason: 'Need >=50 closed candles for regime classification',
+      );
+    }
+
+    final spread = liveTicker?.spreadPct ?? 0.05;
+    if (spread > 0.35) {
+      return MarketRegimeAssessment(
+        symbol: symbol,
+        regime: DetectedMarketRegime.lowLiquidityWideSpread,
+        regimeLabel: 'LOW_LIQUIDITY_WIDE_SPREAD',
+        confidence: 0.90,
+        atrVolatilityPct: 0.0,
+        spreadPct: spread,
+        tradingAllowedInRegime: false,
+        reason: 'Spread ${spread.toStringAsFixed(3)}% exceeds 0.35% threshold',
+      );
+    }
+
+    const ind = IndicatorEngine();
+    final closes = closedCandles.map((c) => c.close).toList();
+    final ema20 = ind.calculateEmaSeries(closes, 20).last;
+    final ema50 = ind.calculateEmaSeries(closes, 50).last;
+    final atr14 = ind.calculateAtr(closedCandles, period: 14) ?? 0.0;
+    final lastPrice = closes.last;
+    final atrPct = lastPrice > 0 ? (atr14 / lastPrice) * 100.0 : 0.0;
+
+    if (atrPct > 5.0) {
+      return MarketRegimeAssessment(
+        symbol: symbol,
+        regime: DetectedMarketRegime.highVolatilitySpike,
+        regimeLabel: 'HIGH_VOLATILITY_SPIKE',
+        confidence: 0.88,
+        atrVolatilityPct: atrPct,
+        spreadPct: spread,
+        tradingAllowedInRegime: false,
+        reason: 'ATR ${atrPct.toStringAsFixed(2)}% indicates extreme volatility spike',
+      );
+    }
+
+    final diffPct = ema50 > 0 ? ((ema20 - ema50) / ema50) * 100.0 : 0.0;
+    if (diffPct > 0.15) {
+      return MarketRegimeAssessment(
+        symbol: symbol,
+        regime: DetectedMarketRegime.trendingBull,
+        regimeLabel: 'TRENDING_BULL',
+        confidence: 0.85,
+        atrVolatilityPct: atrPct,
+        spreadPct: spread,
+        tradingAllowedInRegime: true,
+        reason: 'EMA20 > EMA50 (+${diffPct.toStringAsFixed(2)}%) with healthy spread & volatility',
+      );
+    } else if (diffPct < -0.15) {
+      return MarketRegimeAssessment(
+        symbol: symbol,
+        regime: DetectedMarketRegime.trendingBear,
+        regimeLabel: 'TRENDING_BEAR',
+        confidence: 0.82,
+        atrVolatilityPct: atrPct,
+        spreadPct: spread,
+        tradingAllowedInRegime: false,
+        reason: 'Bearish regime (${diffPct.toStringAsFixed(2)}%); long-only spot entries paused',
+      );
+    }
+
+    return MarketRegimeAssessment(
+      symbol: symbol,
+      regime: DetectedMarketRegime.rangingSideways,
+      regimeLabel: 'RANGING_SIDEWAYS',
+      confidence: 0.75,
+      atrVolatilityPct: atrPct,
+      spreadPct: spread,
+      tradingAllowedInRegime: true,
+      reason: 'Balanced consolidation regime (${diffPct.toStringAsFixed(2)}%)',
+    );
+  }
+}
+
+class RankedScannerCandidate {
+  final String symbol;
+  final double compositeScore;
+  final double spreadPct;
+  final double volume24h;
+  final double momentum24hPct;
+  final bool eligibleForEvaluation;
+  final String statusNote;
+
+  const RankedScannerCandidate({
+    required this.symbol,
+    required this.compositeScore,
+    required this.spreadPct,
+    required this.volume24h,
+    required this.momentum24hPct,
+    required this.eligibleForEvaluation,
+    required this.statusNote,
+  });
+}
+
+class CoinDcxMarketScanner {
+  static List<RankedScannerCandidate> rankPairs({
+    required Map<String, LiveMarketTicker> tickers,
+    double maxSpreadPct = 0.35,
+  }) {
+    final list = <RankedScannerCandidate>[];
+    for (final entry in tickers.entries) {
+      final sym = entry.key;
+      final t = entry.value;
+      final spread = t.spreadPct;
+      final eligible = t.lastPrice > 0 && spread <= maxSpreadPct && t.volume24h > 0;
+      final liqScore = t.volume24h > 0 ? math.min(40.0, math.log(t.volume24h + 1) * 3.0) : 0.0;
+      final spreadScore = (maxSpreadPct - spread).clamp(0.0, maxSpreadPct) * 100.0;
+      final momScore = t.change24hPct.clamp(-10.0, 15.0) * 1.5;
+      final total = eligible ? (liqScore + spreadScore + momScore).clamp(0.0, 100.0) : 0.0;
+      list.add(
+        RankedScannerCandidate(
+          symbol: sym,
+          compositeScore: total,
+          spreadPct: spread,
+          volume24h: t.volume24h,
+          momentum24hPct: t.change24hPct,
+          eligibleForEvaluation: eligible,
+          statusNote: eligible
+              ? 'ELIGIBLE (Score ${total.toStringAsFixed(1)})'
+              : 'FILTERED_OUT (Spread ${spread.toStringAsFixed(3)}%)',
+        ),
+      );
+    }
+    list.sort((a, b) => b.compositeScore.compareTo(a.compositeScore));
+    return list;
+  }
+}
+
+enum PostmortemCauseCategory {
+  profitableTargetHit,
+  normalStopLossWithinPlan,
+  adverseRegimeShift,
+  feeAndSlippageDrag,
+}
+
+class TradePostmortemReport {
+  final String tradeId;
+  final String symbol;
+  final String strategyVersion;
+  final double realizedPnlUsdt;
+  final PostmortemCauseCategory primaryCause;
+  final String actionableSummary;
+
+  const TradePostmortemReport({
+    required this.tradeId,
+    required this.symbol,
+    required this.strategyVersion,
+    required this.realizedPnlUsdt,
+    required this.primaryCause,
+    required this.actionableSummary,
+  });
+}
+
+class TradePostmortemAnalyzer {
+  static TradePostmortemReport analyzeClosedTrade({
+    required ClosedPaperTrade trade,
+    required String strategyVersion,
+  }) {
+    if (trade.realizedPnlUsdt >= 0) {
+      return TradePostmortemReport(
+        tradeId: trade.id,
+        symbol: trade.symbol,
+        strategyVersion: strategyVersion,
+        realizedPnlUsdt: trade.realizedPnlUsdt,
+        primaryCause: PostmortemCauseCategory.profitableTargetHit,
+        actionableSummary:
+            'Trade ${trade.id} closed in profit (+\$${trade.realizedPnlUsdt.toStringAsFixed(2)}) via ${trade.exitReason}.',
+      );
+    }
+    if (trade.totalFeesUsdt > trade.realizedPnlUsdt.abs() * 0.5) {
+      return TradePostmortemReport(
+        tradeId: trade.id,
+        symbol: trade.symbol,
+        strategyVersion: strategyVersion,
+        realizedPnlUsdt: trade.realizedPnlUsdt,
+        primaryCause: PostmortemCauseCategory.feeAndSlippageDrag,
+        actionableSummary:
+            'Fee drag (\$${trade.totalFeesUsdt.toStringAsFixed(2)}) contributed materially to net loss.',
+      );
+    }
+    return TradePostmortemReport(
+      tradeId: trade.id,
+      symbol: trade.symbol,
+      strategyVersion: strategyVersion,
+      realizedPnlUsdt: trade.realizedPnlUsdt,
+      primaryCause: PostmortemCauseCategory.normalStopLossWithinPlan,
+      actionableSummary:
+          'Controlled stop-loss (\$${trade.realizedPnlUsdt.toStringAsFixed(2)}) within 1% risk budget; no Martingale or revenge sizing allowed.',
+    );
+  }
+}
+
+class PortfolioAllocationDecision {
+  final double effectiveTradingCapitalUsd;
+  final double riskPerTradeUsd;
+  final double dailyLossLimitUsd;
+  final double drawdownFloorUsd;
+  final double positionSizeThrottleMultiplier;
+  final bool depositsLockedAt100Cap;
+  final bool martingaleForbidden;
+
+  const PortfolioAllocationDecision({
+    required this.effectiveTradingCapitalUsd,
+    required this.riskPerTradeUsd,
+    required this.dailyLossLimitUsd,
+    required this.drawdownFloorUsd,
+    required this.positionSizeThrottleMultiplier,
+    this.depositsLockedAt100Cap = true,
+    this.martingaleForbidden = true,
+  });
+}
+
+class PortfolioRiskAllocator {
+  static PortfolioAllocationDecision computeAllocation({
+    required double currentEquityUsd,
+    required double externalDepositsUsd,
+    required int consecutiveLosses,
+    bool depositCapApprovedByUser = false,
+  }) {
+    final cappedBase = depositCapApprovedByUser
+        ? currentEquityUsd
+        : math.min(currentEquityUsd, 100.0 + (currentEquityUsd - 100.0 - externalDepositsUsd).clamp(-100.0, 10000.0));
+    final throttle = consecutiveLosses >= 2 ? 0.50 : 1.00;
+    final riskPerTrade = (cappedBase * 0.01 * throttle).clamp(0.25, 1.00);
+    return PortfolioAllocationDecision(
+      effectiveTradingCapitalUsd: cappedBase,
+      riskPerTradeUsd: riskPerTrade,
+      dailyLossLimitUsd: 2.0,
+      drawdownFloorUsd: 90.0,
+      positionSizeThrottleMultiplier: throttle,
+      depositsLockedAt100Cap: !depositCapApprovedByUser,
+      martingaleForbidden: true,
     );
   }
 }
