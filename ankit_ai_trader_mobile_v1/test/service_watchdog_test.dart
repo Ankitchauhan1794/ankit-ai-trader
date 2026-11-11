@@ -758,7 +758,7 @@ void main() {
 
   test('Multi-Pair Test 21: AuthoritativeTradingEngine dynamically discovers eligible pairs, isolates single-pair candle errors, ranks multiple BUY signals, and enforces 1-max-open-position portfolio limit', () async {
     final db = PersistenceDatabase(useInMemoryFallback: true);
-    const nowMs = 200000000;
+    const nowMs = 1700000000000;
     final client = _MockHttpClient((req) async {
       final url = req.url.toString();
       if (url.contains('/exchange/v1/markets_details')) {
@@ -776,8 +776,8 @@ void main() {
       if (url.contains('/exchange/ticker')) {
         return http.Response(
           '['
-          '{"market":"BTCUSDT","last_price":"90000","bid":"89995","ask":"90005","volume":"800000","change_24_hour":"3.2","timestamp":200000},'
-          '{"market":"ETHUSDT","last_price":"3000","bid":"2999.5","ask":"3000.5","volume":"400000","change_24_hour":"2.1","timestamp":200000}'
+          '{"market":"BTCUSDT","last_price":"90000","bid":"89995","ask":"90005","volume":"800000","change_24_hour":"3.2","timestamp":1700000000},'
+          '{"market":"ETHUSDT","last_price":"3000","bid":"2999.5","ask":"3000.5","volume":"400000","change_24_hour":"2.1","timestamp":1700000000}'
           ']',
           200,
         );
@@ -792,7 +792,7 @@ void main() {
           final idx = 65 - i;
           final openTime = nowMs - (i + 1) * dur;
           if (idx % 3 == 2) {
-            curPrice -= step * 0.95;
+            curPrice -= step * 1.25;
           } else {
             curPrice += step * 1.0;
           }

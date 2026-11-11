@@ -705,7 +705,7 @@ class CoinDcxMarketService {
           rawTime == null) {
         continue;
       }
-      final openMs = rawTime < 10000000000 ? rawTime * 1000 : rawTime;
+      final openMs = (rawTime < 10000000000 && rawTime * 1000 <= nowMs + 86400000) ? rawTime * 1000 : rawTime;
       final closeMs = openMs + durMs;
       final c = Candle(
         openTimeMs: openMs,
