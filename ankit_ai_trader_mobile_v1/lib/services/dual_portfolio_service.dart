@@ -1027,17 +1027,6 @@ class DualPortfolioManager {
     supervisor.maxOpenPositionsLimit = snap.configuredMaxOpenPositions;
     supervisor.maxPortfolioLossPct = snap.maxPortfolioLossPct;
 
-    if (CoinDcxPortfolioProvider.isPreciousMetalSymbol(instrumentSpec.symbol) ||
-        instrumentSpec.category == PortfolioAssetCategory.preciousMetalSpotCfd) {
-      return (
-        approved: false,
-        approvedQuantity: 0.0,
-        stopLossPrice: stopLossPrice,
-        rejectionReason:
-            'PRECIOUS_METALS_RESEARCH_ONLY_LOCK: ${instrumentSpec.symbol} is locked in RESEARCH-ONLY mode until a verified metals provider and contract specifications are approved.',
-      );
-    }
-
     if (snap.isResearchOnlyMode || !snap.executionEnabled) {
       return (
         approved: false,
@@ -1067,6 +1056,17 @@ class DualPortfolioManager {
         stopLossPrice: stopLossPrice,
         rejectionReason:
             'UNVERIFIED_INSTRUMENT_SPECIFICATION: ${instrumentSpec.symbol} lacks verified provider/contract specifications (${instrumentSpec.statusNote}).',
+      );
+    }
+
+    if (CoinDcxPortfolioProvider.isPreciousMetalSymbol(instrumentSpec.symbol) ||
+        instrumentSpec.category == PortfolioAssetCategory.preciousMetalSpotCfd) {
+      return (
+        approved: false,
+        approvedQuantity: 0.0,
+        stopLossPrice: stopLossPrice,
+        rejectionReason:
+            'PRECIOUS_METALS_RESEARCH_ONLY_LOCK: ${instrumentSpec.symbol} is locked in RESEARCH-ONLY mode until a verified metals provider and contract specifications are approved.',
       );
     }
 

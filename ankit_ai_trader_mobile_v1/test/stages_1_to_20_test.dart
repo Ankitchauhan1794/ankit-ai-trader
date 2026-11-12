@@ -1764,9 +1764,9 @@ void main() {
           final idx = 65 - i;
           final openMs = nowMs - (i + 1) * dur;
           if (idx % 3 == 2) {
-            cur -= 0.7;
+            cur -= 2.1;
           } else {
-            cur += 0.8;
+            cur += 1.8;
           }
           list.add({
             'time': openMs,
