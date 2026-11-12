@@ -231,10 +231,15 @@ class UnverifiedHighVolatilityProvider implements PortfolioMarketDataProvider {
       final tickSz = math
           .pow(10, -discoveredRecord.baseCurrencyPrecision.clamp(0, 8))
           .toDouble();
+      final isTradable = discoveredRecord.isActiveStatus &&
+          discoveredRecord.isEligibleForPaperTrading &&
+          !CoinDcxPortfolioProvider.isPreciousMetalSymbol(
+            discoveredRecord.symbol,
+          );
       return VerifiedInstrumentSpecification(
         symbol: discoveredRecord.symbol,
         canonicalPair: discoveredRecord.pair,
-        providerId: 'COINDCX_SPOT_RESEARCH_FEED',
+        providerId: 'COINDCX_SPOT',
         baseCurrency: discoveredRecord.targetCurrencyShortName,
         quoteCurrency: discoveredRecord.baseCurrencyShortName,
         category: PortfolioAssetCategory.highVolatilityCryptoSpot,
@@ -255,9 +260,44 @@ class UnverifiedHighVolatilityProvider implements PortfolioMarketDataProvider {
         supportedOrderTypes: discoveredRecord.orderTypes,
         isProviderConnected: true,
         isSpecificationVerified: discoveredRecord.isActiveStatus,
-        isExecutionAuthorized: false,
-        statusNote:
-            'RESEARCH_ONLY: Verified CoinDCX crypto specs available for research; High-Volatility Portfolio autonomous execution disabled until verified & approved.',
+        isExecutionAuthorized: isTradable,
+        statusNote: isTradable
+            ? 'PAPER_ELIGIBLE_CRYPTO: Verified CoinDCX Spot pair; internal PaperBroker execution enabled.'
+            : discoveredRecord.eligibilityReason,
+      );
+    }
+
+    if (upper == 'BTCUSDT' ||
+        upper == 'B-BTC_USDT' ||
+        upper == 'ETHUSDT' ||
+        upper == 'B-ETH_USDT') {
+      final isBtc = upper.contains('BTC');
+      return VerifiedInstrumentSpecification(
+        symbol: isBtc ? 'BTCUSDT' : 'ETHUSDT',
+        canonicalPair: isBtc ? 'B-BTC_USDT' : 'B-ETH_USDT',
+        providerId: 'COINDCX_SPOT',
+        baseCurrency: isBtc ? 'BTC' : 'ETH',
+        quoteCurrency: 'USDT',
+        category: PortfolioAssetCategory.highVolatilityCryptoSpot,
+        contractSize: 1.0,
+        minQuantity: isBtc ? 0.0001 : 0.001,
+        maxQuantity: isBtc ? 100.0 : 1000.0,
+        quantityStep: isBtc ? 0.00001 : 0.0001,
+        tickSize: 0.01,
+        tickValue: 0.01,
+        minNotional: 5.0,
+        currentSpreadBps: 5.0,
+        makerFeeRate: 0.001,
+        takerFeeRate: 0.001,
+        swapLongRate: 0.0,
+        swapShortRate: 0.0,
+        marginRequirementFraction: 1.0,
+        tradingSessions: const ['24/7_SPOT'],
+        supportedOrderTypes: const ['market_order', 'limit_order'],
+        isProviderConnected: true,
+        isSpecificationVerified: true,
+        isExecutionAuthorized: true,
+        statusNote: 'PAPER_ELIGIBLE_CRYPTO: Verified CoinDCX Spot pair',
       );
     }
 
@@ -599,8 +639,8 @@ class DualPortfolioManager {
       availableCashUsdt: 100.0,
       accountEquityUsdt: 100.0,
       startOfDayEquityUsdt: 100.0,
-      executionEnabled: false,
-      isResearchOnlyMode: true,
+      executionEnabled: true,
+      isResearchOnlyMode: false,
       liveTradingLocked: true,
       activeStrategyId: 'HIGH_VOL_RESEARCH_CANDIDATE_V1',
       configuredMaxOpenPositions: 5,
@@ -613,11 +653,11 @@ class DualPortfolioManager {
         preciousMetalsDataReady: false,
         learningInsights: [
           'High-Volatility learning context isolated from Crypto Portfolio.',
-          'XAUUSD (Gold) and XAGUSD (Silver) locked in research-only mode awaiting verified provider.',
+          'CoinDCX high-volatility crypto spot paper trading active; XAUUSD (Gold) & XAGUSD (Silver) remain research-only.',
         ],
       ),
       statusSummary:
-          'RESEARCH-ONLY MODE • High-Vol Crypto & Metals (XAUUSD/XAGUSD) • Execution Disabled Until Provider Verified',
+          'CRYPTO PAPER TRADING ACTIVE (CoinDCX Spot) • Gold (XAUUSD) & Silver (XAGUSD) Research-Only',
     ),
   };
 
@@ -914,6 +954,17 @@ class DualPortfolioManager {
     _snapshots[PortfolioId.crypto] = updatedCrypto;
   }
 
+  Future<void> syncHighVolatilitySnapshot(
+    PortfolioAccountSnapshot persistedHv,
+  ) async {
+    _snapshots[PortfolioId.highVolatility] = persistedHv;
+    final sup = _riskSupervisors[PortfolioId.highVolatility]!;
+    sup.portfolioLossLockoutActive = persistedHv.isPortfolioLossLockoutTriggered;
+    sup.maxOpenPositionsLimit = persistedHv.configuredMaxOpenPositions;
+    sup.maxPortfolioLossPct = persistedHv.maxPortfolioLossPct;
+    sup.consecutiveLosses = persistedHv.consecutiveLosses;
+  }
+
   Future<void> syncCryptoPortfolioFromEngineSnapshot(
     PersistedEngineSnapshot snap,
   ) async {
@@ -975,6 +1026,17 @@ class DualPortfolioManager {
     final supervisor = _riskSupervisors[portfolioId]!;
     supervisor.maxOpenPositionsLimit = snap.configuredMaxOpenPositions;
     supervisor.maxPortfolioLossPct = snap.maxPortfolioLossPct;
+
+    if (CoinDcxPortfolioProvider.isPreciousMetalSymbol(instrumentSpec.symbol) ||
+        instrumentSpec.category == PortfolioAssetCategory.preciousMetalSpotCfd) {
+      return (
+        approved: false,
+        approvedQuantity: 0.0,
+        stopLossPrice: stopLossPrice,
+        rejectionReason:
+            'PRECIOUS_METALS_RESEARCH_ONLY_LOCK: ${instrumentSpec.symbol} is locked in RESEARCH-ONLY mode until a verified metals provider and contract specifications are approved.',
+      );
+    }
 
     if (snap.isResearchOnlyMode || !snap.executionEnabled) {
       return (
@@ -1109,6 +1171,15 @@ class DualPortfolioManager {
     required int nowMs,
   }) async {
     final snap = _snapshots[portfolioId]!;
+    if (CoinDcxPortfolioProvider.isPreciousMetalSymbol(instrumentSpec.symbol) ||
+        instrumentSpec.category == PortfolioAssetCategory.preciousMetalSpotCfd) {
+      return (
+        executed: false,
+        reason:
+            'PRECIOUS_METALS_RESEARCH_ONLY_LOCK: ${instrumentSpec.symbol} remains RESEARCH-ONLY until a verified metals provider and contract specifications are approved.',
+        position: null,
+      );
+    }
     if (snap.isResearchOnlyMode || !snap.executionEnabled) {
       return (
         executed: false,

@@ -88,6 +88,7 @@ Future<void> backgroundServiceMain() async {
     await engine.loadPersistedStateIntoMemory();
     await channel.invokeMethod('acknowledgeEngineInitialized');
     if (engine.userIntention == UserSessionIntention.running &&
+        engine.state != BotEngineState.starting &&
         !engine.maxDrawdownLocked &&
         engine.lockedDailyLossUtcDate == null) {
       await engine.startEngine();
@@ -488,9 +489,11 @@ class _DashboardPageState extends State<DashboardPage>
                         Row(
                           mainAxisAlignment: MainAxisAlignment.spaceBetween,
                           children: [
-                            const Text(
-                              'Research-Only',
-                              style: TextStyle(
+                            Text(
+                              _coordinator.highVolatilityPortfolio.isResearchOnlyMode
+                                  ? 'Research-Only'
+                                  : 'Crypto Paper • Metals Research',
+                              style: const TextStyle(
                                 fontSize: 9.5,
                                 color: Colors.amberAccent,
                               ),
@@ -532,7 +535,7 @@ class _DashboardPageState extends State<DashboardPage>
               ),
             ),
           ),
-          if (activeSnap.isResearchOnlyMode) ...[
+          if (_coordinator.isHighVolatilitySelected) ...[
             const SizedBox(height: 6),
             Container(
               width: double.infinity,
@@ -543,7 +546,7 @@ class _DashboardPageState extends State<DashboardPage>
                 border: Border.all(color: _orangeWarn.withOpacity(0.5)),
               ),
               child: const Text(
-                'RESEARCH-ONLY MODE: High-Volatility & Precious Metals (XAUUSD / XAGUSD) execution is disabled until provider & specifications are verified.',
+                'HIGH-VOLATILITY PORTFOLIO: CoinDCX Crypto Spot Paper Trading ACTIVE • Gold (XAUUSD) & Silver (XAGUSD) remain RESEARCH-ONLY until provider & specs are verified.',
                 style: TextStyle(
                   fontSize: 10,
                   fontWeight: FontWeight.w600,

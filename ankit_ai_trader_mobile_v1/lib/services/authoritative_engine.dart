@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:math' as math;
+import '../models/dual_portfolio_models.dart';
 import '../models/trading_models.dart';
 import 'coindcx_market_service.dart';
+import 'dual_portfolio_service.dart';
 import 'execution_and_risk_hub.dart';
 import 'paper_broker.dart';
 import 'persistence_db.dart';
@@ -18,6 +20,7 @@ class AuthoritativeTradingEngine {
   final RiskManager riskManager;
   final PaperBroker paperBroker;
   final IndependentRiskSupervisor riskSupervisor;
+  late final DualPortfolioManager dualPortfolioManager;
   final String ownerId;
   final int Function() _nowMs;
   final bool verifyReachabilityBeforeNetworkPause;
@@ -59,6 +62,7 @@ class AuthoritativeTradingEngine {
   bool _isCycleInFlight = false;
   bool _disposed = false;
   bool _hasLoadedPersistedState = false;
+  Future<bool>? _activeStartFuture;
   int _candleScanCursor = 0;
 
   AuthoritativeTradingEngine({
@@ -68,6 +72,7 @@ class AuthoritativeTradingEngine {
     this.riskManager = const RiskManager(),
     this.paperBroker = const PaperBroker(),
     IndependentRiskSupervisor? riskSupervisor,
+    DualPortfolioManager? dualPortfolioManager,
     this.ownerId = 'bg_service_engine_1',
     int Function()? nowMsProvider,
     this.verifyReachabilityBeforeNetworkPause = false,
@@ -76,7 +81,10 @@ class AuthoritativeTradingEngine {
     this.onTradeAlert,
   })  : riskSupervisor = riskSupervisor ?? IndependentRiskSupervisor(),
         _nowMs =
-            nowMsProvider ?? (() => DateTime.now().millisecondsSinceEpoch);
+            nowMsProvider ?? (() => DateTime.now().millisecondsSinceEpoch) {
+    this.dualPortfolioManager =
+        dualPortfolioManager ?? DualPortfolioManager(persistence: persistence);
+  }
 
   Future<void> loadPersistedStateIntoMemory() async {
     final snap = await persistence.loadFullState();
@@ -131,13 +139,35 @@ class AuthoritativeTradingEngine {
     }
   }
 
-  Future<bool> startEngine() async {
+  Future<bool> startEngine() {
+    if (_activeStartFuture != null) {
+      return _activeStartFuture!;
+    }
+    final fut = _startEngineInternal();
+    _activeStartFuture = fut;
+    fut.whenComplete(() {
+      if (identical(_activeStartFuture, fut)) {
+        _activeStartFuture = null;
+      }
+    });
+    return fut;
+  }
+
+  Future<bool> _startEngineInternal() async {
     if (!_hasLoadedPersistedState) {
       await loadPersistedStateIntoMemory();
     }
     final now = _nowMs();
     lastStartupAttemptMs = now;
     lastStartupError = null;
+
+    if (state == BotEngineState.running &&
+        userIntention == UserSessionIntention.running &&
+        _cycleTimer != null) {
+      lastHeartbeatMs = now;
+      await persistence.recordHeartbeat(now);
+      return true;
+    }
 
     if (maxDrawdownLocked ||
         riskManager.shouldStopForMaxDrawdown(accountEquityUsdt)) {
@@ -176,6 +206,7 @@ class AuthoritativeTradingEngine {
       lockName: lockName,
       ownerId: ownerId,
       nowMs: now,
+      forceTakeover: true,
     );
     if (!locked) {
       lastStartupError =
@@ -531,6 +562,9 @@ class AuthoritativeTradingEngine {
       }
 
       final buyOpportunities = <RankedSignalOpportunity>[];
+      final cycleCandles15mByPair = <String, List<Candle>>{};
+      final cycleCandles1hByPair = <String, List<Candle>>{};
+      final cycleEvalByPair = <String, StrategyEvaluationResult>{};
 
       for (final market in marketsToEvaluate) {
         final pairKey = market.pair;
@@ -592,12 +626,15 @@ class AuthoritativeTradingEngine {
         closedCandlePrices[market.symbol] = candles15m.last.close;
         evaluatedCount++;
 
+        cycleCandles15mByPair[pairKey] = candles15m;
+        cycleCandles1hByPair[pairKey] = candles1h;
         final eval = strategyEngine.evaluate(
           symbol: pairKey,
           closedCandles15m: candles15m,
           closedCandles1h: candles1h,
           nowMs: now,
         );
+        cycleEvalByPair[pairKey] = eval;
         whyNoTradeForSymbol[pairKey] = eval.reason;
         whyNoTradeForSymbol[market.symbol] = eval.reason;
 
@@ -804,6 +841,15 @@ class AuthoritativeTradingEngine {
         }
       }
 
+      await _executeHighVolatilityCryptoCycle(
+        catalogue: catalogue,
+        now: now,
+        allowTradingExecution: allowTradingExecution,
+        cycleCandles15mByPair: cycleCandles15mByPair,
+        cycleCandles1hByPair: cycleCandles1hByPair,
+        cycleEvalByPair: cycleEvalByPair,
+      );
+
       await _persistCurrentState(now);
       if (onNotificationUpdate != null) {
         await onNotificationUpdate!(
@@ -822,6 +868,189 @@ class AuthoritativeTradingEngine {
       );
     } finally {
       _isCycleInFlight = false;
+    }
+  }
+
+
+  Future<void> _executeHighVolatilityCryptoCycle({
+    required MarketCatalogueSnapshot catalogue,
+    required int now,
+    required bool allowTradingExecution,
+    required Map<String, List<Candle>> cycleCandles15mByPair,
+    required Map<String, List<Candle>> cycleCandles1hByPair,
+    required Map<String, StrategyEvaluationResult> cycleEvalByPair,
+  }) async {
+    try {
+      final persistedHv = await persistence.loadPortfolioAccountSnapshot(
+        PortfolioId.highVolatility,
+      );
+      if (persistedHv != null) {
+        await dualPortfolioManager.syncHighVolatilitySnapshot(persistedHv);
+      }
+
+      var hvSnap = dualPortfolioManager.snapshotFor(PortfolioId.highVolatility);
+      if (!hvSnap.executionEnabled || hvSnap.isResearchOnlyMode) {
+        return;
+      }
+
+      // 1. Evaluate open High-Volatility positions on closed candles via PaperBroker
+      for (final pos in List<PaperPosition>.from(hvSnap.openPositions)) {
+        if (CoinDcxPortfolioProvider.isPreciousMetalSymbol(pos.symbol)) {
+          continue;
+        }
+        try {
+          final c15 = cycleCandles15mByPair[pos.symbol] ??
+              await marketService.fetchClosedCandles(
+                pair: pos.symbol,
+                interval: '15m',
+                nowMs: now,
+                limit: 80,
+              );
+          final c1h = cycleCandles1hByPair[pos.symbol] ??
+              await marketService.fetchClosedCandles(
+                pair: pos.symbol,
+                interval: '1h',
+                nowMs: now,
+                limit: 65,
+              );
+          if (c15.isNotEmpty) {
+            final latestClosed = c15.last;
+            closedCandlePrices[pos.symbol] = latestClosed.close;
+            final eval = cycleEvalByPair[pos.symbol] ??
+                strategyEngine.evaluate(
+                  symbol: pos.symbol,
+                  closedCandles15m: c15,
+                  closedCandles1h: c1h,
+                  nowMs: now,
+                );
+            final exitCheck = paperBroker.evaluateOpenPositionOnClosedCandle(
+              position: pos,
+              closedCandle: latestClosed,
+              nextOrderId: 'HV_ORD_${++orderSeq}',
+              nextTradeId: 'HV_TRD_$orderSeq',
+              strategySignal: eval.signal,
+            );
+            if (exitCheck.closedTrade != null && exitCheck.exitOrder != null) {
+              await dualPortfolioManager.closeIsolatedPaperPosition(
+                portfolioId: PortfolioId.highVolatility,
+                positionId: pos.id,
+                exitPrice: exitCheck.exitOrder!.executedPrice,
+                nowMs: now,
+                exitReason: exitCheck.closedTrade!.exitReason,
+              );
+            }
+          }
+        } catch (_) {}
+      }
+
+      hvSnap = dualPortfolioManager.snapshotFor(PortfolioId.highVolatility);
+
+      // 2. Mark-to-market equity & enforce 15% portfolio loss lockout independently
+      double hvOpenVal = 0.0;
+      for (final p in hvSnap.openPositions) {
+        final mark = liveTickerPrices[p.symbol] ??
+            closedCandlePrices[p.symbol] ??
+            p.entryPrice;
+        hvOpenVal += (p.quantity * mark) - (p.quantity * mark * 0.001);
+      }
+      final hvEquity = hvSnap.availableCashUsdt + hvOpenVal;
+      final hvLossLocked =
+          await dualPortfolioManager.evaluateAndEnforcePortfolioLossLimit(
+        portfolioId: PortfolioId.highVolatility,
+        currentEquityUsdt: hvEquity,
+        nowMs: now,
+      );
+      hvSnap = dualPortfolioManager.snapshotFor(PortfolioId.highVolatility);
+      final todayUtc = RiskManager.currentUtcDateString(now);
+      final hvDailyLocked = hvSnap.lockedDailyLossUtcDate == todayUtc ||
+          riskManager.shouldLockDailyLoss(
+            startOfDayEquityUsdt: hvSnap.startOfDayEquityUsdt,
+            currentEquityUsdt: hvEquity,
+          );
+      if (!allowTradingExecution ||
+          state != BotEngineState.running ||
+          hvLossLocked ||
+          hvDailyLocked) {
+        return;
+      }
+
+      // 3. Evaluate eligible CoinDCX USDT crypto pairs (Gold/Silver XAUUSD/XAGUSD remain RESEARCH-ONLY)
+      final eligibleCrypto = catalogue.allMarkets
+          .where((m) =>
+              m.isEligibleForPaperTrading &&
+              m.quoteCurrency.toUpperCase() == 'USDT' &&
+              m.pair.isNotEmpty &&
+              !CoinDcxPortfolioProvider.isPreciousMetalSymbol(m.symbol))
+          .toList();
+
+      for (final market in eligibleCrypto) {
+        hvSnap = dualPortfolioManager.snapshotFor(PortfolioId.highVolatility);
+        if (hvSnap.openPositions.length >= hvSnap.configuredMaxOpenPositions) {
+          break;
+        }
+        final pairKey = market.pair;
+        final c15 = cycleCandles15mByPair[pairKey];
+        final eval = cycleEvalByPair[pairKey];
+        if (c15 == null || eval == null) continue;
+
+        final ticker = market.latestTicker ??
+            CoinDcxMarketService.matchTickerForMarket(
+              symbol: market.symbol,
+              coindcxName: market.coindcxName,
+              pair: market.pair,
+              tickersByKey: liveTickers,
+            );
+        if (ticker == null || !ticker.isFresh(now, maxAgeMs: 300000)) {
+          continue;
+        }
+
+        final hvClass = dualPortfolioManager.classifier.classifyCryptoMarket(
+          market: market,
+          closedCandles: c15,
+          nowMs: now,
+          portfolioExecutionApproved: hvSnap.executionEnabled,
+        );
+        if (!hvClass.isExecutionAuthorized || !hvClass.qualifiesAsHighVolatility) {
+          continue;
+        }
+
+        if (eval.signal != StrategySignalType.buy) {
+          continue;
+        }
+
+        final spec = dualPortfolioManager.highVolProvider
+            .getInstrumentSpecification(market.symbol, discoveredRecord: market);
+        final refAsk = ticker.ask > 0 ? ticker.ask : eval.closePrice;
+        final estFill = paperBroker.computeBuyFillPrice(refAsk);
+        final slPrice = estFill - (eval.atr14_15m * riskManager.config.stopLossAtrMultiplier);
+        final tpPrice = estFill + (eval.atr14_15m * riskManager.config.takeProfitAtrMultiplier);
+
+        final vet = dualPortfolioManager.vetAndSizePortfolioOrder(
+          portfolioId: PortfolioId.highVolatility,
+          instrumentSpec: spec,
+          entryPrice: estFill,
+          stopLossPrice: slPrice,
+          spreadPct: ticker.spreadPct,
+          atr14: eval.atr14_15m,
+          isDataFresh: ticker.isFresh(now, maxAgeMs: 300000),
+          nowMs: now,
+        );
+        if (!vet.approved || vet.approvedQuantity <= 0) {
+          continue;
+        }
+
+        await dualPortfolioManager.openIsolatedPaperPosition(
+          portfolioId: PortfolioId.highVolatility,
+          instrumentSpec: spec,
+          entryPrice: estFill,
+          stopLossPrice: vet.stopLossPrice,
+          takeProfitPrice: tpPrice,
+          quantity: vet.approvedQuantity,
+          nowMs: now,
+        );
+      }
+    } catch (_) {
+      // High-Volatility cycle errors are isolated and never crash the Crypto engine
     }
   }
 

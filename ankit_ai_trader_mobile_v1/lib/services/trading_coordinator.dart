@@ -486,7 +486,7 @@ class TradingCoordinator extends ChangeNotifier {
   String get highVolatilityExecutionStatusLabel =>
       (highVolatilityPortfolio.executionEnabled &&
               !highVolatilityPortfolio.isResearchOnlyMode)
-          ? 'ENABLED (Paper)'
+          ? 'CRYPTO PAPER ENABLED (Metals Research-Only)'
           : 'DISABLED (Research-Only)';
 
   String get marketDataFreshnessLabel {
@@ -1131,9 +1131,14 @@ class TradingCoordinator extends ChangeNotifier {
       // 3. Dispatch START command and verify background engine acknowledgement
       final ok = await commandBridge.dispatchCommand('START');
       if (!ok) {
+        await _checkServiceReadySafe();
+        final latestSnap = await persistence.loadFullState();
         restoreFailedRequiresRestart = true;
-        engineState = BotEngineState.failedStartupError;
-        restoreFailureReason = lastStartupError ??
+        engineState = latestSnap.botState.isRiskLock
+            ? latestSnap.botState
+            : BotEngineState.failedStartupError;
+        restoreFailureReason = latestSnap.lastStartupError ??
+            lastStartupError ??
             'Background Dart engine did not acknowledge START command';
         lastStartupError = restoreFailureReason;
         lastShutdownReason =
@@ -1170,19 +1175,17 @@ class TradingCoordinator extends ChangeNotifier {
         final verifierEngine = AuthoritativeTradingEngine(
           marketService: marketService,
           persistence: persistence,
-          ownerId: AuthoritativeTradingEngine.lockName,
+          dualPortfolioManager: dualPortfolioManager,
+          ownerId: 'bg_service_engine_1',
           nowMsProvider: _nowMs,
         );
-        await verifierEngine.restoreSessionIfRunningIntended();
+        await verifierEngine.loadPersistedStateIntoMemory();
         if (verifierEngine.state == BotEngineState.starting ||
-            verifierEngine.state == BotEngineState.stopped) {
+            verifierEngine.state == BotEngineState.stopped ||
+            !hasFreshCycleHb) {
           await verifierEngine.startEngine();
         }
         verifierEngine.dispose();
-        await persistence.releaseExecutionLock(
-          lockName: AuthoritativeTradingEngine.lockName,
-          ownerId: AuthoritativeTradingEngine.lockName,
-        );
         snap = await persistence.loadFullState();
       }
 

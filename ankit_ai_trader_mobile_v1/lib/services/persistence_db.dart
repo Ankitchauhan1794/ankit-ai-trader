@@ -88,7 +88,7 @@ class PersistedEngineSnapshot {
 
 class PersistenceDatabase {
   static const String dbFileName = 'ankit_ai_trader_phase1.db';
-  static const int currentSchemaVersion = 6;
+  static const int currentSchemaVersion = 7;
 
   Database? _db;
   final Map<String, String> _inMemoryKv = {};
@@ -381,8 +381,8 @@ class PersistenceDatabase {
         'lockedDailyLossUtcDate': null,
         'lastStopLossClosedAtMs': null,
         'consecutiveLosses': 0,
-        'executionEnabled': 0,
-        'isResearchOnly': 1,
+        'executionEnabled': 1,
+        'isResearchOnly': 0,
         'activeStrategyId': 'HIGH_VOL_RESEARCH_CANDIDATE_V1',
         'maxOpenPositions': 5,
         'maxPortfolioLossPct': 15.0,
@@ -401,6 +401,16 @@ class PersistenceDatabase {
     if (oldVersion < 6) {
       await _createPortfolioAccountsTable(db);
       await _migrateAndSeedPortfoliosOnDb(db);
+    }
+    if (oldVersion < 7) {
+      try {
+        await db.update(
+          'portfolio_accounts',
+          {'executionEnabled': 1, 'isResearchOnly': 0},
+          where: 'portfolioId = ?',
+          whereArgs: [PortfolioId.highVolatility.dbKey],
+        );
+      } catch (_) {}
     }
   }
 
@@ -579,11 +589,13 @@ class PersistenceDatabase {
     required String ownerId,
     required int nowMs,
     int ttlMs = 55000,
+    bool forceTakeover = false,
   }) async {
     final db = await database;
     if (db == null) {
       final existing = _inMemoryLocks[lockName];
-      if (existing != null &&
+      if (!forceTakeover &&
+          existing != null &&
           existing['ownerId'] != ownerId &&
           (existing['expiresAtMs'] as int) > nowMs) {
         return false;
@@ -603,7 +615,7 @@ class PersistenceDatabase {
         whereArgs: [lockName],
         limit: 1,
       );
-      if (rows.isNotEmpty) {
+      if (!forceTakeover && rows.isNotEmpty) {
         final curOwner = rows.first['ownerId'] as String;
         final expiresAt = (rows.first['expiresAtMs'] as num).toInt();
         if (curOwner != ownerId && expiresAt > nowMs) {

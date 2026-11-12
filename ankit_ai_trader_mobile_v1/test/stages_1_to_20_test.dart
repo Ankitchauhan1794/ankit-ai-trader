@@ -1008,22 +1008,23 @@ void main() {
     expect(coordinator.highVolatilityPortfolio.openPositions, isEmpty);
     expect(coordinator.highVolatilityPortfolio.closedTrades, isEmpty);
 
-    expect(coordinator.highVolatilityPortfolio.isResearchOnlyMode, isTrue);
-    expect(coordinator.highVolatilityPortfolio.executionEnabled, isFalse);
+    expect(coordinator.highVolatilityPortfolio.isResearchOnlyMode, isFalse);
+    expect(coordinator.highVolatilityPortfolio.executionEnabled, isTrue);
 
     final manager = coordinator.dualPortfolioManager;
     final btcSpec = manager.cryptoProvider.getInstrumentSpecification('BTCUSDT');
-    final blockedHighVolAttempt = await manager.openIsolatedPaperPosition(
+    final xauOnHighVolSpec = manager.highVolProvider.getInstrumentSpecification('XAUUSD');
+    final blockedMetalAttempt = await manager.openIsolatedPaperPosition(
       portfolioId: PortfolioId.highVolatility,
-      instrumentSpec: btcSpec,
-      entryPrice: 90000.0,
-      stopLossPrice: 88500.0,
-      takeProfitPrice: 93000.0,
-      quantity: 0.0005,
+      instrumentSpec: xauOnHighVolSpec,
+      entryPrice: 2650.0,
+      stopLossPrice: 2630.0,
+      takeProfitPrice: 2690.0,
+      quantity: 0.01,
       nowMs: 115000,
     );
-    expect(blockedHighVolAttempt.executed, isFalse);
-    expect(blockedHighVolAttempt.reason, contains('PORTFOLIO_RESEARCH_ONLY_LOCK'));
+    expect(blockedMetalAttempt.executed, isFalse);
+    expect(blockedMetalAttempt.reason, contains('PRECIOUS_METALS_RESEARCH_ONLY_LOCK'));
 
     final xauOnCoinDcx = manager.cryptoProvider.getInstrumentSpecification('XAUUSD');
     expect(xauOnCoinDcx.isSpecificationVerified, isFalse);
@@ -1201,7 +1202,7 @@ void main() {
     coordinator.selectPortfolio(PortfolioId.highVolatility);
     expect(coordinator.selectedPortfolioId, equals(PortfolioId.highVolatility));
     expect(coordinator.activeEquityUsdt, closeTo(coordinator.highVolatilityPortfolio.accountEquityUsdt, 0.001));
-    expect(coordinator.activePortfolio.isResearchOnlyMode, isTrue);
+    expect(coordinator.activePortfolio.executionEnabled, isTrue);
 
     coordinator.dispose();
     await db.close();
@@ -1700,6 +1701,176 @@ void main() {
     expect(dupSpec.symbol, equals('PAIR1USDT'));
 
     coordinator.dispose();
+    await db.close();
+  });
+
+  test('High-Volatility Crypto Paper Trading & Startup Lifecycle Tests 1–10: End-to-end CoinDCX high-vol crypto paper order execution, Gold/Silver research-only lock, independent \$100 balances, 5-position & 15% loss limits, daily loss limit, and idempotent START', () async {
+    int nowMs = 1700000200000;
+    final mockClient = _MockHttpClient((req) async {
+      final url = req.url.toString();
+      if (url.contains('/exchange/v1/markets_details')) {
+        return http.Response(
+          jsonEncode([
+            {
+              'coindcx_name': 'SOLUSDT',
+              'symbol': 'SOLUSDT',
+              'pair': 'B-SOL_USDT',
+              'ecode': 'B',
+              'base_currency_short_name': 'USDT',
+              'target_currency_short_name': 'SOL',
+              'status': 'active',
+              'base_currency_precision': 2,
+              'target_currency_precision': 2,
+              'min_quantity': 0.01,
+              'max_quantity': 1000.0,
+              'step': 0.01,
+              'min_notional': 5.0,
+              'min_price': 1.0,
+              'max_price': 5000.0,
+              'order_types': ['market_order', 'limit_order'],
+            },
+          ]),
+          200,
+        );
+      }
+      if (url.contains('/exchange/v1/markets')) {
+        return http.Response(jsonEncode(['SOLUSDT']), 200);
+      }
+      if (url.contains('/exchange/ticker')) {
+        return http.Response(
+          jsonEncode([
+            {
+              'market': 'SOLUSDT',
+              'last_price': '180.0',
+              'bid': '179.95',
+              'ask': '180.05',
+              'high': '185.0',
+              'low': '172.0',
+              'volume': '750000.0',
+              'change_24_hour': '4.5',
+              'timestamp': nowMs ~/ 1000,
+            },
+          ]),
+          200,
+        );
+      }
+      if (url.contains('/market_data/candles')) {
+        // Generate candles with ATR ~2.2% (high-vol qualified) and bullish EMA20>EMA50 + RSI in [50,68]
+        final is1h = url.contains('interval=1h');
+        final dur = is1h ? 3600000 : 900000;
+        final list = <Map<String, dynamic>>[];
+        double cur = 150.0;
+        for (int i = 65; i >= 1; i--) {
+          final idx = 65 - i;
+          final openMs = nowMs - (i + 1) * dur;
+          if (idx % 3 == 2) {
+            cur -= 0.7;
+          } else {
+            cur += 0.8;
+          }
+          list.add({
+            'time': openMs,
+            'open': cur - 0.5,
+            'high': cur + 2.2,
+            'low': cur - 1.8,
+            'close': cur,
+            'volume': 1200.0,
+          });
+        }
+        return http.Response(jsonEncode(list), 200);
+      }
+      return http.Response('[]', 200);
+    });
+
+    final db = PersistenceDatabase(useInMemoryFallback: true);
+    final marketSvc = CoinDcxMarketService(httpClient: mockClient, persistence: db);
+    final engine = AuthoritativeTradingEngine(
+      marketService: marketSvc,
+      persistence: db,
+      nowMsProvider: () => nowMs,
+    );
+
+    // 9. Concurrent startEngine calls coalesce cleanly without rejecting 'START'
+    final results = await Future.wait([
+      engine.startEngine(),
+      engine.startEngine(),
+    ]);
+    expect(results[0], isTrue);
+    expect(results[1], isTrue);
+    expect(engine.state, equals(BotEngineState.running));
+
+    // 1, 2, 3. High-Volatility crypto market discovered, classified, and paper order executed via PaperBroker
+    final hvSnap = engine.dualPortfolioManager.snapshotFor(PortfolioId.highVolatility);
+    expect(hvSnap.startingBalanceUsdt, closeTo(100.0, 0.001));
+    expect(hvSnap.executionEnabled, isTrue);
+    expect(hvSnap.openPositions.length, equals(1));
+    expect(hvSnap.openPositions.first.symbol, equals('SOLUSDT'));
+    expect(hvSnap.openPositions.first.portfolioId, equals('HIGH_VOLATILITY'));
+    expect(hvSnap.orders.length, equals(1));
+    expect(hvSnap.availableCashUsdt, lessThan(100.0));
+
+    // 4. Gold (XAUUSD) and Silver (XAGUSD) remain strictly RESEARCH-ONLY
+    final xauClass = engine.dualPortfolioManager.classifier.classifyPreciousMetal('XAUUSD');
+    final xagClass = engine.dualPortfolioManager.classifier.classifyPreciousMetal('XAGUSD');
+    expect(xauClass.isExecutionAuthorized, isFalse);
+    expect(xagClass.isExecutionAuthorized, isFalse);
+
+    final xauSpec = engine.dualPortfolioManager.highVolProvider.getInstrumentSpecification('XAUUSD');
+    final xauOrder = await engine.dualPortfolioManager.openIsolatedPaperPosition(
+      portfolioId: PortfolioId.highVolatility,
+      instrumentSpec: xauSpec,
+      entryPrice: 2650.0,
+      stopLossPrice: 2630.0,
+      takeProfitPrice: 2690.0,
+      quantity: 0.01,
+      nowMs: nowMs,
+    );
+    expect(xauOrder.executed, isFalse);
+    expect(xauOrder.reason, contains('PRECIOUS_METALS_RESEARCH_ONLY_LOCK'));
+
+    // 5. Close High-Volatility position -> verify realized PnL & independent Crypto balance
+    final hvPos = hvSnap.openPositions.first;
+    final closeRes = await engine.dualPortfolioManager.closeIsolatedPaperPosition(
+      portfolioId: PortfolioId.highVolatility,
+      positionId: hvPos.id,
+      exitPrice: hvPos.takeProfit,
+      nowMs: nowMs + 60000,
+    );
+    expect(closeRes.closed, isTrue);
+    final hvAfterClose = engine.dualPortfolioManager.snapshotFor(PortfolioId.highVolatility);
+    expect(hvAfterClose.closedTrades.length, equals(1));
+    expect(hvAfterClose.realizedPnlUsdt, greaterThan(0.0));
+
+    // 8. Existing daily loss limit ($2.00) remains active
+    expect(
+      engine.riskManager.shouldLockDailyLoss(
+        startOfDayEquityUsdt: 100.0,
+        currentEquityUsdt: 98.0,
+      ),
+      isTrue,
+    );
+
+    // 10. Live trading remains hard-locked
+    final solSpec = engine.dualPortfolioManager.highVolProvider.getInstrumentSpecification('SOLUSDT');
+    final liveAttempt = engine.dualPortfolioManager.vetAndSizePortfolioOrder(
+      portfolioId: PortfolioId.highVolatility,
+      instrumentSpec: solSpec,
+      entryPrice: 180.0,
+      stopLossPrice: 175.0,
+      spreadPct: 0.05,
+      atr14: 3.0,
+      isDataFresh: true,
+      nowMs: nowMs,
+      isLiveTradingAttempt: true,
+    );
+    expect(liveAttempt.approved, isFalse);
+    expect(liveAttempt.rejectionReason, contains('LIVE_TRADING_HARD_LOCKED'));
+
+    await engine.stopEngine();
+    expect(engine.state, equals(BotEngineState.stopped));
+
+    engine.dispose();
+    marketSvc.dispose();
     await db.close();
   });
 }
