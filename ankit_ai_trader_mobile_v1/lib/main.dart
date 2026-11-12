@@ -422,13 +422,18 @@ class _DashboardPageState extends State<DashboardPage>
                         Row(
                           mainAxisAlignment: MainAxisAlignment.spaceBetween,
                           children: [
-                            const Text(
-                              'CoinDCX Spot',
-                              style: TextStyle(
-                                fontSize: 9.5,
-                                color: _mutedSlate,
+                            const Flexible(
+                              child: Text(
+                                'CoinDCX Spot',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: 9.5,
+                                  color: _mutedSlate,
+                                ),
                               ),
                             ),
+                            const SizedBox(width: 4),
                             Text(
                               _formatUnsignedUsdt(
                                 _coordinator.cryptoPortfolio.accountEquityUsdt,
@@ -489,15 +494,20 @@ class _DashboardPageState extends State<DashboardPage>
                         Row(
                           mainAxisAlignment: MainAxisAlignment.spaceBetween,
                           children: [
-                            Text(
-                              _coordinator.highVolatilityPortfolio.isResearchOnlyMode
-                                  ? 'Research-Only'
-                                  : 'Crypto Paper • Metals Research',
-                              style: const TextStyle(
-                                fontSize: 9.5,
-                                color: Colors.amberAccent,
+                            Flexible(
+                              child: Text(
+                                _coordinator.highVolatilityPortfolio.isResearchOnlyMode
+                                    ? 'Research-Only'
+                                    : 'Crypto Paper',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontSize: 9.5,
+                                  color: Colors.amberAccent,
+                                ),
                               ),
                             ),
+                            const SizedBox(width: 4),
                             Text(
                               _formatUnsignedUsdt(
                                 _coordinator
@@ -528,6 +538,8 @@ class _DashboardPageState extends State<DashboardPage>
             ),
             child: Text(
               'Crypto Engine: ${_coordinator.cryptoEngineStatusLabel}  •  High-Vol Research: ${_coordinator.highVolatilityResearchStatusLabel}  •  High-Vol Execution: ${_coordinator.highVolatilityExecutionStatusLabel}',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
               style: const TextStyle(
                 fontSize: 9.5,
                 fontWeight: FontWeight.w600,
@@ -583,6 +595,7 @@ class _DashboardPageState extends State<DashboardPage>
         : '—';
 
     return ListView(
+      cacheExtent: 1500,
       padding: const EdgeInsets.all(12),
       children: [
         Card(
@@ -641,14 +654,8 @@ class _DashboardPageState extends State<DashboardPage>
                           const SizedBox(height: 4),
                           Text(
                             'Starting: ${_formatUnsignedUsdt(_coordinator.activePortfolio.startingBalanceUsdt)}  |  Settled Balance: ${_formatUnsignedUsdt(_coordinator.activeSettledBalanceUsdt)}',
-                            style: const TextStyle(
-                              fontSize: 11,
-                              color: Colors.white70,
-                            ),
-                          ),
-                          const SizedBox(height: 2),
-                          Text(
-                            'Available Cash: ${_formatUnsignedUsdt(_coordinator.activeAvailableCashUsdt)}  |  Reserved (Spot): ${_formatUnsignedUsdt(_coordinator.activeReservedCapitalUsdt)}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
                             style: const TextStyle(
                               fontSize: 10.5,
                               color: Colors.white70,
@@ -656,9 +663,21 @@ class _DashboardPageState extends State<DashboardPage>
                           ),
                           const SizedBox(height: 2),
                           Text(
-                            'Realised P&L: ${_formatSignedUsdt(_coordinator.activeRealizedPnlUsdt)}  |  Unrealised P&L: ${_formatSignedUsdt(_coordinator.activeUnrealizedPnlUsdt)}  |  Positions: ${_coordinator.activeOpenPositions.length}/${_coordinator.activeMaxOpenPositions}',
+                            'Available Cash: ${_formatUnsignedUsdt(_coordinator.activeAvailableCashUsdt)}  |  Reserved (Spot): ${_formatUnsignedUsdt(_coordinator.activeReservedCapitalUsdt)}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
                             style: const TextStyle(
                               fontSize: 10,
+                              color: Colors.white70,
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            'Realised P&L: ${_formatSignedUsdt(_coordinator.activeRealizedPnlUsdt)}  |  Unrealised P&L: ${_formatSignedUsdt(_coordinator.activeUnrealizedPnlUsdt)}  |  Positions: ${_coordinator.activeOpenPositions.length}/${_coordinator.activeMaxOpenPositions}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 9.5,
                               color: _mutedSlate,
                             ),
                           ),
