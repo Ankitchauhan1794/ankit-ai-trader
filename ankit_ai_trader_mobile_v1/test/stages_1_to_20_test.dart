@@ -1150,6 +1150,11 @@ void main() {
       approvedAndVerified: false,
       nowMs: 136000,
     );
+    expect(coordinator.highVolatilityPortfolio.executionEnabled, isFalse);
+    await manager.setHighVolatilityExecutionApproval(
+      approvedAndVerified: true,
+      nowMs: 137000,
+    );
 
     final cryptoSup = manager.riskSupervisorFor(PortfolioId.crypto);
     final highVolSup = manager.riskSupervisorFor(PortfolioId.highVolatility);
